@@ -90,3 +90,94 @@ PTY="$APPDIR/node_modules/node-pty"
 [ -f "$PTY/build/Release/spawn-helper" ] || die "node-pty/build/Release/spawn-helper is missing from the bundle"
 [ "$(sha256 "$PTY/src/unix/pty.cc" | awk '{print $1}')" = "$PTY_SOURCE_SHA" ] || die "the bundle does not contain the patched node-pty source"
 [ "$(sha256 "$PTY/build/Release/pty.node" | awk '{print $1}')" = "$PTY_BINARY_SHA" ] || die "the bundle does not contain the rebuilt node-pty binary"
+PTY_FILE="$(file "$PTY/build/Release/pty.node")"
+case "$PTY_FILE" in
+  *Mach-O*arm64*) ;;
+  *) die "packaged node-pty binary is not Mach-O arm64: $PTY_FILE" ;;
+esac
+[ "$(lipo -archs "$PTY/build/Release/pty.node")" = arm64 ] || die "packaged node-pty binary is not arm64"
+for helper in "$PTY/build/Release/spawn-helper" "$PTY/prebuilds/darwin-arm64/spawn-helper"; do
+  [ -f "$helper" ] || continue
+  if [ ! -x "$helper" ]; then
+    chmod +x "$helper"
+    say "made ${helper#"$APPDIR/"} executable"
+  fi
+  [ -x "$helper" ] || die "${helper#"$APPDIR/"} is not executable"
+done
+
+say "signing (ad-hoc)"
+codesign --force --deep --sign - "$BUILT"
+codesign --verify --deep --strict --verbose=1 "$BUILT" 2>&1 | sed 's/^/package: /'
+
+# node-pty must load under the packaged Electron and spawn through the bundled spawn-helper.
+ELECTRON_RUN_AS_NODE=1 "$BUILT/Contents/MacOS/$APP_NAME" -e '
+const assert = require("assert");
+assert.strictEqual(process.versions.electron, "45.2.1");
+assert.strictEqual(process.arch, "arm64");
+const pty = require(process.argv[1]);
+const p = pty.spawn("/bin/sh", ["-c", "echo flow-pty-$((40 + 2))"], { cols: 80, rows: 24 });
+let out = "";
+p.onData((d) => { out += d; });
+p.onExit(({ exitCode }) => {
+  if (exitCode === 0 && out.includes("flow-pty-42")) process.exit(0);
+  console.error(`node-pty spawn failed: exit ${exitCode}, output ${JSON.stringify(out)}`);
+  process.exit(1);
+});
+setTimeout(() => { console.error("node-pty spawn timed out"); process.exit(1); }, 10000);
+' "$PTY" || die "node-pty does not work inside the packaged app"
+say "node-pty spawns through the bundled spawn-helper"
+mkdir -p "$ROOT/evidence"
+ELECTRON_RUN_AS_NODE=1 node "$ROOT/scripts/pty-lifecycle-watchdog.cjs" 120000 \
+  "$BUILT/Contents/MacOS/$APP_NAME" "$ROOT/scripts/pty-native-lifecycle.cjs" "$PTY" \
+  | tee "$ROOT/evidence/pty-native-lifecycle-packaged.txt" \
+  || die "packaged node-pty lifecycle gate failed"
+say "packaged node-pty source $PTY_SOURCE_SHA"
+say "packaged node-pty binary $PTY_BINARY_SHA"
+say "built $BUILT"
+
+if [ "${FLOW_SKIP_INSTALL:-}" = 1 ]; then
+  echo "$BUILT"
+  exit 0
+fi
+
+NEW="$INSTALL_PATH.new"
+OLD="$INSTALL_PATH.old"
+mkdir -p "$(dirname "$INSTALL_PATH")"
+
+if [ -e "$INSTALL_PATH" ]; then
+  HAVE="$(plist "$INSTALL_PATH" CFBundleIdentifier)"
+  [ "$HAVE" = "$BUNDLE_ID" ] || die "$INSTALL_PATH is another app (${HAVE:-no bundle id}); leaving it alone. Set FLOW_INSTALL_PATH to install somewhere else."
+  if pgrep -f "^$(regex_escape "$INSTALL_PATH")/Contents/MacOS/$APP_NAME" >/dev/null; then
+    die "Flow is running from $INSTALL_PATH; quit it, then run this again"
+  fi
+fi
+for stale in "$NEW" "$OLD"; do
+  [ -e "$stale" ] || continue
+  HAVE="$(plist "$stale" CFBundleIdentifier)"
+  [ "$HAVE" = "$BUNDLE_ID" ] || die "$stale is not a Flow build (${HAVE:-no bundle id}); move it away by hand"
+  rm -rf "$stale"
+done
+
+say "staging $NEW"
+ditto "$BUILT" "$NEW"
+codesign --verify --deep --strict "$NEW" || die "the staged copy at $NEW fails signature verification"
+node "$ROOT/scripts/e2e.mjs" --smoke --app "$NEW" || die "the staged copy at $NEW did not start cleanly; $INSTALL_PATH is untouched"
+
+if [ -e "$INSTALL_PATH" ]; then
+  mv "$INSTALL_PATH" "$OLD"
+fi
+if ! mv "$NEW" "$INSTALL_PATH"; then
+  [ -e "$OLD" ] && mv "$OLD" "$INSTALL_PATH"
+  die "could not move $NEW into place; the previous install is back"
+fi
+rm -rf "$OLD"
+
+[ "$(plist "$INSTALL_PATH" CFBundleIdentifier)" = "$BUNDLE_ID" ] || die "installed bundle id is wrong"
+codesign --verify --deep --strict "$INSTALL_PATH" || die "the installed copy fails signature verification"
+[ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$INSTALL_PATH"
+say "installed"
+echo "$INSTALL_PATH"
+
+
+
+
