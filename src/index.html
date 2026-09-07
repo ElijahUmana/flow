@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http:; font-src 'self' data:; connect-src 'self'">
+<title>Flow</title>
+<link rel="stylesheet" href="vendor/xterm/xterm.css">
+<link rel="stylesheet" href="app.css"><link rel="stylesheet" href="term.css"><link rel="stylesheet" href="page.css"><link rel="stylesheet" href="sidebar.css"><link rel="stylesheet" href="files.css"><link rel="stylesheet" href="wsbg.css"><link rel="stylesheet" href="notes.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sb" id="sb">
+    <div class="sb-in">
+      <div class="sb-top"><input class="sb-search" id="q" placeholder="search  (⌘K)" spellcheck="false" autocomplete="off"></div>
+      <div class="sb-list" id="sblist"></div>
+      <div class="sb-foot"><button id="collapse" title="hide the sidebar (⌘\)">‹</button></div>
+    </div>
+  </aside>
+  <button class="expand" id="expand" title="show the sidebar (⌘\)">›</button>
+  <main class="stage" id="stage">
+    <div class="menubar">
+      <nav class="spaces" id="spaces"></nav>
+      <div class="mb-right">
+      </div>
+    </div>
+    <div class="viewport" id="viewport">
+      <div class="track" id="track"></div>
+      <div class="edge l" id="edgeL"></div>
+      <div class="edge r" id="edgeR"></div>
+    </div>
+    <div class="dock" id="dock">
+      <button data-k="agent">›_<span>new agent</span></button>
+      <button data-k="shell">$_<span>new shell</span></button>
+      <button data-k="team">◫<span>new team</span></button>
