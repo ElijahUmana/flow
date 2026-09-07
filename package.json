@@ -1,0 +1,24 @@
+{
+  "name": "flow",
+  "productName": "Flow",
+  "version": "0.1.0",
+  "description": "Workspaces for Claude Code terminals, pages and notes",
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "package": "bash scripts/package.sh",
+    "e2e": "node scripts/e2e.mjs"
+  },
+  "dependencies": {
+    "node-pty": "1.1.0"
+  },
+  "devDependencies": {
+    "electron": "45.2.1",
+    "electron-packager": "17.1.2"
+  }
+}
+
+
+
+
