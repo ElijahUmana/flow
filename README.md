@@ -20,3 +20,24 @@ FLOW_USER_DATA=/tmp/flow-dev FLOW_TMUX_SOCKET=flow-dev FLOW_CDP_PORT=9561 npm st
 
 ## Tests
 
+```
+npm run e2e
+node scripts/e2e.mjs --smoke
+```
+
+## Layout
+
+```
+src/       main process, renderer, preloads, styles
+native/    trackpad touch monitor
+scripts/   build, packaging, e2e
+spec/      interface contract and mockup
+test/      behavioural harnesses
+```
+
+
+
+
+
+
+
