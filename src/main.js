@@ -616,3 +616,312 @@ function guestContextMenu(guest, params) {
       { label: 'Open Link in New Page', click: () => sendNewWindow(guest, params.linkURL, 'new-page') },
     );
   }
+  if (params.mediaType === 'image' && /^(https?|data):/i.test(params.srcURL || '')) {
+    items.push(
+      { type: 'separator' },
+      { label: 'Open Image in New Page', enabled: /^https?:/i.test(params.srcURL), click: () => sendNewWindow(guest, params.srcURL, 'new-page') },
+      { label: 'Copy Image', click: () => guest.copyImageAt(params.x, params.y) },
+      { label: 'Copy Image Address', click: () => clipboard.writeText(params.srcURL).catch((e) => console.error(`[flow] could not copy the image address: ${e.message}`)) },
+      { label: 'Save Image', click: () => guest.downloadURL(params.srcURL) },
+    );
+  }
+  items.push({ type: 'separator' }, { label: 'Inspect', click: () => guest.inspectElement(params.x, params.y) });
+  const host = guest.hostWebContents;
+  const win = host ? BrowserWindow.fromWebContents(host) : null;
+  Menu.buildFromTemplate(items).popup(win ? { window: win, frame: params.frame } : { frame: params.frame });
+}
+
+// A page opens a page, a window or another app only from the owner's own action, as a browser's popup blocker allows:
+// within ACTIVATION_MS of a click or key in it or in any frame of it (input main sees on its way in, which the page
+// cannot make), once per action; a new document starts without one. Anything else is dropped, with no sign in the
+// window (logged at most once a minute per page).
+const ACTIVATION_MS = 5000;
+const ACTIVATING = new Set(['mouseDown', 'rawKeyDown', 'keyDown', 'touchEnd', 'gestureTap']);
+const activatedAt = new WeakMap();   // webContents -> when the owner last clicked or pressed a key in it
+const droppedLogAt = new WeakMap();   // webContents -> when a dropped open of it was last logged
+
+// The pages the owner has edited text in since they loaded (the guest preload says so at the first trusted input event,
+// and an editing key into a frame of another site, which the preload cannot see, counts too): only these can hold unsaved
+// text of the owner's, so a close or a quit asks only these, and a window with none goes at once.
+const touched = new Set();   // webContents ids
+const EDIT_KEYS = new Set(['Backspace', 'Delete', 'Enter', 'Process', 'Dead']);
+const edits = (input) => (input.meta || input.control ? /^[vxz]$/i.test(input.key) : input.key.length === 1 || EDIT_KEYS.has(input.key));
+
+// input-event sees input into the page itself, the before-* events also into frames of other sites inside it; each
+// misses some of what the other sees.
+function trackActivation(wc) {
+  const id = wc.id;
+  wc.once('destroyed', () => touched.delete(id));
+  wc.on('input-event', (_event, input) => {
+    if (ACTIVATING.has(input.type)) activatedAt.set(wc, Date.now());
+  });
+  wc.on('before-mouse-event', (_event, mouse) => {
+    if (mouse.type === 'mouseDown') activatedAt.set(wc, Date.now());
+  });
+  wc.on('before-input-event', (_event, input) => {
+    if (input.type !== 'keyDown') return;
+    if (input.key !== 'Escape') activatedAt.set(wc, Date.now());
+    if (edits(input)) touched.add(id);
+  });
+  wc.on('did-navigate', () => {
+    activatedAt.delete(wc);
+    touched.delete(id);
+  });
+}
+
+function takeActivation(wc) {
+  const at = activatedAt.get(wc);
+  if (!at || Date.now() - at > ACTIVATION_MS) return false;
+  activatedAt.delete(wc);
+  return true;
+}
+
+// window.open with features (a sign-in popup) or of about:blank (a window the page points somewhere next) stays a real
+// popup, because sign-in flows (Notion's, Figma's "Continue with Google") need window.opener. Links (a shift-click is
+// 'new-window' too, with no features) and a plain window.open open as Flow pages. Whatever a popup opens follows the
+// same rule; its pages go to the opener's window. from: the page or popup asking.
+function openFromPage(guest, { url, disposition, features }, from) {
+  if (!takeActivation(from)) {
+    if (Date.now() - (droppedLogAt.get(from) || 0) > 60000) {
+      droppedLogAt.set(from, Date.now());
+      console.warn(`[flow] dropped ${url}: a page opened it with no click or key from the owner`);
+    }
+    return { action: 'deny' };
+  }
+  if ((disposition === 'new-window' && features && /^https?:/i.test(url) && !inFilePages(guest)) || url === 'about:blank') return { action: 'allow' };
+  if (/^https?:/i.test(url)) sendNewWindow(guest, url, disposition);
+  else if (/^mailto:/i.test(url)) shell.openExternal(url).catch((e) => console.error(`[flow] could not open ${url}: ${e.message}`));
+  else if (isAppLink(url)) askExternal(guest, url, (open) => { if (open) shell.openExternal(url).catch((e) => console.error(`[flow] could not open ${url}: ${e.message}`)); });
+  else console.warn(`[flow] blocked a page popup to ${url}`);
+  return { action: 'deny' };
+}
+
+function hardenPopup(win, guest) {
+  trackActivation(win.webContents);
+  keepKind(win.webContents, guest);
+  win.webContents.setWindowOpenHandler((details) => openFromPage(guest, details, win.webContents));
+  win.webContents.on('did-create-window', (child) => hardenPopup(child, guest));
+}
+
+// A webview's session is set when it is made, so a page or popup that sends itself or a frame to an address of the
+// other kind (a report, or from a report a web page or another file) does not go there: when the owner clicked or
+// typed, its window opens a main frame's address in the same tab with a webview of its own (page.js, 'current-tab').
+// guest: the page it belongs to.
+function keepKind(wc, guest) {
+  if (inFilePages(wc)) wc.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
+  wc.on('will-frame-navigate', (event) => {
+    if (!crossesKind(wc, event.url)) return;
+    event.preventDefault();
+    if (event.isMainFrame && takeActivation(wc)) sendNewWindow(guest, event.url, 'current-tab');
+    else console.warn(`[flow] kept ${event.isMainFrame ? 'a page' : 'a frame'} from loading ${event.url.slice(0, 120)} in place`);
+  });
+  wc.on('will-redirect', (event) => {
+    if (!crossesKind(wc, event.url)) return;
+    event.preventDefault();
+    console.warn(`[flow] stopped a redirect to ${event.url.slice(0, 120)}`);
+  });
+}
+
+const pages = new Map();   // guest id -> { zoom, intent, blockedAt, allowedUntil }
+
+function hardenGuest(guest) {
+  const id = guest.id;
+  const page = { zoom: null, intent: null, blockedAt: 0, allowedUntil: 0, asked: {}, using: {} };   // asked/using: a media device the site requested / has live
+  pages.set(id, page);
+  const restore = nextRestore;
+  nextRestore = null;
+  if (restore) {
+    guest.once('did-attach', () => {
+      guest.navigationHistory.restore({ index: restore.index, entries: restore.entries }).catch((e) => {
+        // the page went away while its entry loaded (its window closed, or a quit): nothing to load it into
+        if (guest.isDestroyed()) return;
+        console.warn(`[flow] could not restore the history of ${restore.src}: ${e.message}`);
+        guest.loadURL(restore.src).catch((err) => console.warn(`[flow] could not load ${restore.src}: ${err.message}`));
+      });
+    });
+  }
+  trackActivation(guest);
+  keepKind(guest, guest);
+  guest.setWindowOpenHandler((details) => openFromPage(guest, details, guest));
+  guest.on('did-create-window', (win) => hardenPopup(win, guest));
+  guest.on('context-menu', (_event, params) => guestContextMenu(guest, params));
+  guest.on('login', (event, details, authInfo, callback) => {
+    if (!details.isMainFrame || authInfo.isProxy) return;
+    event.preventDefault();
+    askLogin(guest, details.url, !details.firstAuthAttempt, callback);
+  });
+  // A page guarding unsaved typing never stops a navigation (owner, Nov 1 20:47): it goes on, and the page's own
+  // unload handlers run, as after Chrome's Leave. Closing is the window's (page.js keeps such a page 10 s).
+  guest.on('will-prevent-unload', (event) => event.preventDefault());
+  guest.on('did-navigate', () => {
+    if (page.zoom !== null) guest.send('flow:zoom', page.zoom);
+  });
+  guest.on('destroyed', () => {
+    pages.delete(id);
+    for (const ask of asks.values()) if (ask.guestId === id) ask.settle(false);
+    for (const login of logins.values()) if (login.guestId === id) login.settle(null);
+  });
+}
+
+// A tab comes back after a quit or a crash with its back/forward history and scroll (principle 5): the window keeps
+// pageHistory() with the tab, and before it inserts the restored tab's webview it calls restorePageNext(src, history).
+// That webview then loads nothing itself (Chromium restores history only into a page that has loaded nothing): its
+// guest gets the history at did-attach. Electron creates the guest right after will-attach-webview, in the same call.
+const HISTORY_MAX = 15;
+function pageHistory(guest) {
+  const h = guest.navigationHistory;
+  const all = h.getAllEntries();
+  const index = h.getActiveIndex();
+  const from = Math.max(0, Math.min(index - 9, all.length - HISTORY_MAX));
+  return { index: index - from, entries: all.slice(from, from + HISTORY_MAX).map(({ url, title, pageState }) => ({ url, title, pageState })) };
+}
+
+// Where Chromium's PDF viewer shows a page's PDF, and putting it back there after a restart. The viewer runs in an
+// extension frame inside the page's guest, which only main can reach; viewport_ is the viewer's own object, so each call
+// checks it is there (null or false when not).
+const PDF_VIEWER = 'chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/';
+const pdfFrame = (guest) => guest.mainFrame.framesInSubtree.find((f) => f.url.startsWith(PDF_VIEWER)) || null;
+
+async function pdfPlace(guest) {
+  const f = pdfFrame(guest);
+  if (!f) return null;
+  return f.executeJavaScript(`(() => { const p = document.querySelector('pdf-viewer')?.viewport_;
+    return p && p.position ? { x: p.position.x, y: p.position.y } : null; })()`);
+}
+
+// Once a page's PDF has loaded: the viewer's thumbnails pane closes (once, with the viewer's own toggle, so its ≡ opens it
+// again), then a place kept from before a restart is set. Closing the pane lays the pages out again, and the viewer cuts
+// a place short until its pages are laid out, so the place is done once it has held on two tries in a row (every 200 ms,
+// for up to 6 s).
+async function pdfShown(guest, at) {
+  const place = at && Number.isFinite(at.x) && Number.isFinite(at.y) ? { x: Number(at.x), y: Number(at.y) } : null;
+  let toggled = false;
+  let held = 0;
+  let failure = null;
+  for (let i = 0; i < 30 && !guest.isDestroyed(); i++) {
+    const f = pdfFrame(guest);
+    const r = f && await f.executeJavaScript(`(() => {
+      const v = document.querySelector('pdf-viewer'), p = v && v.viewport_;
+      if (!p || typeof p.setPosition !== 'function') return null;
+      if (${!toggled} && !v.sidenavCollapsed_ && typeof v.onSidenavToggleClick_ === 'function') {
+        v.onSidenavToggleClick_();
+        return { toggled: true };
+      }
+      const there = ${place ? `Math.abs(p.position.x - ${place.x}) < 2 && Math.abs(p.position.y - ${place.y}) < 2` : 'true'};
+      if (!there) p.setPosition(${place ? `{ x: ${place.x}, y: ${place.y} }` : 'p.position'});
+      return { there };
+    })()`).catch((e) => {
+      failure = e;
+      return null;
+    });
+    if (r && r.toggled) toggled = true;
+    held = r && r.there ? held + 1 : 0;
+    if (held >= 2) return true;
+    await new Promise((res) => setTimeout(res, 200));
+  }
+  if (failure) console.warn(`[flow] could not set up a page's PDF (pane, place): ${failure.message}`);
+  return false;
+}
+
+const restores = new Map();   // host webContents id -> [{ src, history, at }] waiting for their webview (10 s at most)
+let nextRestore = null;       // set by will-attach-webview, taken by the guest it creates
+
+function expectRestore(hostId, src, history) {
+  const entries = history && Array.isArray(history.entries) ? history.entries : [];
+  const index = history && history.index;
+  const ok = entries.length > 0 && entries.length <= 50 && Number.isInteger(index) && index >= 0 && index < entries.length &&
+    entries.every((e) => e && typeof e.url === 'string' && /^(https?|flow-file):/i.test(e.url) && (e.title == null || typeof e.title === 'string') &&
+      (e.pageState == null || (typeof e.pageState === 'string' && e.pageState.length < 262144)));
+  if (!ok) return false;
+  const list = (restores.get(hostId) || []).filter((r) => Date.now() - r.at < 10000);
+  list.push({ src, at: Date.now(), history: { index, entries: entries.map(({ url, title, pageState }) => (pageState ? { url, title: title || '', pageState } : { url, title: title || '' })) } });
+  restores.set(hostId, list);
+  return true;
+}
+
+function takeRestore(hostId, src) {
+  const waiting = (restores.get(hostId) || []).filter((r) => Date.now() - r.at < 10000);
+  const at = src ? waiting.findIndex((r) => r.src === src) : -1;
+  const found = at >= 0 ? waiting.splice(at, 1)[0] : null;
+  if (waiting.length) restores.set(hostId, waiting);
+  else restores.delete(hostId);
+  if (!found) return null;
+  // One saved before pages kept their kind may hold both: it keeps those of its page's.
+  const { index, entries } = found.history;
+  const kept = entries.filter((e) => isFilePage(e.url) === isFilePage(src));
+  const active = kept.indexOf(entries[index]);
+  return active >= 0 ? { src, index: active, entries: kept } : null;
+}
+
+// A page guarding unsaved changes (beforeunload) gets no dialog: the navigation stops and the page's window asks
+// inline (page:unload-blocked). Leave calls allowUnload: the next unload of that page goes through for 10 s, and main
+// repeats the navigation if the page started it (a link or a script; the guest preload sends where it was going) or
+// the page's context menu did; otherwise allowUnload resolves false and the window repeats its own action.
+function navigatePage(guest, run) {
+  const page = pages.get(guest.id);
+  if (page) page.intent = { at: Date.now(), run };
+  run();
+}
+
+function pageNavigating(event, to) {
+  const guest = event.sender;
+  const page = pages.get(guest.id);
+  if (!page || !event.senderFrame || event.senderFrame.parent || !to || typeof to !== 'object') {
+    console.warn('[flow] ignored flow:page-navigate from a sender that is not a page');
+    return;
+  }
+  let run = null;
+  if (to.type === 'reload') run = () => guest.reload();
+  else if (to.type === 'traverse' && Number.isInteger(to.delta)) run = () => guest.navigationHistory.goToOffset(to.delta);
+  else if ((to.type === 'push' || to.type === 'replace') && /^https?:/i.test(to.url)) {
+    run = crossesKind(guest, to.url) ? () => sendNewWindow(guest, to.url, 'current-tab')
+      : () => guest.loadURL(to.url).catch((e) => console.warn(`[flow] could not go on to ${to.url}: ${e.message}`));
+  }
+  page.intent = run && { at: Date.now(), run };
+}
+
+function allowUnload(guest) {
+  const page = pages.get(guest.id);
+  page.allowedUntil = Date.now() + 10000;
+  const intent = page.intent;
+  page.intent = null;
+  if (!intent || Math.abs(intent.at - page.blockedAt) > 1000) return false;
+  intent.run();
+  return true;
+}
+
+// Closing a page destroys its webview, which never asks the page, so the window asks first. Each frame answers by
+// Chromium's rule: its guard counts only once the frame has had user activation. The page's own handlers run, as they
+// do in Chrome when the user picks Stay.
+const UNSAVED_CHECK = `(() => {
+  const e = document.createEvent('BeforeUnloadEvent');
+  e.initEvent('beforeunload', false, true);
+  dispatchEvent(e);
+  return navigator.userActivation.hasBeenActive && (e.defaultPrevented || !!e.returnValue);
+})()`;
+
+function within(ms, promise) {
+  let timer;
+  const late = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`no answer in ${ms} ms`)), ms); });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
+// Quitting, or closing a Flow window, destroys its pages without asking them (Electron never runs a webview's
+// beforeunload then). A Flow window that shows unsaved pages (flow.onUnsavedPages) is asked first: when one of its
+// pages has unsaved changes the quit or close waits, the window gets window:unsaved-pages { action, pages }, and
+// flow.closeAnyway(action) goes on. A window that does not listen closes as it always did.
+const unsavedShown = new Set();   // webContents ids of Flow windows listening for window:unsaved-pages
+const closeAnyway = new WeakSet();   // Flow windows the owner closes with unsaved pages: not asked again
+const closeNow = new WeakSet();   // Flow windows that were asked and saved what they show: their close goes on
+let quitAnyway = false;
+let quitChecking = false;
+let quitReady = false;   // every window was asked: the quit goes on
+let quitGone = false;    // the quit has taken the windows off the screen: nothing can be shown any more
+let startAgain = false;  // the owner opened Flow again while it was quitting
+
+// Flow opened again (a second launch, or a Dock click on macOS) once a quit has taken the windows away: this instance
+// is on its way out and that quit cannot be undone, so a new one starts once it has exited, with what it saved.
+function openedWhileQuitting() {
+  if (!quitGone && !quitting) return false;
+  if (!startAgain) {
+    startAgain = true;
