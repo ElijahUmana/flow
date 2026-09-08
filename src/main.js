@@ -307,3 +307,312 @@ function createWindow(hash, primary, savedBounds) {
   wc.on('context-menu', (_event, params) => textMenu(wc, params));
   // Nothing may navigate a Flow window away from Flow (a dropped file, a stray link): that would
   // destroy every live terminal and page in it.
+  wc.on('will-navigate', (event, url) => {
+    event.preventDefault();
+    console.warn(`[flow] blocked navigation of a Flow window to ${url}`);
+  });
+  wc.setWindowOpenHandler(({ url }) => {
+    console.warn(`[flow] blocked window.open from a Flow window: ${url}`);
+    return { action: 'deny' };
+  });
+  // A reload or crash replaces the page: its tmux clients belong to the old page.
+  wc.on('did-start-navigation', (details) => {
+    if (!details.isMainFrame || details.isSameDocument) return;
+    pty.detachAll(wcId);
+    unsavedShown.delete(wcId);
+    forgetFlush(wcId);
+  });
+  wc.on('render-process-gone', (_event, details) => {
+    console.error(`[flow] renderer of window ${wcId} is gone (${details.reason}, exit ${details.exitCode})`);
+    pty.detachAll(wcId);
+  });
+  wc.on('console-message', (event) => {
+    if (event.level !== 'error') return;
+    console.error(`[flow renderer ${wcId}] ${event.message} (${event.sourceId}:${event.lineNumber})`);
+  });
+  wc.on('destroyed', () => {
+    flowContents.delete(wcId);
+    mainContents.delete(wcId);
+    unsavedShown.delete(wcId);
+    if (store) store.forget(wcId);
+    forgetFlush(wcId);
+    pty.detachAll(wcId);
+  });
+  let asking = false;
+  win.on('close', (event) => {
+    if (quitReady || quitAnyway || closeNow.has(win) || (!unsavedShown.has(wcId) && !flushShown.has(wcId))) return;
+    event.preventDefault();
+    if (asking) return;
+    asking = true;
+    (async () => {
+      if (!closeAnyway.has(win) && !(await mayClose([win], 'close'))) return false;
+      leaveScreen(win);
+      await flushPagesOf([win]);
+      return true;
+    })().then((go) => {
+      asking = false;
+      if (!go || win.isDestroyed()) return;
+      closeNow.add(win);
+      win.close();
+    }, (e) => {
+      asking = false;
+      console.error(`[flow] could not ask window ${wcId} before closing it, closing: ${e.message}`);
+      closeNow.add(win);
+      if (!win.isDestroyed()) win.close();
+    });
+  });
+
+  if (primary) {
+    let timer = null;
+    const remember = () => {
+      if (win.isDestroyed() || win.isMinimized() || leaving.has(win)) return;
+      store.setBounds({ ...win.getNormalBounds(), maximized: win.isMaximized(), ...(fullNow() ? { fullScreen: true } : {}) });
+    };
+    readFrame.set(win, remember);
+    const later = () => {
+      clearTimeout(timer);
+      timer = setTimeout(remember, 400);
+    };
+    for (const ev of ['resize', 'move', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen']) win.on(ev, later);
+    win.on('close', () => {
+      clearTimeout(timer);
+      remember();
+    });
+  } else {
+    const entry = { hash, bounds: win.getNormalBounds() };
+    popouts.set(win, entry);
+    savePopouts(true);
+    sendPopouts();
+    let timer = null;
+    const remember = () => {
+      if (win.isDestroyed() || win.isMinimized() || leaving.has(win)) return;
+      entry.bounds = win.getNormalBounds();
+      entry.maximized = win.isMaximized();
+      entry.fullScreen = fullNow();
+    };
+    readFrame.set(win, remember);
+    const later = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        remember();
+        savePopouts(false);
+      }, 400);
+    };
+    for (const ev of ['resize', 'move', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen']) win.on(ev, later);
+    win.on('close', () => {
+      clearTimeout(timer);
+      remember();
+    });
+    win.on('closed', () => {
+      if (!quitting) popouts.delete(win);
+      savePopouts(true);
+      sendPopouts();
+    });
+  }
+
+  win.loadFile(ENTRY, hash ? { hash } : {}).catch((e) => console.error(`[flow] could not load ${ENTRY}: ${e.message}`));
+  return win;
+}
+
+// ---------- menu ----------
+
+const isFlowWindow = (w) => !!w && !w.isDestroyed() && flowContents.has(w.webContents.id);
+
+const EDITS = { 'select-all': 'selectAll', undo: 'undo', redo: 'redo' };   // menu actions a page or a plain window does itself
+function sendMenu(action, win) {
+  // a page that has the keys selects, undoes and redoes in itself
+  const fc = EDITS[action] && webContents.getFocusedWebContents();
+  if (fc && fc.getType() === 'webview') {
+    fc[EDITS[action]]();
+    return;
+  }
+  // A sign-in popup is a plain window: ⌘W closes it and the edits act in it, every other action goes to a Flow window.
+  if (win && !win.isDestroyed() && !isFlowWindow(win) && (action === 'close-window' || EDITS[action])) {
+    if (action === 'close-window') win.close();
+    else win.webContents[EDITS[action]]();
+    return;
+  }
+  const focused = BrowserWindow.getFocusedWindow();
+  const target = isFlowWindow(win) ? win : isFlowWindow(focused) ? focused : flowWindows()[0];
+  if (target) {
+    target.webContents.send('menu', action);
+    return;
+  }
+  if (action === 'close-window') return;
+  const fresh = createWindow('', true);
+  fresh.webContents.once('did-finish-load', () => fresh.webContents.send('menu', action));
+}
+
+function buildMenu() {
+  const act = (label, action, accelerator) => ({ label, accelerator, click: (_item, win) => sendMenu(action, win) });
+  const template = [
+    {
+      label: app.name,
+      submenu: [
+        { role: 'about' },
+        { type: 'separator' },
+        { role: 'services' },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        { type: 'separator' },
+        { role: 'quit' },
+      ],
+    },
+    {
+      label: 'File',
+      submenu: [
+        act('New Agent', 'new-agent', 'Command+N'),
+        act('New Shell', 'new-shell', 'Alt+Command+T'),
+        act('New Team', 'new-team', 'Alt+Command+N'),
+        act('New Note', 'new-note', 'Shift+Command+N'),
+        act('New Page', 'new-page-window', 'Alt+Command+P'),
+        act('New Sub-workspace', 'new-zone'),
+        { type: 'separator' },
+        act('New Tab', 'new-page', 'Command+T'),
+        { label: 'New Beside', submenu: [
+          act('Right', 'beside-right', 'Control+Command+Right'),
+          act('Left', 'beside-left', 'Control+Command+Left'),
+          act('Above', 'beside-above', 'Control+Command+Up'),
+          act('Below', 'beside-below', 'Control+Command+Down'),
+        ] },
+        act('New Workspace', 'new-workspace', 'Control+Command+N'),
+        { type: 'separator' },
+        act('Reopen Closed Tab', 'tab-reopen', 'Shift+Command+T'),
+        act('Close Window', 'close-window', 'Command+W'),
+        { type: 'separator' },
+        act('Print…', 'page-print', 'Command+P'),
+      ],
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        act('Undo', 'undo', 'Command+Z'),
+        act('Redo', 'redo', 'Shift+Command+Z'),
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'pasteAndMatchStyle' },
+        { role: 'delete' },
+        act('Select All', 'select-all', 'Command+A'),
+        { type: 'separator' },
+        act('Find', 'find', 'Command+F'),
+        act('Search', 'search', 'Command+K'),
+      ],
+    },
+    {
+      label: 'View',
+      submenu: [
+        act('Toggle Sidebar', 'toggle-sidebar', 'Command+\\'),
+        act('Arrange', 'arrange', 'Control+Command+A'),
+        { type: 'separator' },
+        { role: 'togglefullscreen' },
+        { role: 'toggleDevTools', accelerator: 'Alt+Command+I', visible: false },
+      ],
+    },
+    {
+      label: 'Page',
+      submenu: [
+        act('Reload Page', 'reload-page', 'Command+R'),
+        act('Back', 'page-back', 'Command+['),
+        act('Forward', 'page-forward', 'Command+]'),
+        { type: 'separator' },
+        act('Next Tab', 'tab-next', 'Shift+Command+]'),
+        { ...act('Next Tab', 'tab-next', 'Control+Tab'), visible: false },
+        act('Previous Tab', 'tab-prev', 'Shift+Command+['),
+        { ...act('Previous Tab', 'tab-prev', 'Control+Shift+Tab'), visible: false },
+        ...[1, 2, 3, 4, 5, 6, 7, 8].map((k) => ({ ...act(`Tab ${k}`, `tab-${k}`, `Command+${k}`), visible: false })),
+        { ...act('Last Tab', 'tab-last', 'Command+9'), visible: false },
+        { type: 'separator' },
+        act('Zoom In', 'page-zoom-in', 'Command+Plus'),
+        { ...act('Zoom In', 'page-zoom-in', 'Command+='), visible: false },   // ⌘+ without Shift, as in Chrome
+        act('Zoom Out', 'page-zoom-out', 'Command+-'),
+        act('Actual Size', 'page-zoom-reset', 'Command+0'),
+        { type: 'separator' },
+        act('Focus Address', 'focus-address', 'Command+L'),
+        act('Save Page', 'save-page', 'Command+D'),
+      ],
+    },
+    {
+      label: 'Window',
+      role: 'window',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'zoom' },
+        { type: 'separator' },
+        { label: 'Close', accelerator: 'Shift+Command+W', click: (_item, win) => { if (win) win.close(); } },
+        { type: 'separator' },
+        { role: 'front' },
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+// ---------- webviews ----------
+
+function sendNewWindow(guest, url, disposition) {
+  const host = !guest.isDestroyed() && guest.hostWebContents;
+  if (!host || host.isDestroyed()) {
+    console.warn(`[flow] a page asked to open ${url} but its window is gone`);
+    return;
+  }
+  host.send('page:new-window', { url, disposition, guestId: guest.id });
+}
+
+// Text in Flow itself (a note, a title, the address bar, search, a terminal's selection): the Mac's text menu, spelling
+// first. app.js shows its own menus elsewhere, so this comes only where app.js leaves the right-click to Chromium.
+function textMenu(wc, params) {
+  const flags = params.editFlags || {};
+  if (!params.isEditable && !(params.selectionText && params.selectionText.trim())) return;
+  const items = [];
+  if (params.isEditable && params.misspelledWord) {
+    for (const word of (params.dictionarySuggestions || []).slice(0, 5)) items.push({ label: word, click: () => wc.replaceMisspelling(word) });
+    if (!items.length) items.push({ label: 'No Spelling Suggestions', enabled: false });
+    items.push({ label: 'Add to Dictionary', click: () => wc.session.addWordToSpellCheckerDictionary(params.misspelledWord) }, { type: 'separator' });
+  }
+  if (params.isEditable) items.push({ label: 'Cut', enabled: !!flags.canCut, click: () => wc.cut() });
+  items.push({ label: 'Copy', enabled: !!flags.canCopy, click: () => wc.copy() });
+  if (params.isEditable) items.push({ label: 'Paste', enabled: !!flags.canPaste, click: () => wc.paste() });
+  const win = BrowserWindow.fromWebContents(wc);
+  if (win) Menu.buildFromTemplate(items).popup({ window: win });
+}
+
+function guestContextMenu(guest, params) {
+  const nav = guest.navigationHistory;
+  const flags = params.editFlags || {};
+  const items = [];
+  // Spelling first, as in Chrome: Chromium's suggestions for the misspelled word under the pointer.
+  if (params.misspelledWord) {
+    for (const word of (params.dictionarySuggestions || []).slice(0, 5)) items.push({ label: word, click: () => guest.replaceMisspelling(word) });
+    if (!items.length) items.push({ label: 'No Spelling Suggestions', enabled: false });
+    items.push({ label: 'Add to Dictionary', click: () => guest.session.addWordToSpellCheckerDictionary(params.misspelledWord) }, { type: 'separator' });
+  }
+  items.push(
+    { label: 'Back', enabled: nav.canGoBack(), click: () => navigatePage(guest, () => nav.goBack()) },
+    { label: 'Forward', enabled: nav.canGoForward(), click: () => navigatePage(guest, () => nav.goForward()) },
+    { label: 'Reload', click: () => navigatePage(guest, () => guest.reload()) },
+    { type: 'separator' },
+  );
+  if (params.isEditable) items.push({ label: 'Cut', enabled: !!flags.canCut, click: () => { touched.add(guest.id); guest.cut(); } });
+  items.push(
+    { label: 'Copy', enabled: !!flags.canCopy, click: () => guest.copy() },
+    { label: 'Paste', enabled: params.isEditable && !!flags.canPaste, click: () => { touched.add(guest.id); guest.paste(); } },
+    { label: 'Select All', enabled: flags.canSelectAll !== false, click: () => guest.selectAll() },
+  );
+  // The selection may sit where the page's own script cannot read it (Chromium's PDF viewer, cross-origin frames).
+  if (params.selectionText && params.selectionText.trim()) {
+    items.push({ label: 'Clip to Note', click: () => {
+      const host = guest.hostWebContents;
+      if (host && !host.isDestroyed()) host.send('page:clip', { guestId: guest.id, text: params.selectionText });
+    } });
+  }
+  if (params.linkURL) {
+    items.push(
+      { type: 'separator' },
+      { label: 'Copy Link', click: () => clipboard.writeText(params.linkURL).catch((e) => console.error(`[flow] could not copy the link: ${e.message}`)) },
+      { label: 'Open Link in New Page', click: () => sendNewWindow(guest, params.linkURL, 'new-page') },
+    );
+  }
