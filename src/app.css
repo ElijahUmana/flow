@@ -1,0 +1,97 @@
+:root{--side:#151517;--line:#26262a;--text:#e9e9ec;--dim:#8d8d93;--faint:#5d5d63;--win:#0f0f11;--bar1:#242428;--bar2:#1c1c1f;--mono:"SF Mono",ui-monospace,Menlo,Monaco,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif;--lights-top:38px;--lights-left:84px}
+html,body{margin:0;height:100%;overflow:hidden;background:#0b0b0d;color:var(--text);font-family:var(--sans);overscroll-behavior:none;-webkit-font-smoothing:antialiased}
+*{box-sizing:border-box}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+.app{position:fixed;inset:0;display:flex}
+
+.sb{width:260px;flex:none;background:#141416;border-right:1px solid var(--line);font-size:12.5px;z-index:60;overflow:hidden;transition:width .3s cubic-bezier(.22,.82,.2,1)}
+.sb.hide{width:0;border-right:0}
+.sb-in{width:260px;height:100%;display:flex;flex-direction:column}
+.sb-top{padding:var(--lights-top) 10px 4px;-webkit-app-region:drag}
+.sb-search{width:100%;height:27px;border-radius:7px;border:1px solid #2c2c30;background:#1d1d20;color:var(--text);padding:0 9px;font-size:12px;outline:none;-webkit-app-region:no-drag}
+.sb-search:focus{border-color:#44444b}
+.sb-list{flex:1;overflow-y:auto;padding:0 6px 12px}
+.wsh{padding:12px 8px 4px}
+.wsn{font-size:13px;font-weight:600;color:#ececf0}
+.wsf{font-size:11px;color:var(--faint);margin-top:2px}
+.wsf[data-folder]{cursor:pointer}
+.wsf[data-folder]:hover{color:var(--dim)}
+.grp{font-size:10.5px;color:#66666c;padding:10px 8px 3px;cursor:pointer;user-select:none;-webkit-user-select:none}
+.grp::before{content:"▾ ";color:#46464c}
+.grp.closed::before{content:"▸ "}
+.sec{font-size:10.5px;letter-spacing:.5px;color:var(--faint);padding:14px 8px 4px;text-transform:uppercase}
+.tr{display:flex;align-items:center;gap:7px;padding:4px 8px;border-radius:6px;cursor:pointer;color:#d2d2d6;white-space:nowrap}
+.tr:hover{background:#1f1f23}
+.tr.d1{padding-left:24px}
+.tr.d2{padding-left:40px}
+.tr.d3{padding-left:56px}
+.tr .g{width:15px;flex:none;text-align:center;color:#66666c;font-size:10.5px}
+.tr .l{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.tr .m{flex:none;font-size:10.5px;color:var(--faint)}
+.tr .p{display:block;font-size:10.5px;color:var(--faint);overflow:hidden;text-overflow:ellipsis}
+.tr.dim .l,.tr.dim .g{color:#6c6c72}
+.tr .x{flex:none;font-size:11px;color:var(--faint);opacity:0;padding:0 2px}
+.tr:hover .x{opacity:1}
+.tr .x:hover{color:#fff}
+.tr.flash{animation:flashrow 1s ease}
+@keyframes flashrow{30%{background:#2c2c32}}
+mark{background:none;color:#fff;text-decoration:underline;text-underline-offset:2px}
+.empty{color:var(--faint);font-size:11.5px;padding:4px 10px}
+.empty.more{cursor:pointer}
+.empty.more:hover{color:var(--dim)}
+.sb-foot{padding:6px 8px;border-top:1px solid var(--line)}
+.sb-foot button,.expand{width:24px;height:22px;border-radius:5px;color:var(--faint)}
+.sb-foot button:hover,.expand:hover{background:#232327;color:var(--dim)}
+.expand{position:absolute;left:8px;bottom:8px;z-index:70;background:rgba(20,20,22,.75);display:none}
+.sb.hide~.expand{display:block}
+
+.stage{position:relative;flex:1;min-width:0;background:#111}
+.menubar{position:absolute;top:0;left:0;right:0;height:32px;z-index:50;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 12px 0 16px;background:rgba(14,14,16,.5);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,.05);-webkit-app-region:drag;transition:padding-left .3s cubic-bezier(.22,.82,.2,1)}
+.sb.hide~.stage .menubar{padding-left:var(--lights-left)}
+/* The pills scroll inside .pills; + sits after them, outside the scroller, so a full row never hides it. */
+.spaces{display:flex;align-items:center;gap:6px;font-size:12.5px;min-width:0}
+.pills{display:flex;align-items:center;gap:6px;min-width:0;overflow-x:auto;scrollbar-width:none}
+.pills::-webkit-scrollbar{display:none}
+.sp{position:relative;display:flex;align-items:center;gap:4px;flex:none;color:#a3a3a9;white-space:nowrap;cursor:pointer;transition:color .2s,background .2s;border-radius:7px;padding:3px 27px 3px 10px;-webkit-app-region:no-drag}
+.sp:hover{color:#ececf0;background:rgba(255,255,255,.06)}
+.sp.on{color:#fff;background:rgba(255,255,255,.15)}
+.sp.dropon{background:rgba(255,255,255,.22);color:#fff}
+.addws{flex:none;width:24px;height:24px;border-radius:7px;color:var(--dim);font-size:16px;line-height:22px;-webkit-app-region:no-drag}
+.addws:hover{background:rgba(255,255,255,.08);color:#fff}
+@media (max-width:1000px){.modes{display:none}.sb,.sb-in{width:220px}.sp{padding:3px 27px 3px 8px}.spaces,.pills{gap:4px}}
+/* The pop-out and close buttons live in reserved pill padding, so appearing on hover or keyboard focus moves nothing. */
+.pop{display:none;position:absolute;top:0;bottom:0;right:14px;width:13px;align-items:center;justify-content:center;font-size:10.5px;color:var(--faint)}
+.sp:hover .pop,.sp:focus-within .pop{display:flex}
+.pop:hover{color:#fff}
+.pillx{position:absolute;top:0;right:0;bottom:0;width:14px;margin:0;padding:0;border:0;background:none;color:var(--faint);font:13px var(--sans);opacity:0;pointer-events:none;-webkit-app-region:no-drag}
+.sp:hover .pillx,.sp:focus-within .pillx,.pillx:focus{opacity:1;pointer-events:auto}
+.pillx:hover,.pillx:focus{color:#fff;outline:none}
+.solonote{font-size:11px;color:var(--faint)}
+.mb-right{display:flex;align-items:center;gap:16px;font-size:12px;flex:none}
+.modes{display:flex;gap:13px}
+.modes button{color:var(--faint);-webkit-app-region:no-drag}
+.modes button:hover{color:var(--dim)}
+.modes button.on{color:var(--text)}
+.rn{cursor:text;outline:none;min-height:0;-webkit-user-select:text;user-select:text}
+.sp .rn{display:inline-block;min-width:3ch}
+.tr .l.rn{text-overflow:clip;color:#fff}
+
+.viewport{position:absolute;inset:0;overflow:hidden}
+.viewport.drop::after{content:"";position:absolute;inset:38px 6px 6px;border:1px dashed rgba(255,255,255,.2);border-radius:10px;pointer-events:none;z-index:45}
+.track{position:absolute;inset:0;display:flex;transition:transform .55s cubic-bezier(.22,.82,.2,1)}
+.ws{flex:0 0 100%;position:relative;overflow:hidden;cursor:default;touch-action:none}
+.viewport.panning .ws{cursor:grabbing}
+.canvas{position:absolute;top:0;left:0;bottom:0}
+.canvas.anim{transition:transform .45s cubic-bezier(.22,.82,.2,1)}
+.edge{position:absolute;top:32px;bottom:0;width:34px;pointer-events:none;opacity:0;transition:opacity .35s;z-index:40}
+.edge.r{right:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.075))}
+.edge.l{left:0;background:linear-gradient(270deg,transparent,rgba(255,255,255,.075))}
+.edge.on{opacity:1}
+.dock{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);display:flex;gap:8px;padding:7px 9px;border-radius:16px;background:rgba(40,40,46,.55);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.08);z-index:55}
+.dock button{position:relative;width:38px;height:38px;border-radius:10px;background:rgba(255,255,255,.08);color:#e6e6ea;font-size:14px;display:flex;align-items:center;justify-content:center}
+.dock button:hover{background:rgba(255,255,255,.16)}
+.dock button span{position:absolute;bottom:46px;left:50%;transform:translateX(-50%);white-space:nowrap;font-size:11.5px;background:rgba(30,30,34,.94);border:1px solid #34343a;border-radius:6px;padding:3px 8px;color:#e6e6ea;opacity:0;pointer-events:none;transition:opacity .15s}
+.dock button:hover span{opacity:1}
+.ov{position:absolute;right:28px;bottom:12px;z-index:54;background:rgba(22,22,26,.92);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border:1px solid rgba(255,255,255,.1);border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,.45);overflow:hidden;cursor:pointer;opacity:0;visibility:hidden;pointer-events:none}
+.ov b{position:absolute;background:rgba(255,255,255,.035);box-shadow:inset 0 0 0 1px rgba(255,255,255,.06);border-radius:3px}
+.ov i{position:absolute;background:rgba(255,255,255,.3);border-radius:2px}
