@@ -925,3 +925,312 @@ function openedWhileQuitting() {
   if (!quitGone && !quitting) return false;
   if (!startAgain) {
     startAgain = true;
+    app.relaunch();
+    console.log('[flow] opened again while quitting: Flow starts again once it has exited');
+  }
+  return true;
+}
+
+// Then a window that saves what it shows (flow.onFlushPages: its pages read their scroll and the state is written) is
+// asked to, and the quit or close waits for its answer, at most FLUSH_WAIT_MS.
+const flushShown = new Set();   // webContents ids of Flow windows listening for window:flush-pages
+const flushWaits = new Map();   // request id -> { wcId, done }
+const FLUSH_WAIT_MS = 2000;
+let flushSeq = 0;
+const shownPages = (pages) => (Array.isArray(pages) ? pages.map(String) : null);
+
+function flushPagesOf(wins) {
+  return Promise.all(wins.filter((w) => !w.isDestroyed() && flushShown.has(w.webContents.id)).map((w) => new Promise((resolve) => {
+    const id = ++flushSeq;
+    const wcId = w.webContents.id;
+    const timer = setTimeout(() => {
+      flushWaits.delete(id);
+      console.error(`[flow] window ${wcId} did not save what it shows within ${FLUSH_WAIT_MS} ms; going on`);
+      resolve();
+    }, FLUSH_WAIT_MS);
+    flushWaits.set(id, { wcId, done: () => { clearTimeout(timer); flushWaits.delete(id); resolve(); } });
+    w.webContents.send('window:flush-pages', id);
+  })));
+}
+
+function forgetFlush(wcId) {
+  flushShown.delete(wcId);
+  for (const f of [...flushWaits.values()]) if (f.wcId === wcId) f.done();
+}
+
+const guestsOf = (win) => webContents.getAllWebContents().filter((w) => w.getType() === 'webview' && !w.isDestroyed() && w.hostWebContents &&
+  w.hostWebContents.id === win.webContents.id);
+
+// Once nothing needs asking, a window on its way out (its close, or a quit) leaves the screen at once and saves what it
+// shows behind it. Hidden, its renderer and pages would be throttled as background pages, so they stop being throttled
+// first; its frame is read before it hides.
+const leaving = new WeakSet();
+const readFrame = new WeakMap();   // Flow window -> reads its frame (bounds, maximized, full screen) into what is kept of it
+
+function leaveScreen(win) {
+  if (win.isDestroyed() || leaving.has(win)) return;
+  for (const wc of [win.webContents, ...guestsOf(win)]) wc.setBackgroundThrottling(false);
+  // macOS would leave a full-screen window's Space behind, empty, if the window hid: that one goes as it closes.
+  if (win.isFullScreen()) return;
+  const read = readFrame.get(win);
+  if (read) read();
+  leaving.add(win);
+  win.hide();
+}
+
+async function unsavedPagesOf(win) {
+  const guests = guestsOf(win).filter((g) => touched.has(g.id));
+  const flags = await Promise.all(guests.map((g) => hasUnsavedChanges(g)));
+  return guests.filter((g, i) => flags[i] && !g.isDestroyed()).map((g) => ({ guestId: g.id, url: g.getURL(), title: g.getTitle() }));
+}
+
+// Whether those windows may close now; each one holding unsaved pages is told instead.
+async function mayClose(wins, action) {
+  const asked = wins.filter((w) => !w.isDestroyed() && unsavedShown.has(w.webContents.id));
+  const found = await Promise.all(asked.map((w) => unsavedPagesOf(w)));
+  let held = false;
+  asked.forEach((w, i) => {
+    if (!found[i].length || w.isDestroyed()) return;
+    held = true;
+    w.webContents.send('window:unsaved-pages', { action, pages: found[i] });
+  });
+  return !held;
+}
+
+async function hasUnsavedChanges(guest) {
+  const answers = await Promise.all(guest.mainFrame.framesInSubtree.map((frame) => within(1000, frame.executeJavaScript(UNSAVED_CHECK)).catch((e) => {
+    console.warn(`[flow] could not ask ${frame.url} about unsaved changes: ${e.message}`);
+    return false;
+  })));
+  return answers.includes(true);
+}
+
+// Zoom is per page. Chromium zooms every page of a site together (webContents.setZoomLevel), so the guest preload
+// zooms only its own page (webFrame.setZoomLevel), and main sets it again for each new document of the page.
+const ZOOM_FACTORS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];   // Chrome's steps
+const levelOf = (factor) => Math.log(factor) / Math.log(1.2);
+
+function setPageZoom(guest, level) {
+  const page = pages.get(guest.id);
+  page.zoom = Math.min(Math.max(level, levelOf(ZOOM_FACTORS[0])), levelOf(ZOOM_FACTORS[ZOOM_FACTORS.length - 1]));
+  guest.send('flow:zoom', page.zoom);
+  return page.zoom;
+}
+
+function zoomPage(guest, step) {
+  const factor = 1.2 ** (pages.get(guest.id).zoom || 0);
+  let next = 1;
+  if (step > 0) next = ZOOM_FACTORS.find((f) => f > factor + 0.001) || factor;
+  else if (step < 0) next = ZOOM_FACTORS.findLast((f) => f < factor - 0.001) || factor;
+  return setPageZoom(guest, levelOf(next));
+}
+
+// A two-finger pinch over a page zooms inside it as Chrome's does (MAC_NOTES 58 b): the page is magnified, not laid out
+// again, and the point under the fingers stays under them. A webview never applies the pinch its guest receives, so main
+// sets Chromium's own page scale on the guest's debugger and moves its visual viewport to keep that point still. From 1x
+// (Chrome does not pinch below the page's own size) to 5x; a new document starts at 1x, as in Chrome.
+const PINCH_MAX = 5;
+const PINCH_GAIN = 0.01;   // a ctrl+wheel delta of -100 px (Chromium's trackpad pinch) is e^1 ≈ 2.7x
+async function pinchPage(guest, p) {
+  const page = pages.get(guest.id);
+  if (!page || guest.isDestroyed()) return null;
+  const d = Number(p && p.deltaY);
+  const x = Number(p && p.x);
+  const y = Number(p && p.y);
+  const vv = p && p.vv;
+  if (!Number.isFinite(d) || !Number.isFinite(x) || !Number.isFinite(y) || !vv || !(vv.s > 0)) return null;
+  const from = vv.s;
+  const to = Math.min(PINCH_MAX, Math.max(1, from * Math.exp(-d * PINCH_GAIN)));
+  if (Math.abs(to - from) < 1e-4) return from;
+  // the page point under the fingers, in the layout viewport: it must be under the same screen point at the new scale
+  const ox = vv.ox + x / from - x / to;
+  const oy = vv.oy + y / from - y / to;
+  if (!page.pinchReady) {
+    await guest.setVisualZoomLevelLimits(1, PINCH_MAX);
+    page.pinchReady = true;
+  }
+  if (!guest.debugger.isAttached()) guest.debugger.attach('1.3');
+  await guest.debugger.sendCommand('Emulation.setPageScaleFactor', { pageScaleFactor: to });
+  guest.send('flow:pinch-anchor', { x: ox, y: oy });
+  return to;
+}
+
+// A link to another app (zoommtg:, slack:, ...) opens only after the page's window asked inline (page:open-external,
+// answered by answerExternal); no answer in 60 s is no. mailto: opens at once.
+const asks = new Map();   // request id -> { hostId, guestId, settle }
+let lastAsk = 0;
+const isAppLink = (url) => /^[a-z][a-z0-9+.-]*:/i.test(url) &&
+  !/^(https?|mailto|file|flow-file|javascript|data|blob|about|chrome|chrome-extension|chrome-untrusted|devtools|view-source|filesystem|ws|wss):/i.test(url);
+
+function askExternal(guest, url, answer) {
+  const host = guest.hostWebContents;
+  if (!host || host.isDestroyed()) {
+    console.warn(`[flow] blocked a page link to ${url}: its window is gone`);
+    answer(false);
+    return;
+  }
+  const requestId = ++lastAsk;
+  const timer = setTimeout(() => {
+    console.warn(`[flow] no answer about opening ${url} in 60 s, not opened`);
+    settle(false);
+  }, 60000);
+  function settle(open) {
+    clearTimeout(timer);
+    asks.delete(requestId);
+    answer(open);
+  }
+  asks.set(requestId, { hostId: host.id, guestId: guest.id, settle });
+  host.send('page:open-external', { guestId: guest.id, url, requestId });
+}
+
+// A site's own sign-in on a page (HTTP auth): its window asks for a name and password in the page's area (page:login,
+// answered by answerPageLogin; again: the last ones did not work) and the answer goes to the site. A page that starts
+// another navigation or goes away, or no answer in 5 minutes, answers nothing, and the site's own page shows. A proxy's
+// or a frame's sign-in is not asked. The name and password are never logged or kept.
+const logins = new Map();   // request id -> { hostId, guestId, settle }
+function askLogin(guest, url, again, callback) {
+  const host = guest.hostWebContents;
+  if (!host || host.isDestroyed()) {
+    callback();
+    return;
+  }
+  const requestId = ++lastAsk;
+  const away = (details) => { if (details.isMainFrame && !details.isSameDocument) settle(null); };
+  const timer = setTimeout(() => settle(null), 300000);
+  function settle(answer) {
+    if (!logins.delete(requestId)) return;
+    clearTimeout(timer);
+    if (!guest.isDestroyed()) guest.off('did-start-navigation', away);
+    if (answer) callback(answer.user, answer.password);
+    else callback();
+  }
+  logins.set(requestId, { hostId: host.id, guestId: guest.id, settle });
+  guest.on('did-start-navigation', away);
+  host.send('page:login', { guestId: guest.id, requestId, host: new URL(url).host, again });
+}
+
+// Page downloads go straight into the downloads folder, no dialog, "name (1).ext" on a clash (dev and test runs with
+// FLOW_USER_DATA keep them in userData/Downloads). When one starts, its page's window is told (download:started) and
+// says which workspace the page is in (download:workspace). When it is done, the page's tab shows it (page:download)
+// and it lands in that workspace's downloads however the tab ended (download:done, to the page's window, or to the
+// main window when that one has closed).
+const downloaded = new Set();   // files Flow saved, the only paths showItemInFolder opens
+const reserved = new Set();     // paths of downloads still running
+const going = new Map();        // download id -> { hostId: the page's window, wsId: its workspace once that window says }
+let downloadSeq = 0;
+const downloadsDir = () => (process.env.FLOW_USER_DATA ? path.join(app.getPath('userData'), 'Downloads') : app.getPath('downloads'));
+
+function downloadPath(name) {
+  const dir = downloadsDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const ext = path.extname(name);
+  const base = path.basename(name, ext) || 'download';
+  let file = path.join(dir, base + ext);
+  for (let n = 1; fs.existsSync(file) || reserved.has(file); n++) file = path.join(dir, `${base} (${n})${ext}`);
+  return file;
+}
+
+function trackDownload(item, wc) {
+  const file = downloadPath(path.basename(item.getFilename() || 'download'));
+  reserved.add(file);
+  item.setSavePath(file);
+  const id = ++downloadSeq;
+  const guestId = wc && !wc.isDestroyed() && wc.getType() === 'webview' ? wc.id : null;
+  const host = guestId == null ? null : wc.hostWebContents;
+  const at = { hostId: host ? host.id : null, wsId: null };
+  going.set(id, at);
+  if (host && !host.isDestroyed()) host.send('download:started', { id, guestId });
+  item.once('done', (_event, state) => {
+    reserved.delete(file);
+    going.delete(id);
+    if (state === 'completed') downloaded.add(file);
+    const d = { id, url: item.getURL(), file, state, bytes: item.getReceivedBytes() };
+    const hostLive = !!host && !host.isDestroyed();
+    if (hostLive && !wc.isDestroyed()) host.send('page:download', { ...d, guestId });
+    const main = flowWindows().find((w) => mainContents.has(w.webContents.id));
+    const to = hostLive ? host : main && main.webContents;
+    if (to && at.wsId) to.send('download:done', { ...d, wsId: at.wsId });
+    if (state !== 'completed') console.warn(`[flow] download of ${item.getURL()} ${state}`);
+  });
+}
+
+// Chromium writes cookies to disk about every 30 s, so a crash could lose a login made just before it: changes are
+// written within 2 s. Session cookies (no expiry) would end at every quit: they are kept for 30 days instead, so
+// logins come back after a quit or a reboot, as with Chrome's "continue where you left off". SameSite=None ones are
+// left alone: Electron's cookie API does not say whether a cookie is partitioned (CHIPS, a third-party frame's cookie
+// kept per top-level site), and a copy would be unpartitioned, sent to that site from every page that embeds it.
+const SESSION_COOKIE_DAYS = 30;
+function keepSessionCookie(ses, c) {
+  const host = c.domain.replace(/^\./, '');
+  const details = { url: `${c.secure ? 'https' : 'http'}://${host}${c.path || '/'}`, name: c.name, value: c.value, path: c.path,
+    secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite, expirationDate: Date.now() / 1000 + SESSION_COOKIE_DAYS * 86400 };
+  if (!c.hostOnly) details.domain = c.domain;
+  ses.cookies.set(details).catch((e) => console.error(`[flow] could not keep the session cookie ${c.name} of ${host}: ${e.message}`));
+}
+
+const PROMPTED = new Set(['media', 'geolocation', 'notifications', 'clipboard-read', 'midi', 'midiSysex', 'display-capture']);
+const ALLOWED = new Set(['fullscreen', 'clipboard-sanitized-write', 'pointerLock', 'window-management']);
+const decisions = new Map();   // `${origin} ${permission}` -> boolean, the user's answers, kept in the state file
+
+// The microphone and the camera are answered apart (media:audio, media:video), as in Chrome.
+function permissionKeys(origin, permission, mediaTypes) {
+  if (permission === 'media' && mediaTypes.length) return mediaTypes.map((t) => `${origin} media:${t}`);
+  return [`${origin} ${permission}`];
+}
+
+// A site the owner allowed still gets nothing until macOS has granted Flow the device; macOS only shows its own
+// prompt when Flow asks it, so ask on the first allowed use (MAC_NOTES 41 b).
+async function macMedia(mediaTypes) {
+  if (process.platform !== 'darwin') return true;
+  const devices = mediaTypes.filter((t) => t === 'video' || t === 'audio').map((t) => (t === 'video' ? 'camera' : 'microphone'));
+  for (const device of devices) {
+    const status = systemPreferences.getMediaAccessStatus(device);
+    if (status === 'granted') continue;
+    if (status !== 'not-determined') {
+      console.warn(`[flow] macOS has ${status} Flow's ${device}; turn it on in System Settings > Privacy & Security > ${device === 'camera' ? 'Camera' : 'Microphone'}`);
+      return false;
+    }
+    if (!(await systemPreferences.askForMediaAccess(device))) return false;
+  }
+  return true;
+}
+
+// A page's camera and microphone answers, for the small control in its address bar, and that control's own answers. A
+// preference (MAC_NOTES 41 b, owner: "turn off my camera"): off is kept for the site and refused before the site can ask,
+// on is kept too. It is the same map the dialog writes, so the next ask matches whichever way the owner last chose.
+const MEDIA = ['media:video', 'media:audio'];
+const mediaDevices = (key) => (key === 'media:video' ? ['video'] : key === 'media:audio' ? ['audio'] : []);
+function mediaState(origin) {
+  return Object.fromEntries(MEDIA.map((m) => {
+    const v = decisions.get(`${origin} ${m}`);
+    return [m === 'media:video' ? 'camera' : 'microphone', v === true ? 'on' : v === false ? 'off' : 'ask'];
+  }));
+}
+// The OS gate is the stricter one, so a site answer of "on" still reads off when macOS has the device blocked.
+function macState(device) {
+  if (process.platform !== 'darwin' || !systemPreferences.getMediaAccessStatus) return 'ask';
+  const status = systemPreferences.getMediaAccessStatus(device);
+  return status === 'granted' ? 'ask' : status === 'not-determined' ? 'ask' : 'off';
+}
+async function setMedia(guest, device, state) {
+  const kind = device === 'camera' ? 'media:video' : device === 'microphone' ? 'media:audio' : null;
+  if (!kind) throw new Error(`flow: no device ${device}`);
+  const origin = mediaOrigin(guest);
+  if (!origin) throw new Error('flow: this page has no site to answer for');
+  const key = `${origin} ${kind}`;
+  if (state === 'ask') decisions.delete(key);
+  else decisions.set(key, state === 'on');
+  store.setPermissions(Object.fromEntries(decisions));
+  if (state === 'on' && process.platform === 'darwin' && systemPreferences.getMediaAccessStatus) {
+    const os = systemPreferences.getMediaAccessStatus(device);
+    if (os === 'not-determined' && systemPreferences.askForMediaAccess) {
+      if (!(await systemPreferences.askForMediaAccess(device))) {
+        decisions.set(key, false);
+        store.setPermissions(Object.fromEntries(decisions));
+        return mediaState(origin);
+      }
+    } else if (os !== 'granted') {
+      decisions.set(key, false);
+      store.setPermissions(Object.fromEntries(decisions));
+    }
+  }
