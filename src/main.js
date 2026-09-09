@@ -1543,3 +1543,312 @@ function setupIpc() {
   on('term:resize', (event, id, cols, rows) => pty.resize(event.sender.id, id, cols, rows));
   on('term:detach', (event, id) => pty.detach(event.sender.id, id));
   handle('term:kill', (_event, id, opts) => pty.kill(id, opts));
+  handle('term:restoreAttach', (_event, id, opts) => pty.restoreAttach(id, opts));
+  handle('term:exists', (_event, id, opts) => pty.exists(id, opts));
+  handle('term:list', (_event, expected) => pty.list(expected));
+  handle('term:panes', (_event, id, opts) => pty.panes(id, opts));
+  handle('term:find', (_event, id, op, opts) => pty.find(id, op, opts));
+  handle('term:breakPane', (_event, id, paneId, newId) => pty.breakPane(id, paneId, newId));
+  handle('term:joinPane', (event, srcId, dstId) => pty.joinPane(event.sender.id, srcId, dstId));
+  handle('term:teammate', (_event, id, paneId, opts) => pty.teammate(id, paneId, opts));
+  handle('term:teamSessions', (_event, id, opts) => pty.teamSessions(id, opts));
+  handle('term:resumeCommand', (_event, sessionId, opts) => pty.resumeCommand(sessionId, opts));
+  handle('term:holds', (_event, id, sessionId, opts) => pty.holds(id, sessionId, opts));
+
+  handle('sessions:list', () => sessions.list());
+  handle('sessions:search', (_event, query, opts) => sessions.search(query, opts));
+  // Only the two guards that reopen a conversation ask this. A claude Flow has just ended (still exiting) is left out:
+  // the window opens at once, and pty's open starts its terminal's claude once that one has exited.
+  handle('sessions:running', async () => (await sessions.running()).filter((r) => !pty.isEnding(r.pid)));
+  handle('sessions:has', (_event, id) => sessions.has(id));
+
+  handle('files:list', (_event, host, dir) => files.list(host, dir));
+  handle('files:exist', (_event, paths) => files.exist(paths));
+  handle('files:open', (_event, host, file, how) => files.open(host, file, how === 'dropped' ? 'dropped' : undefined));
+  on('files:watch', (event, dirs) => files.watch(event.sender, dirs));
+  on('files:reveal', (_event, file) => files.reveal(file));
+  handle('files:copy', (_event, host, p, macDir) => vmfiles.copy(host, p, macDir == null ? undefined : macDir));
+  handle('files:put', (_event, macFile, host, dir, opts) => vmfiles.put(macFile, host, dir, opts));
+  handle('files:retry', () => vmfiles.retryNow());
+
+  // A space already in a pop-out comes forward instead of opening twice. A pop-out on its way out never comes back:
+  // its space opens again once it has saved and closed. frame: where a new pop-out opens (one closePopout gave).
+  const openWindow = (h, frame) => {
+    const space = spaceOf(h);
+    const open = space && popoutOf(space);
+    if (open && leaving.has(open)) open.once('closed', () => { if (!quitting) openWindow(h, frame); });
+    else if (open) bringForward(open);
+    else createWindow(h, false, frame);
+  };
+  const frameOf = (f) => (f && typeof f === 'object' && ['x', 'y', 'width', 'height'].every((k) => Number.isFinite(f[k]))
+    ? { x: f.x, y: f.y, width: f.width, height: f.height, maximized: !!f.maximized, fullScreen: !!f.fullScreen } : undefined);
+  // A native menu at the pointer for the renderer's own items (term.js's terminal menu): the chosen item's id, or null
+  // when it is dismissed.
+  handle('menu:popup', (event, items, at) => new Promise((resolve) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const list = Array.isArray(items) ? items.slice(0, 30) : [];
+    if (!win || !list.length) { resolve(null); return; }
+    let chosen = null;
+    const menu = Menu.buildFromTemplate(list.map((it) => (it && it.type === 'separator' ? { type: 'separator' }
+      : { label: String(it && it.label), enabled: !(it && it.enabled === false), click: () => { chosen = String(it.id); } })));
+    const p = at && Number.isFinite(at.x) && Number.isFinite(at.y) ? { x: Math.round(at.x), y: Math.round(at.y) } : {};
+    menu.popup({ window: win, ...p, callback: () => resolve(chosen) });
+  }));
+  // the Flow window's own undo, redo or paste: app.js's when no note has the keys (the Edit menu sends it 'undo' and
+  // 'redo'), and term.js's terminal menu, whose Paste goes in as ⌘V does (into xterm's textarea, then its paste handler)
+  on('edit:native', (event, cmd) => {
+    if (cmd === 'undo') event.sender.undo();
+    else if (cmd === 'redo') event.sender.redo();
+    else if (cmd === 'paste') event.sender.paste();
+    else console.warn(`[flow] edit:native: no such edit ${String(cmd).slice(0, 40)}`);
+  });
+  on('window:open', (_event, hash, frame) => openWindow(String(hash || '').replace(/^#/, ''), frameOf(frame)));
+  // A sub-workspace removed while it is popped out (nav): its pop-out closes at once, saving what it shows, with no
+  // question about unsaved pages (owner, Nov 1 20:46), and its frame comes back, for an undo to open it there again.
+  // Null when no window holds that space.
+  handle('popouts:close', async (_event, space) => {
+    const win = space && typeof space === 'object' && space.ws ? popoutOf({ ws: String(space.ws), zone: space.zone == null ? null : String(space.zone) }) : null;
+    if (!win) return null;
+    const entry = popouts.get(win);
+    const closed = new Promise((resolve) => win.once('closed', resolve));
+    if (!leaving.has(win)) {
+      closeAnyway.add(win);
+      win.close();
+    }
+    await closed;
+    return { ...entry.bounds, maximized: !!entry.maximized, fullScreen: !!entry.fullScreen };
+  });
+  handle('popouts:list', () => openSpaces());
+  handle('popouts:frames', () => openSpaceFrames());
+  handle('popouts:focus', (_event, space) => {
+    const win = space && typeof space === 'object' && space.ws ? popoutOf({ ws: String(space.ws), zone: space.zone == null ? null : String(space.zone) }) : null;
+    if (!win || leaving.has(win)) return false;
+    bringForward(win);
+    return true;
+  });
+  handle('dialog:pickFolder', async (event, defaultPath) => {
+    let start = defaultPath ? String(defaultPath) : HOME;
+    if (start === '~' || start.startsWith('~/')) start = path.join(HOME, start.slice(1));
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'], defaultPath: start, buttonLabel: 'Choose' });
+    return r.canceled || !r.filePaths.length ? null : r.filePaths[0];
+  });
+  handle('clipboard:saveImage', () => saveClipboardImage());
+
+  // A Flow window acts only on the pages it holds.
+  const guestOf = (event, guestId) => {
+    const guest = webContents.fromId(Number(guestId));
+    const host = guest && !guest.isDestroyed() && guest.getType() === 'webview' ? guest.hostWebContents : null;
+    if (host && host.id === event.sender.id && pages.has(guest.id)) return guest;
+    throw new Error(`flow: no page ${guestId} in this window`);
+  };
+  handle('page:allowUnload', (event, guestId) => allowUnload(guestOf(event, guestId)));
+  handle('page:hasUnsavedChanges', (event, guestId) => hasUnsavedChanges(guestOf(event, guestId)));
+  handle('page:zoom', (event, guestId, step) => zoomPage(guestOf(event, guestId), Math.sign(Number(step) || 0)));
+  handle('page:pinch', (event, guestId, p) => pinchPage(guestOf(event, guestId), p));
+  handle('page:setZoom', (event, guestId, level) => setPageZoom(guestOf(event, guestId), Number(level) || 0));
+  handle('page:history', (event, guestId) => pageHistory(guestOf(event, guestId)));
+  handle('page:media', (event, guestId) => mediaFor(guestOf(event, guestId)));
+  handle('page:setMedia', (event, guestId, device, state) => setMedia(guestOf(event, guestId), String(device), String(state)));
+  handle('page:pdfPlace', (event, guestId) => pdfPlace(guestOf(event, guestId)));
+  handle('page:pdfShown', (event, guestId, at) => pdfShown(guestOf(event, guestId), at));
+  on('window:unsaved-shown', (event) => unsavedShown.add(event.sender.id));
+  on('window:flush-shown', (event, shown) => (shown === false ? forgetFlush(event.sender.id) : flushShown.add(event.sender.id)));
+  on('window:pages-flushed', (event, id) => {
+    const f = flushWaits.get(id);
+    if (f && f.wcId === event.sender.id) f.done();
+  });
+  on('window:close-anyway', (event, action) => {
+    if (action === 'quit') {
+      quitAnyway = true;
+      app.quit();
+      return;
+    }
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win) return;
+    closeAnyway.add(win);
+    win.close();
+  });
+  handle('page:restoreNext', (event, src, history) => expectRestore(event.sender.id, String(src), history));
+  on('page:answerExternal', (event, requestId, open) => {
+    const ask = asks.get(requestId);
+    if (!ask || ask.hostId !== event.sender.id) {
+      console.warn(`[flow] answerExternal: no open question ${requestId} for this window`);
+      return;
+    }
+    ask.settle(open === true);
+  });
+  on('page:answerLogin', (event, requestId, answer) => {
+    const login = logins.get(requestId);
+    if (!login || login.hostId !== event.sender.id) {
+      console.warn(`[flow] answerPageLogin: no open sign-in ${requestId} for this window`);
+      return;
+    }
+    login.settle(answer && typeof answer.user === 'string' && typeof answer.password === 'string' ? answer : null);
+  });
+  on('download:workspace', (event, id, wsId) => {
+    const at = going.get(id);
+    if (!at || at.hostId !== event.sender.id || typeof wsId !== 'string' || !wsId) {
+      console.warn(`[flow] download:workspace: no download ${id} started in this window`);
+      return;
+    }
+    at.wsId = wsId;
+  });
+  ipcMain.on('flow:page-navigate', pageNavigating);
+  ipcMain.on('flow:edited', (event) => {
+    if (pages.has(event.sender.id)) touched.add(event.sender.id);
+  });
+  on('shell:showItemInFolder', (_event, file) => {
+    if (!downloaded.has(file)) {
+      console.warn(`[flow] showItemInFolder refused ${file}: not a file Flow downloaded`);
+      return;
+    }
+    shell.showItemInFolder(file);
+  });
+  on('shell:openExternal', (_event, url) => {
+    if (!/^(https?|mailto):/i.test(url)) {
+      console.warn(`[flow] openExternal refused ${url}`);
+      return;
+    }
+    shell.openExternal(url).catch((e) => console.error(`[flow] could not open ${url}: ${e.message}`));
+  });
+}
+
+// ---------- app ----------
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  store = new Store(app.getPath('userData'), { broadcast: broadcastState, onCorrupt: reportCorruptState, alive: (id) => flowContents.has(id),
+    isMain: (id) => mainContents.has(id), workspaceOf: workspaceOfContents });
+  vmfiles.init({ spawn: pty.sshSpawn, sshRetry: pty.sshRetry, openPath: (f) => shell.openPath(f), cacheDir: path.join(app.getPath('userData'), 'vm-files'), downloads: downloadsDir() });
+  files.init({ store, home: HOME, vm: vmfiles });
+  pty.init({ socket: SOCKET, version: app.getVersion() }).then((env) => {
+    if (env.CLAUDE_CONFIG_DIR) sessions.setClaudeDir(env.CLAUDE_CONFIG_DIR.replace(/^~(?=$|\/)/, HOME));
+    sessions.setTmux(pty.info());
+  });
+
+  app.on('second-instance', () => {
+    if (openedWhileQuitting()) return;
+    const w = flowWindows()[0];
+    if (!w) {
+      if (app.isReady()) createWindow('', true);
+      return;
+    }
+    if (BACKGROUND) {
+      showInBackground(w);
+      return;
+    }
+    if (w.isMinimized()) w.restore();
+    w.show();
+    w.focus();
+  });
+
+  app.whenReady().then(() => {
+    app.setAboutPanelOptions({ applicationName: 'Flow', applicationVersion: app.getVersion() });
+    // Electron leaves both off, so a Google "use your passkey" step had nothing to offer and sat there instead of
+    // asking for Touch ID. platformPasskeys also makes the system's own sheet offer iCloud Keychain and a password
+    // manager's passkeys. Anything with readers can still answer the prompt instead.
+    try {
+      app.configureWebAuthn({ platformPasskeys: true, touchID: { keychainAccessGroup: 'so.flow.app', promptReason: 'sign in' } });
+    } catch (e) {
+      console.error(`[flow] passkeys unavailable: ${e.message}`);
+    }
+    setupPageSession();
+    setupIpc();
+    buildMenu();
+    touch.start();
+    createWindow('', true);
+    // Pop-outs open at the last quit or crash come back where they were; one for a workspace that is gone is dropped.
+    const doc = store.load();
+    const known = new Set((doc && Array.isArray(doc.ws) ? doc.ws : []).map((w) => w && w.id));
+    for (const p of store.getPopouts().slice()) {
+      const solo = new URLSearchParams(p.hash).get('solo');
+      if (solo && !known.has(solo)) continue;
+      createWindow(p.hash, false, { ...p.bounds, maximized: p.maximized, fullScreen: p.fullScreen });
+    }
+    savePopouts(false);
+    // Warm the sessions index so the first search is instant.
+    setTimeout(() => {
+      sessions.list().catch((e) => console.error(`[flow] could not index Claude Code sessions: ${e.message}`));
+    }, 1500);
+  });
+
+  app.on('activate', () => {
+    if (openedWhileQuitting()) return;
+    if (app.isReady() && flowWindows().length === 0) createWindow('', true);
+  });
+
+  app.on('before-quit', (event) => {
+    const wins = flowWindows();
+    if (!quitReady && wins.some((w) => (!quitAnyway && unsavedShown.has(w.webContents.id)) || flushShown.has(w.webContents.id))) {
+      event.preventDefault();
+      if (quitChecking) return;
+      quitChecking = true;
+      (async () => {
+        if (!quitAnyway && !(await mayClose(wins, 'quit'))) return false;
+        quitGone = true;
+        for (const w of BrowserWindow.getAllWindows()) leaveScreen(w);
+        await flushPagesOf(flowWindows());
+        return true;
+      })().then((go) => {
+        quitChecking = false;
+        if (!go) return;
+        quitReady = true;
+        app.quit();
+      }, (e) => {
+        quitChecking = false;
+        console.error(`[flow] could not ask the windows before quitting, quitting: ${e.message}`);
+        quitReady = true;
+        app.quit();
+      });
+      return;
+    }
+    // The windows close now, in no fixed order, each saving as it goes (no store yet: a second instance quitting).
+    if (store) store.freezeOwners();
+    quitting = true;
+  });
+
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+  });
+
+  let exiting = false;
+  app.on('will-quit', (event) => {
+    if (exiting) {
+      event.preventDefault();
+      return;
+    }
+    try {
+      store.flushPending();
+    } catch (e) {
+      console.error(`[flow] could not save state on quit: ${e.message}`);
+    }
+    try {
+      sessions.stop();
+    } catch (e) {
+      console.error(`[flow] could not stop the session index: ${e.message}`);
+    }
+    try {
+      vmfiles.shutdown();
+    } catch (e) {
+      console.error(`[flow] could not end the VM file loops: ${e.message}`);
+    }
+    try {
+      touch.stop();
+    } catch (e) {
+      console.error(`[flow] could not stop the trackpad touches: ${e.message}`);
+    }
+    if (!pty.pending()) return;
+    // Quit only once every terminal client has reported its exit (pty.shutdown says why).
+    event.preventDefault();
+    exiting = true;
+    pty.shutdown()
+      .catch((e) => console.error(`[flow] quit: ${e.message}`))
+      .finally(() => app.exit(0));
+  });
+}
+
+
+
+
