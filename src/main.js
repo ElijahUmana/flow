@@ -1234,3 +1234,312 @@ async function setMedia(guest, device, state) {
       store.setPermissions(Object.fromEntries(decisions));
     }
   }
+  mediaChanged(guest);
+  return mediaState(origin);
+}
+// The control in the address bar repaints whenever the site asks, so a fresh ask shows up without a reload.
+function mediaChangedOnly(guest) {
+  const p = guest && pages.get(guest.id);
+  if (p) { const now = Date.now(); p.using.camera = now; p.using.microphone = now; }
+  mediaChanged(guest);
+}
+function mediaChanged(guest) {
+  const host = guest && guest.hostWebContents;
+  if (host && !host.isDestroyed()) host.send('page:media-changed');
+}
+// `asked` is what the control's visibility turns on: a site that asked and was not yet answered for a device, or has an
+// answer, shows it; a site that never asked stays bare (a file page included, whose origin is null).
+function mediaFor(guest) {
+  const origin = mediaOrigin(guest);
+  const p = pages.get(guest.id);
+  const now = Date.now();
+  const asked = { camera: !!(p && p.asked.video), microphone: !!(p && p.asked.audio) };
+  // `live`: the site is holding the device now, or was answered under a second ago (a grant takes a moment to apply).
+  const live = { camera: !!p && now - (p.using.camera || 0) < 4000, microphone: !!p && now - (p.using.microphone || 0) < 4000 };
+  return { origin, ...mediaState(origin), asked, live, mac: { camera: macState('camera'), microphone: macState('microphone') } };
+}
+// A page's own answer key. A file page has no origin, so it is keyed on its file: URL (the same page reopened gets the
+// same answers, and no other page inherits them).
+const mediaOrigin = (guest) => { const o = originOf(guest.getURL()); return o && o !== 'null' ? o : (guest.getURL() || '').replace(/#.*$/, ''); };
+function originOf(u) {
+  try { return new URL(u).origin; } catch { return ''; }
+}
+function permissionLabel(permission, details) {
+  if (permission === 'media') {
+    const types = details.mediaTypes || [];
+    if (types.includes('video') && types.includes('audio')) return 'use your camera and microphone';
+    if (types.includes('video')) return 'use your camera';
+    return 'use your microphone';
+  }
+  return {
+    geolocation: 'know your location',
+    notifications: 'show notifications',
+    'clipboard-read': 'read your clipboard',
+    midi: 'use your MIDI devices',
+    midiSysex: 'use your MIDI devices',
+    'display-capture': 'record your screen',
+  }[permission] || permission;
+}
+
+// A workspace file's HTML page (a report) runs in a session of its own that reaches no network: its proxy goes nowhere,
+// loopback included, and its WebRTC may only use the proxy. No page policy covers WebRTC: STUN over UDP and TURN over
+// TCP would reach the network from any frame of the page, a blank frame it makes included. Its pages are served only
+// once it is cut off. Pages of either kind keep it (keepKind).
+const FILE_PAGES = 'persist:flow-files';
+const isFilePage = (url) => /^flow-file:[^?#]*\.html?(?:[?#]|$)/i.test(url || '');
+const inFilePages = (wc) => wc.session === session.fromPartition(FILE_PAGES);
+const crossesKind = (wc, url) => (inFilePages(wc) ? /^(?:https?|flow-file):/i.test(url) && !isFilePage(url) : isFilePage(url));
+
+const GOOGLE_AUTH_URLS = {
+  urls: ['https://accounts.google.com/*', 'https://accounts.youtube.com/*'],
+};
+
+function addGoogleAuthHints(ses) {
+  // Electron keeps one listener per webRequest event. This owns these two slots for persist:flow.
+  const { low, high } = chromeHints();
+  const lowHints = Object.entries(low).map(([name, value]) => ({ name, value, lower: name.toLowerCase() }));
+  const highHints = new Map(Object.entries(high).map(([name, value]) => [name.toLowerCase(), { name, value }]));
+  const accepted = new Map();
+  ses.webRequest.onHeadersReceived(GOOGLE_AUTH_URLS, (details, callback) => {
+    const origin = new URL(details.url).origin;
+    let found = false;
+    let cleared = false;
+    const requested = new Set();
+    for (const [name, entries] of Object.entries(details.responseHeaders || {})) {
+      const lower = name.toLowerCase();
+      const values = Array.isArray(entries) ? entries : [entries];
+      if (lower === 'clear-site-data' && values.some((value) => /(?:^|,)\s*"(?:clientHints|\*)"\s*(?:,|$)/i.test(String(value)))) cleared = true;
+      if (lower !== 'accept-ch') continue;
+      found = true;
+      for (const value of values) {
+        for (const token of String(value).split(',')) {
+          const normalized = token.trim().toLowerCase();
+          if (normalized) requested.add(normalized);
+        }
+      }
+    }
+    if (cleared) accepted.delete(origin);
+    else if (found) accepted.set(origin, requested);
+    callback({});
+  });
+  ses.webRequest.onBeforeSendHeaders(GOOGLE_AUTH_URLS, (details, callback) => {
+    const headers = details.requestHeaders;
+    const present = new Map(Object.keys(headers).map((name) => [name.toLowerCase(), name]));
+    for (const { name, value, lower } of lowHints) {
+      if (present.has(lower)) headers[present.get(lower)] = value; else headers[name] = value;
+    }
+    for (const token of accepted.get(new URL(details.url).origin) || []) {
+      const hint = highHints.get(token);
+      if (!hint) continue;
+      if (present.has(token)) headers[present.get(token)] = hint.value; else headers[hint.name] = hint.value;
+    }
+    callback({ requestHeaders: headers });
+  });
+}
+
+// A guest webview is created from webPreferences, so it keeps Chromium's own agent and brand list whatever the session
+// says: Google then sees an engine with no Chrome brand and refuses the sign-in. Set the same identity on the guest and
+// on its own debugger, which is what Chromium builds the client hints from.
+function chromeGuestIdentity(contents) {
+  contents.once('did-attach', () => {
+    try {
+      if (!contents.debugger.isAttached()) contents.debugger.attach('1.3');
+      contents.debugger.sendCommand('Network.setUserAgentOverride', {
+        userAgent: CHROME_EXACT_UA,
+        acceptLanguage: 'en-US,en',
+        platform: 'macOS',
+        userAgentMetadata: {
+          brands: CHROME_BRANDS,
+          fullVersionList: CHROME_FULL_BRANDS,
+          fullVersion: process.versions.chrome,
+          platform: 'macOS',
+          platformVersion: process.getSystemVersion(),
+          architecture: CHROME_ARCHITECTURES[process.arch].architecture,
+          model: '',
+          mobile: false,
+          bitness: CHROME_ARCHITECTURES[process.arch].bitness,
+          wow64: false,
+        },
+      }).catch((e) => console.error(`[flow] could not describe this page as Chrome: ${e.message}`));
+    } catch (e) {
+      console.error(`[flow] could not describe this page as Chrome: ${e.message}`);
+    }
+  });
+}
+
+function setupPageSession() {
+  for (const [key, allowed] of Object.entries(store.getPermissions())) if (typeof allowed === 'boolean') decisions.set(key, allowed);
+  const pages = session.fromPartition('persist:flow');
+  addGoogleAuthHints(pages);
+  setupPages(pages);
+  const reports = session.fromPartition(FILE_PAGES);
+  reports.setProxy({ proxyRules: 'socks5://127.0.0.1:1', proxyBypassRules: '<-loopback>' })
+    .then(() => setupPages(reports), (e) => console.error(`[flow] reports will not open: their session could not be cut off the network: ${e.message}`));
+}
+
+function setupPages(ses) {
+  // Not ses.setUserAgent(): it makes Chromium drop the brand list for every guest in the session. Guests get the agent
+  // in chromeGuestIdentity instead, and the main window uses app.userAgentFallback above.
+  ses.on('will-download', (_event, item, wc) => trackDownload(item, wc));
+  files.serveOn(ses);
+  let flushing = null;
+  ses.cookies.on('changed', (_event, cookie, _cause, removed) => {
+    if (!removed && cookie.session && cookie.sameSite !== 'no_restriction') keepSessionCookie(ses, cookie);
+    if (flushing) return;
+    flushing = setTimeout(() => {
+      flushing = null;
+      ses.cookies.flushStore().catch((e) => console.error(`[flow] could not save cookies: ${e.message}`));
+    }, 2000);
+  });
+  // Being asked means the site is trying to use the device now: that is when the page's control shows. It goes again once
+  // the request is answered and whatever came of it (active() below clears it when the device is not in use).
+  ses.setPermissionRequestHandler((wc, permission, callback, details) => {
+    if (permission === 'media') mediaChangedOnly(wc);
+    // A plain link to another scheme never reaches setWindowOpenHandler: it asks for 'openExternal'.
+    if (permission === 'openExternal') {
+      const url = details.externalURL || '';
+      if (/^mailto:/i.test(url)) return callback(true);
+      if (wc && wc.getType() === 'webview' && isAppLink(url)) return askExternal(wc, url, callback);
+      console.warn(`[flow] blocked a page link to ${url}`);
+      return callback(false);
+    }
+    if (ALLOWED.has(permission)) return callback(true);
+    if (!PROMPTED.has(permission)) return callback(false);
+    let origin = '';
+    try {
+      origin = new URL(details.requestingUrl || wc.getURL()).origin;
+    } catch (e) {
+      return callback(false);
+    }
+    const keys = permissionKeys(origin, permission, details.mediaTypes || []);
+    const grant = (allowed) => {
+      if (permission === 'media') mediaChangedOnly(wc);
+      if (!allowed || permission !== 'media') return callback(allowed);
+      macMedia(details.mediaTypes || []).then(callback, (e) => {
+        console.error(`[flow] could not ask macOS for the camera or microphone: ${e.message}`);
+        callback(false);
+      });
+    };
+    if (keys.some((k) => decisions.get(k) === false)) return callback(false);
+  if (permission === 'media') {
+    const p = pages.get(wc.id);
+    if (p) for (const t of details.mediaTypes || []) p.asked[t] = true;
+  }
+  mediaChanged(wc);
+    if (keys.every((k) => decisions.get(k) === true)) return grant(true);
+    const host = wc.hostWebContents;
+    const win = host ? BrowserWindow.fromWebContents(host) : null;
+    const box = { type: 'question', buttons: ['allow', "don't allow"], defaultId: 1, cancelId: 1, message: `${origin} wants to ${permissionLabel(permission, details)}` };
+    (win ? dialog.showMessageBox(win, box) : dialog.showMessageBox(box)).then(({ response }) => {
+      for (const k of keys) decisions.set(k, response === 0);
+      store.setPermissions(Object.fromEntries(decisions));
+      grant(response === 0);
+    }, (e) => {
+      console.error(`[flow] permission prompt failed: ${e.message}`);
+      callback(false);
+    });
+  });
+  // What a page reads (Notification.permission, permissions.query) and what Chromium checks before showing a
+  // notification: the user's answer. One never asked stays granted, Electron's default, since Electron has no "ask".
+  ses.setPermissionCheckHandler((_wc, permission, requestingOrigin, details) => {
+    if (!PROMPTED.has(permission) || !URL.canParse(requestingOrigin)) return true;
+    const keys = permissionKeys(new URL(requestingOrigin).origin, permission, details.mediaType ? [details.mediaType] : []);
+    return !keys.some((k) => decisions.get(k) === false);
+  });
+}
+
+app.on('web-contents-created', (_event, contents) => {
+  const type = contents.getType();
+  if (type === 'window') {
+    contents.on('will-attach-webview', (event, webPreferences, params) => {
+      webPreferences.preload = path.join(__dirname, 'guest-preload.js');
+      webPreferences.nodeIntegration = false;
+      webPreferences.nodeIntegrationInSubFrames = false;
+      webPreferences.contextIsolation = true;
+      webPreferences.sandbox = true;
+      webPreferences.webSecurity = true;
+      webPreferences.allowRunningInsecureContent = false;
+      webPreferences.webviewTag = false;
+      webPreferences.experimentalFeatures = false;
+      webPreferences.spellcheck = true;
+      delete webPreferences.enableBlinkFeatures;
+      // Every page runs in persist:flow and a report in FILE_PAGES, whatever partition its <webview> asked for: Electron
+      // builds the guest from webPreferences, so params.partition alone would leave a webview without the attribute in
+      // the default session.
+      const src = params.src || '';
+      webPreferences.partition = isFilePage(src) ? FILE_PAGES : 'persist:flow';
+      params.partition = webPreferences.partition;
+      if (src && !/^(https?:|flow-file:|about:blank$)/i.test(src)) {
+        event.preventDefault();
+        console.warn(`[flow] refused a webview for ${src}`);
+        return;
+      }
+      nextRestore = takeRestore(contents.id, src);
+      if (nextRestore) delete params.src;
+    });
+  } else if (type === 'webview') {
+    chromeGuestIdentity(contents);
+    hardenGuest(contents);
+  }
+});
+
+// ---------- IPC ----------
+
+function trusted(event) {
+  const frame = event.senderFrame;
+  return flowContents.has(event.sender.id) && !!frame && !frame.parent;
+}
+
+function handle(channel, fn) {
+  ipcMain.handle(channel, (event, ...args) => {
+    if (!trusted(event)) throw new Error(`flow: ${channel} is only available to Flow windows`);
+    return fn(event, ...args);
+  });
+}
+
+function on(channel, fn) {
+  ipcMain.on(channel, (event, ...args) => {
+    if (!trusted(event)) {
+      console.warn(`[flow] ignored ${channel} from an untrusted sender`);
+      return;
+    }
+    fn(event, ...args);
+  });
+}
+
+// ⌘V of an image in a terminal: Claude Code takes an image by its file path. Never written under ~/.claude.
+// Electron 45's clipboard is the promise-based ClipboardItem API (readImage() is gone).
+async function saveClipboardImage() {
+  for (const item of await clipboard.read()) {
+    const type = item.types.includes('image/png') ? 'image/png' : item.types.find((t) => t.startsWith('image/'));
+    if (!type) continue;
+    const data = Buffer.from(await (await item.getType(type)).arrayBuffer());
+    const png = type === 'image/png' ? data : nativeImage.createFromBuffer(data).toPNG();
+    if (!png.length) continue;
+    const dir = path.join(app.getPath('userData'), 'pasted-images');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, `paste-${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomBytes(3).toString('hex')}.png`);
+    fs.writeFileSync(file, png, { mode: 0o600, flag: 'wx' });
+    return file;
+  }
+  return null;
+}
+
+function setupIpc() {
+  ipcMain.on('flow:info', (event) => {
+    event.returnValue = trusted(event) ? { version: app.getVersion() } : { version: '' };
+  });
+
+  handle('state:load', (event) => store.load(event.sender.id));
+  on('state:save', (event, obj, pages, base) => store.save(obj, event.sender.id, shownPages(pages), base));
+  on('fingers:wanted', (event) => touch.want(event.sender));
+  handle('state:flush', (event, obj, pages, base) => store.flush(obj, event.sender.id, shownPages(pages), base));
+  handle('state:revision', (_event, id) => store.revision(id));
+  handle('state:closeWorkspace', (event, obj, pages, base, targetId, expected, revision) =>
+    store.closeWorkspace(obj, event.sender.id, shownPages(pages), base, targetId, expected, revision));
+
+  handle('term:open', (event, opts) => pty.open(event.sender, opts));
+  on('term:write', (event, id, data) => pty.write(event.sender.id, id, data));
+  on('term:resize', (event, id, cols, rows) => pty.resize(event.sender.id, id, cols, rows));
+  on('term:detach', (event, id) => pty.detach(event.sender.id, id));
+  handle('term:kill', (_event, id, opts) => pty.kill(id, opts));
