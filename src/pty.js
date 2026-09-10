@@ -590,3 +590,299 @@ function spawnClient(wc, id, file, args, cols, rows, cwd) {
   proc.onData((d) => queue(c, d));
   proc.onExit(({ exitCode, signal }) => {
     running.delete(c);
+    if (whenIdle && !running.size) whenIdle();
+    onClientExit(c, exitCode, signal);
+  });
+  return c;
+}
+
+// A fork (forkFrom: the parent's session id) starts as a copy of the parent under its own id; once its own transcript
+// exists it always resumes that, so a restart never forks the parent again.
+function claudeArgs(sessionId, resume, forkFrom) {
+  if (!sessionId) return '';
+  if ((resume || forkFrom) && transcriptExists(sessionId)) return ' --resume ' + sessionId;
+  if (forkFrom && transcriptExists(forkFrom)) return ' --resume ' + forkFrom + ' --fork-session --session-id ' + sessionId;
+  return ' --session-id ' + sessionId;
+}
+
+function localCommand(cmd, sessionId, resume, forkFrom) {
+  if (cmd === 'shell') return ['/bin/zsh', '-il'];
+  return ['/bin/zsh', '-ilc', shq(resolveClaude()) + claudeArgs(sessionId, resume, forkFrom) + '; exec /bin/zsh -il'];
+}
+function localRecoveryCommand(sessionId) {
+  return ['/bin/zsh', '-lc', shq(resolveClaude()) + claudeArgs(sessionId, true, null) + '; exec /bin/zsh -il'];
+}
+
+// Runs on the remote host through tmux's default-shell, so $SHELL is the remote user's shell and the
+// transcript check happens over there.
+function remoteClaude(sessionId, resume, forkFrom) {
+  let inner = 'claude';
+  const has = (sid) => `[ -n "$(find "$HOME/.claude/projects" -maxdepth 2 -name '${sid}.jsonl' -print 2>/dev/null | head -n 1)" ]`;
+  if (sessionId && (resume || forkFrom)) {
+    inner = `if ${has(sessionId)}; then claude --resume ${sessionId}; ` +
+      (forkFrom
+        ? `elif ${has(forkFrom)}; then claude --resume ${forkFrom} --fork-session --session-id ${sessionId}; ` +
+          `else echo 'flow: cannot fork: session ${forkFrom} has no transcript on this host'; fi`
+        : `else claude --session-id ${sessionId}; fi`);
+  } else if (sessionId) {
+    inner = 'claude --session-id ' + sessionId;
+  }
+  return 'exec "$SHELL" -lic ' + shq(inner + '; exec "$SHELL" -l');
+}
+
+// Opens and kills of one terminal: an open starts once every open and kill of it before has settled, so it never finds a
+// session an end is still taking down. A kill applies at once: an open of it still in flight (checking who holds its
+// conversation, waiting for an ended claude, making its session) then stops and starts nothing, or ends the session it
+// has just made, so no claude starts only to be ended and no session runs on with no window.
+const turns = new Map();   // terminal id -> its last open or kill, until it settles
+const ends = new Map();    // terminal id -> how many kills of it came while its turns were in flight
+const ENDED_FIRST = 'ended before it started';
+function inTurn(sid, mine) {
+  turns.set(sid, mine);
+  const settled = () => {
+    if (turns.get(sid) !== mine) return;
+    turns.delete(sid);
+    ends.delete(sid);
+  };
+  mine.then(settled, settled);
+  return mine;
+}
+
+function open(wc, opts) {
+  const sid = sanitize(opts && typeof opts === 'object' ? opts.id : '');
+  const at = ends.get(sid) || 0;
+  const run = () => openNow(wc, opts, () => (ends.get(sid) || 0) !== at);
+  return inTurn(sid, (turns.get(sid) || Promise.resolve()).then(run, run));
+}
+
+async function openNow(wc, opts, ended) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const id = o.id == null ? '' : String(o.id);
+  const sid = sanitize(id);
+  const result = (fields) => Object.assign({ ok: false, created: false, cwd: '', cwdMissing: false, error: null }, fields);
+  if (!sid) return result({ error: 'terminal id is empty' });
+  if (o.cmd != null && o.cmd !== 'claude' && o.cmd !== 'shell') return result({ error: `cmd must be 'claude' or 'shell', got ${o.cmd}` });
+  const cmd = o.cmd || 'claude';
+  let sessionId = null;
+  if (o.sessionId != null && o.sessionId !== '') {
+    if (!UUID_RE.test(String(o.sessionId))) return result({ error: 'sessionId must be a UUID, got ' + o.sessionId });
+    sessionId = String(o.sessionId);
+  }
+  let forkFrom = null;
+  if (o.forkFrom != null && o.forkFrom !== '') {
+    if (!UUID_RE.test(String(o.forkFrom))) return result({ error: 'forkFrom must be a UUID, got ' + o.forkFrom });
+    if (!sessionId) return result({ error: 'forkFrom needs the new session id in sessionId' });
+    forkFrom = String(o.forkFrom);
+  }
+  await cfg.ready;
+  const cols = toInt(o.cols, 80, 2, 2000);
+  const rows = toInt(o.rows, 24, 1, 1000);
+  const prev = clients.get(keyOf(wc.id, id));
+  if (prev) drop(prev);
+
+  let remote;
+  try {
+    remote = remoteFor(id, o);
+  } catch (e) {
+    return result({ error: e.message });
+  }
+
+  if (remote) {
+    try {
+      await waitRecoveryProcesses(sid, remote);
+    } catch (e) {
+      return result({ cwd: HOME, error: e.message, retry: true });
+    }
+    const name = 'flow_' + sid;
+    let created = false;
+    let remoteLine;
+    let size = null;
+    if (remote.attach) {
+      // ignore-size: Flow's client never resizes the shared window the owner and the agents also see. tmux honors it only
+      // while another client is attached, so the client also starts at the window's own size plus its status lines,
+      // which keeps the window as it is when Flow is its only client; term.js shows it at that size.
+      remoteLine = hostLine(['tmux', '-u', 'attach', '-f', 'ignore-size', '-t', exactAttachTarget(remote.attach)]);
+      try {
+        size = await windowSize(remote);
+      } catch (e) {
+        if (!hostDown.has(remote.host)) console.error(`[flow] ${e.message}`);   // a failed connection is logged once by runRemote
+      }
+    } else {
+      // The interactive ssh below shows a connection problem in the terminal; runRemote logged it once.
+      try {
+        await locate(sid, remote);
+        if (remote.own) await sendConf(remote.host);
+        created = (await runRemote(remote.host, ['has-session', '-t', '=' + name], remote.own)).code !== 0;
+      } catch (e) {
+        if (!hostDown.has(remote.host)) console.error(`[flow] ${e.message}`);
+      }
+      // cwd: a folder on that host; a folder missing there starts in its home
+      const start = (own) => hostLine(['tmux', '-u', ...(own ? ['-L', cfg.socket, '-f', { raw: `"$HOME"/${HOST_CONF}` }] : []), 'new-session', '-A', '-s', name,
+        ...(o.cwd ? ['-c', hostPath(String(o.cwd))] : []), '-x', String(cols), '-y', String(rows), ...(cmd === 'claude' ? [remoteClaude(sessionId, !!o.resume, forkFrom)] : [])]);
+      // Server not known (the checks above failed): the host picks it, so a session on its default server is never
+      // started a second time on Flow's server.
+      remoteLine = remote.located ? start(remote.own) : `if ${hostLine(['tmux', 'has-session', '-t', '=' + name])} 2>/dev/null && ! ` +
+        `${hostLine(['tmux', '-L', cfg.socket, 'has-session', '-t', '=' + name])} 2>/dev/null; then exec ${start(false)}; else exec ${start(true)}; fi`;
+    }
+    if (ended()) return result({ cwd: HOME, error: ENDED_FIRST });
+    try {
+      spawnClient(wc, id, SSH, ['-t', '--', remote.host, remoteLine], size ? size.cols : cols, size ? size.rows : rows, HOME);
+    } catch (e) {
+      const exhausted = await ptyExhaustion(e);
+      if (exhausted) return result({ cwd: HOME, ...exhausted });
+      return result({ cwd: HOME, error: 'could not start ssh: ' + e.message });
+    }
+    return result(size ? { ok: true, created, cwd: HOME, size } : { ok: true, created, cwd: HOME });
+  }
+
+  if (!cfg.tmux) return result({ error: 'tmux was not found (looked for /opt/homebrew/bin/tmux and on PATH)' });
+  let cwd = o.cwd ? expandHome(String(o.cwd)) : HOME;
+  if (!path.isAbsolute(cwd)) cwd = path.resolve(HOME, cwd);
+  const name = 'flow_' + sid;
+  let existed;
+  try {
+    existed = await hasSession(name);
+  } catch (e) {
+    return result({ error: e.message });
+  }
+  if (!existed && forkFrom && !transcriptExists(sessionId) && !transcriptExists(forkFrom)) {
+    return result({ cwd, error: `cannot fork: session ${forkFrom} has no transcript in ${path.join(claudeDir(), 'projects')}` });
+  }
+  if (!existed && cmd === 'claude' && sessionId) {
+    try {
+      await holdersOf(sid, sessionId, ended);
+      await untilEnded([sessionId, forkFrom].filter(Boolean), ended);
+    } catch (e) {
+      return result({ cwd, error: e.message, ...(e.retry ? { retry: true } : {}) });
+    }
+  }
+  let cwdMissing = false;
+  if (!isDir(cwd)) {
+    if (!existed) cwdMissing = true;
+    cwd = HOME;
+  }
+  // The command is always passed: with -A it is ignored when the session exists, and it is used if
+  // the session ended between the check above and this spawn.
+  const args = ['-u', '-L', cfg.socket, '-f', CONF, 'new-session', '-A', '-s', name, '-c', cwd,
+    ...Object.entries(TRUECOLOR_ENV).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
+    '-x', String(cols), '-y', String(rows), ...localCommand(cmd, sessionId, !!o.resume, forkFrom)];
+  if (ended()) return result({ cwd, cwdMissing, error: ENDED_FIRST });
+  let c;
+  try {
+    c = spawnClient(wc, id, cfg.tmux, args, cols, rows, cwd);
+  } catch (e) {
+    const exhausted = await ptyExhaustion(e);
+    if (exhausted) return result({ cwd, cwdMissing, ...exhausted });
+    return result({ cwd, cwdMissing, error: 'could not start tmux: ' + e.message });
+  }
+  // Resolve once the session exists, so list/panes/exists right after open see it.
+  if (!existed) {
+    const end = Date.now() + 3000;
+    while (Date.now() < end && clients.get(c.key) === c && !(await hasSession(name))) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    // an end that came while tmux was making the session may have found none to kill
+    if (ended()) {
+      drop(c);
+      await endSession(sid, null);
+      return result({ cwd, cwdMissing, error: ENDED_FIRST });
+    }
+  }
+  return result({ ok: true, created: !existed, cwd, cwdMissing });
+}
+
+// An attached window's size as a client needs it: cols x (window rows + status lines), status = the number of status
+// lines (tmux's status option: off, on, or 2 to 5).
+async function windowSize(remote) {
+  const target = windowTarget(exactAttachTarget(remote.attach));
+  if (!target) throw new Error(`invalid tmux attach target: ${remote.attach}`);
+  const r = await runRemote(remote.host, ['display-message', '-p', '-t', target, '#{window_width} #{window_height} #{status}'], false);
+  if (r.code !== 0) throw new Error(`tmux display-message -t ${remote.attach} on ${remote.host}: ${r.stderr}`);
+  const [w, h, st] = r.stdout.trim().split(' ');
+  const status = st === 'off' ? 0 : st === 'on' ? 1 : /^[2-5]$/.test(st) ? Number(st) : NaN;
+  if (!/^\d+$/.test(w) || !/^\d+$/.test(h) || Number.isNaN(status)) throw new Error(`unexpected size of ${remote.attach} on ${remote.host}: ${r.stdout.trim()}`);
+  return { cols: Number(w), rows: Number(h) + status, status };
+}
+
+function write(wcId, id, data) {
+  const c = clients.get(keyOf(wcId, String(id)));
+  if (!c || typeof data !== 'string' || !data) return;
+  c.proc.write(data);
+}
+
+function resize(wcId, id, cols, rows) {
+  const c = clients.get(keyOf(wcId, String(id)));
+  if (!c) return;
+  try {
+    c.proc.resize(toInt(cols, 80, 2, 2000), toInt(rows, 24, 1, 1000));
+  } catch (e) {
+    console.error(`[flow] resize of ${c.id} failed: ${e.message}`);
+  }
+}
+
+function detach(wcId, id) {
+  const c = clients.get(keyOf(wcId, String(id)));
+  if (c) drop(c);
+}
+
+function detachAll(wcId) {
+  for (const c of [...clients.values()]) if (c.wcId === wcId) drop(c);
+}
+
+function idle(ms) {
+  if (!running.size) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      whenIdle = null;
+      resolve(false);
+    }, ms);
+    whenIdle = () => {
+      clearTimeout(timer);
+      whenIdle = null;
+      resolve(true);
+    };
+  });
+}
+
+// Ends every client and resolves once each one's process has reported its exit. node-pty reports exits from a helper
+// thread; a report still queued when Electron frees the Node environment throws where nothing catches it, which aborts
+// the app (MAC_NOTES 11). A client still running after timeoutMs gets SIGKILL.
+async function shutdown(timeoutMs = 2000) {
+  for (const c of [...clients.values()]) drop(c);
+  const count = running.size;
+  if (!count) return;
+  const started = Date.now();
+  if (!(await idle(timeoutMs))) {
+    for (const c of running) {
+      console.error(`[flow] the tmux client of ${c.id} (pid ${c.proc.pid}) did not exit within ${timeoutMs} ms of quitting; sending SIGKILL`);
+      try {
+        c.proc.kill('SIGKILL');
+      } catch (e) {
+        // ESRCH: the process is gone and only its exit report is still on the way; keep waiting for it.
+        if (e.code !== 'ESRCH') console.error(`[flow] could not SIGKILL the tmux client of ${c.id}: ${e.message}`);
+      }
+    }
+    if (!(await idle(1000))) {
+      for (const c of running) console.error(`[flow] the tmux client of ${c.id} (pid ${c.proc.pid}) did not exit after SIGKILL`);
+    }
+  }
+  console.log(`[flow] quit: ${count - running.size} of ${count} terminal clients exited in ${Date.now() - started} ms`);
+}
+
+// ---------- session control ----------
+
+async function hasSession(name) {
+  const r = await runLocal(['has-session', '-t', '=' + name]);
+  if (r.code === 0) return true;
+  if (noServer(r.stderr) || noTarget(r.stderr)) return false;
+  throw new Error('tmux has-session: ' + r.stderr);
+}
+
+// A claude keeps writing to its conversation for a while after its session is killed (its cost-state line about 2 s
+// later) and exits up to 11 s later here, so kill() keeps each claude of the session until it has exited, and open()
+// starts a claude on the same conversation only after that (main's sessions:running leaves these out meanwhile).
+const ending = new Map(); // pid -> { at, sessionId }
+const ENDING_MAX_MS = 120000;
+const ENDING_WAIT_MS = 30000;
+const SESSION_ARG = /(?:^|\s)(?:--session-id|--resume|-r)(?:=|\s+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\s|$)/i;
+const FORK_ARG = /(?:^|\s)--session-id(?:=|\s+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\s|$)/i;
