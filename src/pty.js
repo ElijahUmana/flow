@@ -1182,3 +1182,299 @@ async function killNow(id, opts) {
   if (remote) await waitKilledRemote(sid, remote, processes);
 }
 
+// Kills flow_<sid>, keeping each claude it ran as ending until that has exited.
+async function endSession(sid, remote, prefetched, strict = false) {
+  let claudes = prefetched || [];
+  if (!remote && prefetched == null) {
+    try {
+      claudes = await sessionClaudes('=flow_' + sid);
+    } catch (e) {
+      console.error(`[flow] ending ${sid}: could not read its processes; its conversation opens again only once a scan shows who holds it: ${e.message}`);
+    }
+  }
+  const r = await runner(remote)(['kill-session', '-t', '=flow_' + sid]);
+  if (r.code !== 0 && (strict || (!noServer(r.stderr) && !noTarget(r.stderr)))) throw new Error('tmux kill-session: ' + (r.stderr || 'target is not running'));
+  if (r.code !== 0) return;
+  const at = Date.now();
+  for (const c of claudes) if (alive(c.pid)) ending.set(c.pid, { at, sessionId: c.sessionId, mate: c.mate });
+  if (ending.size) watchEnding();
+}
+
+// The tmux server a process was started under: the socket in its TMUX variable, read from the environment it started
+// with (only that variable is read). Null when it has none or it cannot be read.
+async function tmuxSocketOf(pid) {
+  if (process.platform === 'linux') {
+    let env;
+    try {
+      env = fs.readFileSync(`/proc/${pid}/environ`, 'latin1');
+    } catch (e) {
+      if (e.code === 'ENOENT' || e.code === 'ESRCH' || e.code === 'EACCES') return null;
+      throw e;
+    }
+    const v = env.split('\0').find((x) => x.startsWith('TMUX='));
+    return v ? v.slice(5).split(',')[0] : null;
+  }
+  // macOS: ps -E prints the environment a process started with after its command line
+  const r = await exec('/bin/ps', ['-E', '-ww', '-o', 'command=', '-p', String(pid)], 10000);
+  const m = /(?:^|\s)TMUX=([^,\s]+)/.exec(r.stdout);
+  return m ? m[1] : null;
+}
+const samePath = (a, b) => {
+  const real = (x) => {
+    try {
+      return fs.realpathSync(x);
+    } catch (e) {
+      return x.replace(/^\/private\//, '/');
+    }
+  };
+  return real(a) === real(b);
+};
+
+// Before a claude starts on a conversation: a live claude already holding it is looked for in one ps listing, retried
+// while ps fails, for ENDING_WAIT_MS (if it never works, nothing starts). One under a pane of Flow's tmux server is
+// another Flow window's, and one outside Flow's server the owner's own: neither is ever signalled, and the open fails
+// saying where the conversation is open. Those failures carry retry: the window opens again by itself every few
+// seconds, so the conversation starts once its holder has exited. One that Flow's server started but whose pane is gone
+// is a claude Flow ended that is still exiting: it is waited for and stopped like any other (untilEnded).
+const toldHolders = new Set();   // "sid pid" already in the log, so a window trying again does not repeat it
+const psDown = new Map();        // terminal id -> 'trying' or 'gave up': its failed scans are in the log until one works
+const tryLater = (text) => Object.assign(new Error(text), { retry: true });
+async function holdersOf(sid, sessionId, stop) {
+  const want = sessionId.toLowerCase();
+  const until = Date.now() + ENDING_WAIT_MS;
+  let procs;
+  for (;;) {
+    try {
+      const ps = await exec('/bin/ps', ['-axww', '-o', 'pid=,ppid=,args='], 10000);
+      if (ps.code !== 0) throw new Error('ps: ' + ps.stderr);
+      procs = [];
+      for (const line of ps.stdout.split('\n')) {
+        const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+        if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), args: m[3] });
+      }
+      break;
+    } catch (e) {
+      if (Date.now() >= until) {
+        if (psDown.get(sid) !== 'gave up') console.error(`[flow] opening ${sid}: could not read which claudes hold its conversation for ${ENDING_WAIT_MS} ms, so it did not start (its window tries again; logged once until a scan works): ${e.message}`);
+        psDown.set(sid, 'gave up');
+        throw tryLater('could not check whether this conversation is open elsewhere');
+      }
+      if (!psDown.has(sid)) console.error(`[flow] opening ${sid}: could not read which claudes hold its conversation; trying again every 500 ms (logged once until a scan works): ${e.message}`);
+      if (!psDown.has(sid)) psDown.set(sid, 'trying');
+      await new Promise((r) => setTimeout(r, 500));
+      if (stop()) throw new Error(ENDED_FIRST);
+    }
+  }
+  psDown.delete(sid);
+  // a teammate holds its conversation with no registry entry or argument saying so
+  const mate = mateOfConversation(want);
+  const asMate = (args) => { const m = parseMate(args); return !!m && m.name === mate.name && m.team === mate.team; };
+  const held = procs.filter((p) => /claude/i.test(p.args) && (sessionOfProcess(p.pid, p.args) === want || (mate && asMate(p.args))));
+  if (!held.length) return;
+  const panes = await runLocal(['list-panes', '-a', '-F', '#{pane_pid}']);
+  if (panes.code !== 0 && !noServer(panes.stderr)) throw new Error('tmux list-panes: ' + panes.stderr);
+  const live = new Set(panes.code === 0 ? panes.stdout.split('\n').map(Number).filter((pid) => pid > 1) : []);
+  const parent = new Map(procs.map((p) => [p.pid, p.ppid]));
+  const inPane = (pid) => {
+    for (let p = pid, n = 0; p > 1 && n < 64; p = parent.get(p), n++) if (live.has(p)) return true;
+    return false;
+  };
+  const where = await runLocal(['display-message', '-p', '#{socket_path}']);
+  const ours = where.code === 0 ? where.stdout.trim() : path.join(process.env.TMUX_TMPDIR || '/tmp', `tmux-${process.getuid()}`, cfg.socket);
+  const now = Date.now();
+  const refuse = (p, where, text) => {
+    if (!toldHolders.has(`${sid} ${p.pid}`)) console.log(`[flow] opening ${sid}: claude ${p.pid} ${where} holds conversation ${want}, so it did not start`);
+    toldHolders.add(`${sid} ${p.pid}`);
+    return tryLater(text);
+  };
+  // all checked first, so an open refused for one holder leaves the others as they were
+  for (const p of held) {
+    if (ending.has(p.pid)) continue;   // Flow ended it: untilEnded waits for it, whatever its environment shows while it exits
+    if (inPane(p.pid)) throw refuse(p, 'in another Flow window', 'this conversation is open in another Flow window');
+    const socket = await tmuxSocketOf(p.pid);
+    if (!socket && !alive(p.pid)) continue;   // it exited since the listing: it holds nothing now
+    if (!socket || !samePath(socket, ours)) throw refuse(p, 'outside Flow', 'this conversation is open in a Claude outside Flow');
+  }
+  for (const p of held) ending.set(p.pid, { at: now, sessionId: want, mate: (parseMate(p.args) || {}).agentId || null });
+  watchEnding();
+}
+
+// Waits until no ended claude holds any of these conversations. One still there after ENDING_WAIT_MS is stopped
+// (TERM, then KILL 5 s later), once ps shows it still holds that conversation (its pid could be a new process's).
+async function untilEnded(ids, stop) {
+  const want = ids.map((x) => x.toLowerCase());
+  const holding = () => [...ending].filter(([pid, e]) => want.includes(e.sessionId) && alive(pid)).map(([pid]) => pid);
+  const settle = async (ms) => {
+    const until = Date.now() + ms;
+    while (holding().length && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 100));
+      if (stop()) throw new Error(ENDED_FIRST);
+    }
+    return holding();
+  };
+  let left = await settle(ENDING_WAIT_MS);
+  for (const [sig, ms] of [['SIGTERM', 5000], ['SIGKILL', 2000]]) {
+    if (!left.length) return;
+    const ps = await exec('/bin/ps', ['-ww', '-o', 'pid=,args=', '-p', left.join(',')], 10000);
+    const ours = [];
+    for (const line of ps.stdout.split('\n')) {
+      const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+      const e = m && ending.get(Number(m[1]));
+      if (e && (sessionOfProcess(Number(m[1]), m[2]) === e.sessionId || (e.mate && (parseMate(m[2]) || {}).agentId === e.mate))) ours.push(Number(m[1]));
+    }
+    for (const pid of left) if (!ours.includes(pid)) ending.delete(pid);
+    if (!ours.length) return;
+    console.error(`[flow] the claude of an ended session (process ${ours.join(', ')}) is still running; sending ${sig}`);
+    for (const pid of ours) {
+      try {
+        process.kill(pid, sig);
+      } catch (e) {
+        if (e.code !== 'ESRCH') throw e;
+      }
+    }
+    left = await settle(ms);
+  }
+  if (left.length) throw new Error(`the claude of an ended session (process ${left.join(', ')}) did not exit`);
+}
+
+async function exists(id, opts) {
+  const sid = sanitize(id);
+  if (!sid) return false;
+  const remote = await remoteAt(id, opts);
+  const r = await runner(remote)(['has-session', '-t', sessionTarget(sid, remote)]);
+  if (r.code === 0) return true;
+  if (noServer(r.stderr) || noTarget(r.stderr)) return false;
+  throw new Error('tmux has-session: ' + r.stderr);
+}
+
+async function list(expected) {
+  const wanted = new Map((Array.isArray(expected) ? expected : []).filter((x) => x && sanitize(x.id) && typeof x.cwd === 'string').map((x) => [String(x.id), x.cwd]));
+  const samePath = (a, b) => {
+    try { return fs.realpathSync.native(a) === fs.realpathSync.native(b); } catch (_) { return path.resolve(a) === path.resolve(b); }
+  };
+  const F = ['#{session_name}', '#{session_created}', '#{session_activity}', '#{window_panes}',
+    '#{pane_current_command}', '#{pane_current_path}'].join('\t');
+  const r = await runLocal(['list-sessions', '-F', F]);
+  if (r.code !== 0) {
+    if (noServer(r.stderr)) return [];
+    throw new Error('tmux list-sessions: ' + r.stderr);
+  }
+  return r.stdout.split('\n').filter((l) => l.startsWith('flow_')).map((line) => {
+    const f = line.split('\t'), id = f[0].slice(5), cwd = f.slice(5).join('\t');
+    return {
+      id,
+      name: f[0],
+      created: Number(f[1]) * 1000,
+      activity: Number(f[2]) * 1000,
+      panes: Number(f[3]),
+      command: f[4],
+      cwd,
+      ...(wanted.has(id) ? { sameCwd: samePath(wanted.get(id), cwd) } : {}),
+    };
+  });
+}
+
+const PANE_FORMAT = ['#{session_id}', '#{window_id}', '#{window_index}', '#{window_active}', '#{window_layout}', '#{window_name}', '#{window_width}', '#{window_height}', '#{pane_id}', '#{pane_index}', '#{pane_active}', '#{pane_pid}', '#{pane_left}', '#{pane_top}', '#{pane_width}',
+  '#{pane_height}', '#{pane_current_command}', '#{pane_current_path}', '#{pane_title}'].join('\t');
+
+function paneRecords(text) {
+  return text.split('\n').filter(Boolean).map((line) => {
+    const f = line.split('\t');
+    return {
+      sessionId: f[0], windowId: f[1], windowIndex: Number(f[2]), windowActive: f[3] === '1', windowLayout: f[4], windowName: f[5],
+      windowWidth: Number(f[6]), windowHeight: Number(f[7]), paneId: f[8], index: Number(f[9]), active: f[10] === '1',
+      panePid: Number(f[11]), left: Number(f[12]), top: Number(f[13]), width: Number(f[14]), height: Number(f[15]),
+      command: f[16], cwd: f[17], title: f.slice(18).join('\t'),
+    };
+  });
+}
+
+async function paneInventory(id, opts, allWindows = false) {
+  const sid = sanitize(id);
+  if (!sid) return { exists: false, panes: [], remote: null };
+  const remote = await remoteAt(id, opts);
+  const target = sessionTarget(sid, remote);
+  const r = await runner(remote)(['list-panes', ...(allWindows ? ['-s'] : []), '-t', allWindows ? target : windowTarget(target), '-F', PANE_FORMAT]);
+  if (r.code !== 0) {
+    if (noServer(r.stderr) || noTarget(r.stderr)) return { exists: false, panes: [], remote };
+    throw new Error('tmux list-panes: ' + r.stderr);
+  }
+  const found = paneRecords(r.stdout);
+  if (!found.length) throw new Error(`tmux returned no panes for ${target}`);
+  return { exists: true, panes: found, remote };
+}
+
+async function panes(id, opts) {
+  return (await paneInventory(id, opts)).panes;
+}
+
+// ⌘F in a terminal (term.js): finds op.text in its history through tmux's copy mode on its active pane, the position
+// hidden (-H) and left by scrolling down to the end (-e), as the wheel's copy mode is. op.step 0 finds the nearest match
+// up from where this find started (tmux's incremental search; '' goes back there with nothing marked), 1 the next match
+// up, -1 the next one down; op.done unmarks the matches and keeps the view. Plain text, any case when it is lowercase.
+// { ok, found, error }: found is false when the text is not in the history. Flow's own tmux server only, where any key
+// leaves copy mode (flow-tmux.conf).
+const findWent = new Map();   // terminal id -> its last find step, 1 up or -1 down
+async function find(id, op, opts) {
+  const sid = sanitize(id);
+  if (!sid) return { ok: false, found: false, error: 'terminal id is empty' };
+  const o = op && typeof op === 'object' ? op : {};
+  const step = Number(o.step || 0);
+  if (![0, 1, -1].includes(step)) return { ok: false, found: false, error: `step must be 0, 1 or -1, got ${o.step}` };
+  const remote = await remoteAt(id, opts);
+  // op.leave: before a paste, out of the scrollback on whichever server the pane is on (a VM's own tmux too, where
+  // Flow's User0 key is not bound), since tmux drops a paste that arrives in copy mode.
+  if (o.leave) {
+    const p = windowTarget(sessionTarget(sid, remote));
+    const r = await runner(remote)(['if', '-F', '-t', p, '#{pane_in_mode}', `send -X -t ${p} cancel`]);
+    return r.code === 0 ? { ok: true, found: false, error: null } : { ok: false, found: false, error: 'tmux: ' + r.stderr };
+  }
+  if (remote && !remote.own) return { ok: false, found: false, error: "this terminal is not in Flow's tmux server" };
+  const t = windowTarget(sessionTarget(sid, remote));
+  const search = (arg) => ['send', '-X', '-t', t, 'search-backward-incremental', arg];
+  let args;
+  if (o.done || !o.text) {
+    findWent.delete(sid);
+    args = ['if', '-F', '-t', t, '#{pane_in_mode}', `send -X -t ${t} ${o.done ? 'clear-selection' : 'search-backward-incremental ='}`];
+  } else {
+    // an argument ending in ; ends tmux's command; \; is a literal one
+    const text = String(o.text).replace(/;$/, '\\;');
+    args = ['copy-mode', '-e', '-H', '-t', t];
+    if (step === 0) {
+      // tmux starts again from where the find started only for a changed text: '' takes it back there first
+      args.push(';', ...search('='), ';', ...search('=' + text));
+    } else {
+      // after a step the other way the cursor sits at the far end of the current match, where tmux's first step stops
+      const times = findWent.has(sid) && findWent.get(sid) !== step ? 2 : 1;
+      for (let i = 0; i < times; i++) args.push(';', ...search((step > 0 ? '-' : '+') + text));
+    }
+    findWent.set(sid, step === 0 ? 1 : step);
+    args.push(';', 'display', '-p', '-t', t, '#{search_present}');
+  }
+  const r = await runner(remote)(args);
+  if (r.code !== 0) return { ok: false, found: false, error: 'tmux: ' + r.stderr };
+  return { ok: true, found: !o.done && !!o.text && r.stdout.trim() === '1', error: null };
+}
+
+// A Claude Code agent-team teammate runs as its pane's own process: the lead respawns the pane with
+// `<claude> --agent-id <name>@<team> --agent-name <name> --team-name <team> --agent-color <color> ...`. Teammates write
+// no ~/.claude/sessions/<pid>.json, so the session id comes from the teammate's transcript, whose user lines carry
+// "agentName" and "teamName" (claude 2.1.296). Returns null for a pane that is not a teammate.
+const MATE_FLAGS = { '--agent-id': 'agentId', '--agent-name': 'name', '--team-name': 'team', '--agent-color': 'color',
+  '--parent-session-id': 'parentSessionId', '--agent-type': 'agentType', '--model': 'model' };
+const SAFE_ARG = /^[A-Za-z0-9_.@:[\]-]+$/;
+
+function parseMate(args) {
+  const a = String(args || '').trim().split(/\s+/);
+  const out = {};
+  for (let i = 0; i < a.length - 1; i++) if (MATE_FLAGS[a[i]] && SAFE_ARG.test(a[i + 1])) out[MATE_FLAGS[a[i]]] = a[i + 1];
+  return out.agentId && out.name && out.team ? out : null;
+}
+
+const projectDir = (cwd) => path.join(claudeDir(), 'projects', String(cwd).replace(/[^A-Za-z0-9]/g, '-'));
+
+// The newest of the 60 latest transcripts of that folder whose start names this teammate and team. A transcript
+// removed while this runs is skipped.
+function mateSessionLocal(cwd, name, team) {
+  return mateSessionIn(projectDir(cwd), name, team);
+}
