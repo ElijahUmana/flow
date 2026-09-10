@@ -294,3 +294,299 @@ function findTmux(env) {
 function init(opts) {
   cfg.socket = opts.socket || 'flow';
   cfg.version = opts.version || '0';
+  cfg.ready = resolveLoginEnv().then(async (env) => {
+    cfg.env = env;
+    cfg.tmux = findTmux(env);
+    if (!cfg.tmux) console.error('[flow] tmux was not found (looked for /opt/homebrew/bin/tmux and on PATH)');
+    else await reloadConf();
+    return env;
+  });
+  return cfg.ready;
+}
+
+// The tmux server outlives Flow (the agents keep running) and reads -f only when it starts, so each Flow start loads
+// the conf into a server that is already up: conf changes arrive without ending any agent. No server: nothing to do.
+async function reloadConf() {
+  let r;
+  try {
+    r = await exec(cfg.tmux, ['-u', '-L', cfg.socket, '-f', CONF, 'source-file', CONF], 10000);
+  } catch (e) {
+    console.error(`[flow] could not load ${CONF} into the running tmux server: ${e.message}`);
+    return;
+  }
+  if (r.code !== 0 && !noServer(r.stderr)) console.error(`[flow] could not load ${CONF} into the running tmux server: ${r.stderr}`);
+}
+
+// ---------- running tmux ----------
+
+const noServer = (s) => /no server running|error connecting to|server exited unexpectedly/i.test(s);
+// tmux 3.4 says "no current target" when a server is up but holds no session yet (a cold start, before the first
+// new-session has made one).
+const noTarget = (s) => /can't find (session|window|pane)|session not found|no such session|no current target/i.test(s);
+
+function exec(file, args, timeout) {
+  return new Promise((resolve, reject) => {
+    execFile(...spawnable(file, args), { env: cfg.env, timeout, maxBuffer: 16 << 20, encoding: 'utf8' }, (err, stdout, stderr) => {
+      if (err && typeof err.code !== 'number') {
+        reject(Object.assign(new Error(`${path.basename(file)} ${args.filter((a) => !a.startsWith('-')).slice(0, 3).join(' ')}: ${err.killed ? 'timed out' : err.message}`),
+          { timedOut: !!err.killed }));
+        return;
+      }
+      resolve({ code: err ? err.code : 0, stdout: String(stdout), stderr: String(stderr).trim() });
+    });
+  });
+}
+
+const ENXIO = os.constants.errno.ENXIO;
+function isPtyExhausted(error) {
+  return process.platform === 'darwin' && !!error && error.code === 'ENXIO' &&
+    typeof error.errno === 'number' && error.errno === ENXIO && error.syscall === 'posix_openpt';
+}
+
+async function heldPtyMasters() {
+  return new Promise((resolve) => {
+    execFile('/usr/sbin/lsof', ['-nP', '-a', '-p', String(process.pid), '-Ffn'],
+      { env: cfg.env, timeout: 5000, maxBuffer: 1 << 20, encoding: 'utf8' }, (error, stdout, stderr) => {
+        if (error) {
+          resolve({ count: null, error: String(stderr || '').trim() || error.message });
+          return;
+        }
+        const fds = new Set();
+        let fd = null;
+        for (const line of String(stdout || '').split('\n')) {
+          if (line.startsWith('f')) {
+            const match = /^f(\d+)$/.exec(line);
+            fd = match ? Number(match[1]) : null;
+          } else if (line.startsWith('p')) fd = null;
+          else if (line === 'n/dev/ptmx' && fd !== null) fds.add(fd);
+        }
+        resolve({ count: fds.size, error: null });
+      });
+  });
+}
+
+async function ptyExhaustion(error) {
+  if (!isPtyExhausted(error)) return null;
+  const held = await heldPtyMasters();
+  if (held.error) console.error(`could not count Flow's PTY masters: ${held.error}`);
+  const count = held.count;
+  const holding = count == null ? 'Flow could not count its open PTY masters.' : `Flow holds ${count} PTY master${count === 1 ? '' : 's'}.`;
+  return {
+    ok: false,
+    error: `The Mac is out of terminals. ${holding} Retrying automatically.`,
+    code: 'ENXIO', errno: error.errno, syscall: error.syscall, ptyMasters: count, retry: true,
+  };
+}
+
+async function runLocal(args) {
+  await cfg.ready;
+  if (!cfg.tmux) throw new Error('tmux was not found (looked for /opt/homebrew/bin/tmux and on PATH)');
+  return exec(cfg.tmux, ['-u', '-L', cfg.socket, '-f', CONF, ...args], 10000);
+}
+
+function controlPath() {
+  const dir = path.join('/tmp', 'flow-' + process.getuid());
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = fs.statSync(dir);
+  if (st.uid !== process.getuid() || (st.mode & 0o077) !== 0) {
+    throw new Error(`refusing to use ${dir} for ssh control sockets: it must be private to this user`);
+  }
+  return path.join(dir, 'cm-%C');
+}
+
+const sshArgs = (host, argv) => ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ControlMaster=auto',
+  '-o', 'ControlPath=' + controlPath(), '-o', 'ControlPersist=120', '--', host, argv.map(shq).join(' ')];
+
+// After a failed connection, calls to that host fail with the same error until a backoff has passed (5 s, doubling up
+// to 60 s), so an unreachable host does not get a new ssh for every pane poll. The first failure of a streak is logged.
+function backingOff(host) {
+  const down = hostDown.get(host);
+  if (down && Date.now() < down.until) throw new Error(down.error);
+}
+
+function hostFailed(host, stderr) {
+  const prev = hostDown.get(host);
+  const failures = prev ? prev.failures + 1 : 1;
+  const error = `ssh ${host}: ${stderr || 'connection failed'}`;
+  hostDown.set(host, { failures, until: Date.now() + Math.min(60000, 5000 * 2 ** (failures - 1)), error });
+  if (!prev) console.error(`[flow] ${error}`);
+  return error;
+}
+
+// The Mac's network is back or Flow came to the front again (vmfiles.retryNow): the next ssh to host runs at once and a
+// failure starts a new streak.
+function sshRetry(host) {
+  hostDown.delete(checkHost(host));
+}
+
+async function sshExec(host, argv, timeout = 25000) {
+  await cfg.ready;
+  backingOff(host);
+  const r = await exec(SSH, sshArgs(host, argv), timeout);
+  if (r.code === 255) throw new Error(hostFailed(host, r.stderr));
+  hostDown.delete(host);
+  return r;
+}
+
+// sshExec for a long or binary transfer (vmfiles.js): the ssh process itself, stdout and stderr as Buffers, stdin a pipe
+// when opts.stdin. The same connection, options and backoff; a process ended early with kill() leaves the backoff as is.
+async function sshSpawn(host, argv, opts) {
+  await cfg.ready;
+  const h = checkHost(host);
+  backingOff(h);
+  const child = spawn(...spawnable(SSH, sshArgs(h, argv)), { env: cfg.env, stdio: [opts && opts.stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+  // A failed spawn (EAGAIN, EMFILE) is reported on nextTick: with this listener it can never be an uncaught error, even
+  // for a caller that listens late; callers' own listeners get it too.
+  child.on('error', (e) => console.error(`[flow] ssh to ${h} could not start: ${e.message}`));
+  let stderr = '';
+  child.stderr.on('data', (b) => { if (stderr.length < 4000) stderr += b; });
+  child.on('close', (code) => {
+    if (code === 255) hostFailed(h, stderr.trim());
+    else if (code !== null) hostDown.delete(h);
+  });
+  return child;
+}
+
+// own: Flow's own tmux server on that host (the same socket name as here), not the host's default server.
+const runRemote = (host, args, own) => sshExec(host, own ? ['tmux', '-L', cfg.socket, ...args] : ['tmux', ...args]);
+
+// On a host, the sessions Flow makes live on Flow's own tmux server, with Flow's conf; an attach window (ccm) is a session
+// of the host's default server. A flow_<id> session already on the default server stays there (made before Flow had its
+// own server there, or broken out of an attach window's team: a pane cannot move between servers).
+function remoteFor(id, opts) {
+  const sid = sanitize(id);
+  if (opts && typeof opts === 'object' && opts.host) {
+    const host = checkHost(opts.host);
+    const attach = opts.attach ? String(opts.attach) : null;
+    if (attach && !exactAttachTarget(attach)) throw new Error(`invalid tmux attach target: ${attach}`);
+    const known = remotes.get(sid);
+    if (known && known.host === host && known.attach === attach) return known;
+    const r = { host, attach, own: !attach, located: !!attach };
+    remotes.set(sid, r);
+    return r;
+  }
+  return remotes.get(sid) || null;
+}
+
+// Finds the server a Flow session of that host is on, once per run: Flow's own, else the default one; a new session goes
+// to Flow's own server.
+async function locate(sid, remote) {
+  if (remote.located) return;
+  const target = ['has-session', '-t', '=flow_' + sid];
+  const own = await runRemote(remote.host, target, true);
+  if (own.code !== 0 && !noServer(own.stderr) && !noTarget(own.stderr)) throw new Error(`tmux has-session on ${remote.host}: ${own.stderr}`);
+  if (own.code !== 0) {
+    const other = await runRemote(remote.host, target, false);
+    if (other.code !== 0 && !noServer(other.stderr) && !noTarget(other.stderr)) throw new Error(`tmux has-session on ${remote.host}: ${other.stderr}`);
+    if (other.code === 0) remote.own = false;
+  }
+  remote.located = true;
+}
+
+async function remoteAt(id, opts) {
+  const remote = remoteFor(id, opts);
+  if (remote) await locate(sanitize(id), remote);
+  return remote;
+}
+
+// Flow's tmux conf goes to ~/.flow/flow-tmux.conf on the host before Flow's first session there in this run, and into
+// Flow's server there if it is already up (as on this Mac).
+const HOST_CONF = '.flow/flow-tmux.conf';
+function sendConf(host) {
+  if (!confSent.has(host)) {
+    const write = 'umask 077 && mkdir -p "$HOME/.flow" && printf %s "$1" > "$HOME/.flow/flow-tmux.conf.$$" && ' +
+      'mv -f "$HOME/.flow/flow-tmux.conf.$$" "$HOME/.flow/flow-tmux.conf" && printf %s "$HOME"';
+    confSent.set(host, (async () => {
+      const w = await sshExec(host, ['sh', '-c', write, 'sh', fs.readFileSync(CONF, 'utf8')]);
+      if (w.code !== 0) throw new Error(`could not write ~/${HOST_CONF} on ${host}: ${w.stderr}`);
+      const r = await runRemote(host, ['source-file', `${w.stdout}/${HOST_CONF}`], true);
+      if (r.code !== 0 && !noServer(r.stderr)) console.error(`[flow] could not load ~/${HOST_CONF} into Flow's tmux server on ${host}: ${r.stderr}`);
+    })().catch((e) => {
+      confSent.delete(host);
+      throw e;
+    }));
+  }
+  return confSent.get(host);
+}
+
+// A command line for the host's shell: strings are quoted, { raw } pieces are left for that shell (to expand $HOME).
+const hostLine = (args) => args.map((a) => (typeof a === 'string' ? shq(a) : a.raw)).join(' ');
+const hostPath = (p) => (p === '~' ? { raw: '"$HOME"' } : p.startsWith('~/') ? { raw: '"$HOME"/' + shq(p.slice(2)) } : p);
+
+function checkHost(host) {
+  const h = String(host).trim();
+  if (!HOST_RE.test(h) || h.startsWith('-')) throw new Error('invalid ssh host: ' + h);
+  return h;
+}
+
+// Session (or window) target for tmux -t. Exact matching prevents a saved `ccm` target from resolving to `ccm-old`.
+const ATTACH_PART = '[A-Za-z0-9_.-]+';
+const attachParts = (attach) => new RegExp(`^(${ATTACH_PART})(?::(${ATTACH_PART}))?$`).exec(String(attach || ''));
+const exactAttachTarget = (attach) => {
+  const m = attachParts(attach);
+  return m ? `=${m[1]}${m[2] ? `:${/^\d+$/.test(m[2]) ? m[2] : `=${m[2]}`}` : ''}` : '';
+};
+const attachIsWindow = (attach) => !!(attachParts(attach) || [])[2];
+const sessionTarget = (sid, remote) => (remote && remote.attach ? exactAttachTarget(remote.attach) || '__invalid_attach__' : '=flow_' + sid);
+const windowTarget = (t) => (t.includes(':') ? t : t + ':');
+const runner = (remote) => (remote ? (args) => runRemote(remote.host, args, remote.own) : runLocal);
+
+// ---------- clients ----------
+
+function flush(c) {
+  if (c.timer) {
+    clearTimeout(c.timer);
+    c.timer = null;
+  }
+  if (!c.chunks.length) return;
+  const data = c.chunks.length === 1 ? c.chunks[0] : c.chunks.join('');
+  c.chunks = [];
+  c.size = 0;
+  c.sent = performance.now();
+  if (!c.quiet && !c.wc.isDestroyed()) c.wc.send('term:data', c.id, data);
+}
+
+// A key's echo (a few bytes after a quiet spell) goes to the window at once. Anything larger waits FLUSH_MS for the
+// rest of it, so a screen redrawn in several reads still reaches the window whole, and a burst still costs at most one
+// message per FLUSH_MS.
+function queue(c, data) {
+  if (c.quiet) return;
+  c.chunks.push(data);
+  c.size += data.length;
+  if (c.size >= FLUSH_BYTES) flush(c);
+  else if (!c.timer) {
+    if (c.size <= ECHO_BYTES && performance.now() - (c.sent || -Infinity) >= FLUSH_MS) flush(c);
+    else c.timer = setTimeout(() => flush(c), FLUSH_MS);
+  }
+}
+
+function onClientExit(c, exitCode, signal) {
+  if (!c.quiet) flush(c);
+  if (clients.get(c.key) === c) clients.delete(c.key);
+  if (!c.quiet && !c.quietExit && !c.wc.isDestroyed()) {
+    c.wc.send('term:exit', c.id, typeof exitCode === 'number' ? exitCode : (signal ? 128 + signal : 0));
+  }
+}
+
+// Ends one client without telling its window (detach, re-open, window gone).
+function drop(c) {
+  c.quiet = true;
+  if (c.timer) clearTimeout(c.timer);
+  c.timer = null;
+  c.chunks = [];
+  if (clients.get(c.key) === c) clients.delete(c.key);
+  try {
+    c.proc.kill();
+  } catch (e) {
+    if (e.code !== 'ESRCH') console.error(`[flow] could not stop the tmux client of ${c.id}: ${e.message}`);
+  }
+}
+
+function spawnClient(wc, id, file, args, cols, rows, cwd) {
+  const proc = nodePty.spawn(...spawnable(file, args), { name: 'xterm-256color', cols, rows, cwd, env: cfg.env });
+  const c = { key: keyOf(wc.id, id), id, wcId: wc.id, wc, proc, chunks: [], size: 0, timer: null, quiet: false, quietExit: false };
+  clients.set(c.key, c);
+  running.add(c);
+  proc.onData((d) => queue(c, d));
+  proc.onExit(({ exitCode, signal }) => {
+    running.delete(c);
