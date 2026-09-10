@@ -1478,3 +1478,298 @@ const projectDir = (cwd) => path.join(claudeDir(), 'projects', String(cwd).repla
 function mateSessionLocal(cwd, name, team) {
   return mateSessionIn(projectDir(cwd), name, team);
 }
+
+function mateSessionIn(dir, name, team) {
+  const gone = (e) => {
+    if (e.code !== 'ENOENT') throw e;
+    return null;
+  };
+  let files;
+  try {
+    files = fs.readdirSync(dir).filter((f) => /^[0-9a-f-]{36}\.jsonl$/i.test(f));
+  } catch (e) {
+    return gone(e);
+  }
+  const aged = [];
+  for (const f of files) {
+    try {
+      aged.push({ f, m: fs.statSync(path.join(dir, f)).mtimeMs });
+    } catch (e) {
+      gone(e);
+    }
+  }
+  aged.sort((x, y) => y.m - x.m);
+  const want = [`"agentName":${JSON.stringify(name)}`, `"teamName":${JSON.stringify(team)}`];
+  const buf = Buffer.alloc(65536);
+  for (const { f } of aged.slice(0, 60)) {
+    let fd;
+    try {
+      fd = fs.openSync(path.join(dir, f), 'r');
+    } catch (e) {
+      gone(e);
+      continue;
+    }
+    let n;
+    try {
+      n = fs.readSync(fd, buf, 0, buf.length, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
+    const head = buf.toString('utf8', 0, n);
+    if (want.every((w) => head.includes(w))) return f.slice(0, 36);
+  }
+  return null;
+}
+
+// The teammate whose conversation this is ({ name, team }), when it is the newest transcript of its folder naming that
+// teammate: the conversation a process running as that teammate holds. Null for any other conversation.
+function mateOfConversation(sessionId) {
+  const file = transcriptOf(sessionId);
+  if (!file) return null;
+  const buf = Buffer.alloc(65536);
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+  let n;
+  try {
+    n = fs.readSync(fd, buf, 0, buf.length, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  const head = buf.toString('utf8', 0, n);
+  const name = /"agentName":("(?:[^"\\]|\\.)*")/.exec(head);
+  const team = /"teamName":("(?:[^"\\]|\\.)*")/.exec(head);
+  if (!name || !team) return null;
+  const mate = { name: JSON.parse(name[1]), team: JSON.parse(team[1]) };
+  return mateSessionIn(path.dirname(file), mate.name, mate.team) === sessionId ? mate : null;
+}
+
+async function paneConversation(id, paneId, opts) {
+  if (!sanitize(id) || !PANE_RE.test(String(paneId))) return { cwd: '', sessionId: null };
+  const remote = await remoteAt(id, opts);
+  const at = await runner(remote)(['display-message', '-p', '-t', String(paneId), '#{pane_pid}\t#{pane_current_path}']);
+  if (at.code !== 0) {
+    if (noServer(at.stderr) || noTarget(at.stderr)) return { cwd: '', sessionId: null };
+    throw new Error('tmux display-message: ' + at.stderr);
+  }
+  const [root, ...rest] = at.stdout.replace(/\n$/, '').split('\t'), cwd = rest.join('\t');
+  if (!/^\d+$/.test(root)) return { cwd, sessionId: null };
+  if (remote) {
+    const script = `for p in ${root} $(pgrep -P ${root}); do ` +
+      `a=$(ps -ww -o args= -p "$p"); s=$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\\([0-9a-fA-F-]*\\)".*/\\1/p' "$HOME/.claude/sessions/$p.json" 2>/dev/null | head -n 1); ` +
+      `printf '%s\\t%s\\t%s\\n' "$p" "$s" "$a"; done`;
+    const ps = await sshExec(remote.host, ['sh', '-c', script]);
+    for (const line of ps.stdout.split('\n')) {
+      const f = line.split('\t'), args = f.slice(2).join('\t');
+      if (UUID_RE.test(f[1] || '')) return { cwd, sessionId: f[1].toLowerCase() };
+      if (!isClaudeArgs(args)) continue;
+      const m = (/(?:^|\s)--fork-session(?:\s|$)/.test(args) ? FORK_ARG : SESSION_ARG).exec(args);
+      if (m) return { cwd, sessionId: m[1].toLowerCase() };
+    }
+    return { cwd, sessionId: null };
+  }
+  const ps = await exec('/bin/ps', ['-axww', '-o', 'pid=,ppid=,args='], 10000);
+  if (ps.code !== 0) throw new Error('ps: ' + ps.stderr);
+  const procs = [], under = new Set([Number(root)]);
+  for (const line of ps.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), args: m[3] });
+  }
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const p of procs) if (!under.has(p.pid) && under.has(p.ppid)) { under.add(p.pid); grew = true; }
+  }
+  for (const p of procs) if (under.has(p.pid)) {
+    const sessionId = sessionOfProcess(p.pid, p.args);
+    if (sessionId) return { cwd, sessionId };
+  }
+  return { cwd, sessionId: null };
+}
+
+/* Every pane identity needed before explicitly shutting down a team. The process tree is collected once, then every pane
+   is resolved from that table. Remote registry and teammate transcript ids are fetched in one targeted batch. */
+async function teamSessions(id, opts) {
+  const wholeSession = !(opts && attachIsWindow(opts.attach));
+  const inventory = await paneInventory(id, opts, wholeSession);
+  if (!inventory.exists) return { exists: false, panes: [] };
+  const { panes: list, remote } = inventory;
+  const ps = remote ? await sshExec(remote.host, ['ps', '-axww', '-o', 'pid=,ppid=,args=']) : await exec('/bin/ps', ['-axww', '-o', 'pid=,ppid=,args='], 10000);
+  if (ps.code !== 0) throw new Error(`could not read team processes${remote ? ` on ${remote.host}` : ''}: ${ps.stderr}`);
+  const procs = [];
+  for (const line of ps.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), args: m[3] });
+  }
+  const paneOf = new Map(list.filter((p) => Number.isInteger(p.panePid) && p.panePid > 1).map((p) => [p.panePid, p]));
+  const owner = new Map(paneOf);
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const p of procs) if (!owner.has(p.pid) && owner.has(p.ppid)) { owner.set(p.pid, owner.get(p.ppid)); grew = true; }
+  }
+  const under = new Map(list.map((p) => [p.paneId, []]));
+  for (const q of procs) {
+    const pane = owner.get(q.pid);
+    if (pane) under.get(pane.paneId).push(q);
+  }
+  const mates = list.map((p) => {
+    let mate = null;
+    for (const q of under.get(p.paneId) || []) if (!mate) mate = parseMate(q.args);
+    return mate ? { ...mate, cwd: p.cwd } : null;
+  });
+  const registry = new Map(), mateSessions = new Map();
+  if (remote) {
+    const pids = [...new Set([...under.values()].flat().map((p) => p.pid))];
+    const mateArgs = mates.flatMap((m, i) => (m ? [String(i), m.cwd, m.name, m.team] : []));
+    const script = `while [ "$#" -gt 0 ] && [ "$1" != -- ]; do p=$1; shift; ` +
+      `s=$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\\([0-9a-fA-F-]*\\)".*/\\1/p' "$HOME/.claude/sessions/$p.json" 2>/dev/null | head -n 1); ` +
+      `[ -n "$s" ] && printf 'R\\t%s\\t%s\\n' "$p" "$s"; done; [ "\${1-}" = -- ] && shift; ` +
+      `while [ "$#" -ge 4 ]; do i=$1; cwd=$2; name=$3; team=$4; shift 4; ` +
+      `d="$HOME/.claude/projects/$(printf %s "$cwd" | sed 's/[^A-Za-z0-9]/-/g')"; s=; ` +
+      `if cd "$d" 2>/dev/null; then for f in $(ls -1t *.jsonl 2>/dev/null | head -n 60); do ` +
+      `head -c 65536 "$f" | grep -qF "\\"agentName\\":\\"$name\\"" || continue; ` +
+      `head -c 65536 "$f" | grep -qF "\\"teamName\\":\\"$team\\"" || continue; s=\${f%.jsonl}; break; done; fi; ` +
+      `[ -n "$s" ] && printf 'M\\t%s\\t%s\\n' "$i" "$s"; done; :`;
+    const got = await sshExec(remote.host, ['sh', '-c', script, 'sh', ...pids.map(String), '--', ...mateArgs]);
+    if (got.code !== 0) throw new Error(`could not read team conversations on ${remote.host}: ${got.stderr}`);
+    for (const line of got.stdout.split('\n')) {
+      const f = line.split('\t');
+      if (f[0] === 'R' && /^\d+$/.test(f[1]) && UUID_RE.test(f[2] || '')) registry.set(Number(f[1]), f[2].toLowerCase());
+      if (f[0] === 'M' && /^\d+$/.test(f[1]) && UUID_RE.test(f[2] || '')) mateSessions.set(Number(f[1]), f[2].toLowerCase());
+    }
+  }
+  const resolved = list.map((p, i) => {
+    const mate = mates[i];
+    let sessionId = mate ? (remote ? mateSessions.get(i) : mateSessionLocal(p.cwd, mate.name, mate.team)) : null;
+    if (!sessionId) for (const q of under.get(p.paneId) || []) {
+      sessionId = remote ? registry.get(q.pid) || sessionFromArgs(q.args) : sessionOfProcess(q.pid, q.args);
+      if (sessionId) break;
+    }
+    return { paneId: p.paneId, panePid: p.panePid, sessionId: sessionId || null, sessionTmuxId: p.sessionId,
+      windowId: p.windowId, windowIndex: p.windowIndex, windowActive: p.windowActive, windowLayout: p.windowLayout,
+      windowName: p.windowName, windowWidth: p.windowWidth, windowHeight: p.windowHeight, index: p.index, active: p.active, left: p.left, top: p.top, width: p.width, height: p.height,
+      cwd: p.cwd, command: p.command, title: p.title, mate: mate ? { agentId: mate.agentId, name: mate.name, team: mate.team,
+        color: mate.color || '', parentSessionId: mate.parentSessionId || '', agentType: mate.agentType || '', model: mate.model || '' } : null };
+  });
+  return { exists: true, panes: resolved };
+}
+
+async function teammate(id, paneId, opts) {
+  if (!sanitize(id) || !PANE_RE.test(String(paneId))) return null;
+  const remote = await remoteAt(id, opts);
+  const at = await runner(remote)(['display-message', '-p', '-t', String(paneId), '#{pane_pid}\t#{pane_current_path}']);
+  if (at.code !== 0) {
+    if (noServer(at.stderr) || noTarget(at.stderr)) return null;
+    throw new Error('tmux display-message: ' + at.stderr);
+  }
+  const [pid, ...rest] = at.stdout.replace(/\n$/, '').split('\t');
+  const cwd = rest.join('\t');
+  if (!/^\d+$/.test(pid)) return null;
+  // The pane's process, and its children in case a shell sits in between. Here ps is asked up to three times: under a
+  // heavy load it can take longer than 5 s (orch's E10, F5 and F6 at load 72-118).
+  const script = `ps -ww -o args= -p ${pid}; for c in $(pgrep -P ${pid}); do ps -ww -o args= -p "$c"; done`;
+  let ps = null;
+  for (let tries = 1; !ps; tries++) {
+    try {
+      ps = remote ? await sshExec(remote.host, ['sh', '-c', script]) : await exec('/bin/sh', ['-c', script], 5000);
+    } catch (e) {
+      if (remote || !e.timedOut || tries === 3) throw e;
+    }
+  }
+  let mate = null;
+  for (const line of ps.stdout.split('\n')) if (!mate) mate = parseMate(line);
+  if (!mate) return null;
+  mate.cwd = cwd;
+  if (remote) {
+    const dir = '.claude/projects/' + cwd.replace(/[^A-Za-z0-9]/g, '-');
+    const has = (text) => `head -c 65536 "$f" | grep -qF ${shq(text)}`;
+    const find = `cd "$HOME"/${shq(dir)} 2>/dev/null && ls -t | head -n 60 | while read f; do ` +
+      `${has(`"agentName":${JSON.stringify(mate.name)}`)} && ${has(`"teamName":${JSON.stringify(mate.team)}`)} && { echo "$f"; break; }; done`;
+    const f = (await sshExec(remote.host, ['sh', '-c', find])).stdout.trim();
+    mate.sessionId = /^[0-9a-f-]{36}\.jsonl$/i.test(f) ? f.slice(0, 36) : null;
+  } else {
+    mate.sessionId = mateSessionLocal(cwd, mate.name, mate.team);
+  }
+  return mate;
+}
+
+// Moves one pane of flow_<id> into a new session flow_<newId>: a placeholder session is created
+// detached, the pane is swapped into it, and the placeholder (now sitting in the team) is killed.
+async function breakPane(id, paneId, newId) {
+  const sid = sanitize(id);
+  const nid = sanitize(newId);
+  if (!sid || !nid) return { ok: false, error: 'terminal id is empty' };
+  if (sid === nid) return { ok: false, error: 'the new terminal id must differ from the team id' };
+  if (!PANE_RE.test(String(paneId))) return { ok: false, error: `pane id must look like %12, got ${paneId}` };
+  const remote = await remoteAt(id);
+  const run = runner(remote);
+  const fresh = 'flow_' + nid;
+  const listed = await run(['list-panes', '-t', windowTarget(sessionTarget(sid, remote)), '-F',
+    '#{pane_id}\t#{window_width}\t#{window_height}\t#{pane_current_path}']);
+  if (listed.code !== 0) return { ok: false, error: `terminal ${id} is not running (${listed.stderr})` };
+  const rows = listed.stdout.split('\n').filter(Boolean).map((l) => l.split('\t'));
+  const pane = rows.find((r) => r[0] === paneId);
+  if (!pane) return { ok: false, error: `pane ${paneId} is not in terminal ${id}` };
+  if (rows.length < 2) return { ok: false, error: 'a team needs at least two panes to break one out' };
+  const taken = await run(['has-session', '-t', '=' + fresh]);
+  if (taken.code === 0) return { ok: false, error: `terminal ${newId} already exists` };
+  const made = await run(['new-session', '-d', '-s', fresh, '-x', pane[1], '-y', pane[2], '-c', pane.slice(3).join('\t') || HOME,
+    '-P', '-F', '#{pane_id}', 'cat']);
+  if (made.code !== 0) return { ok: false, error: 'tmux new-session: ' + made.stderr };
+  const placeholder = made.stdout.trim();
+  const swapped = await run(['swap-pane', '-d', '-s', paneId, '-t', placeholder]);
+  if (swapped.code !== 0) {
+    const undo = await run(['kill-session', '-t', '=' + fresh]);
+    if (undo.code !== 0) console.error(`[flow] could not remove placeholder session ${fresh}: ${undo.stderr}`);
+    return { ok: false, error: 'tmux swap-pane: ' + swapped.stderr };
+  }
+  const killed = await run(['kill-pane', '-t', placeholder]);
+  if (killed.code !== 0) return { ok: false, error: `moved the pane but the placeholder ${placeholder} is still in the team: ${killed.stderr}` };
+  if (remote) remotes.set(nid, { host: remote.host, attach: null, own: remote.own, located: true });
+  return { ok: true, error: null };
+}
+
+// Moves flow_<srcId>'s active pane into flow_<dstId>'s current window.
+async function joinPane(wcId, srcId, dstId) {
+  const s = sanitize(srcId);
+  const d = sanitize(dstId);
+  if (!s || !d) return { ok: false, error: 'terminal id is empty' };
+  if (s === d) return { ok: false, error: 'a terminal cannot be joined into itself' };
+  const rs = await remoteAt(srcId);
+  const rd = await remoteAt(dstId);
+  if (!!rs !== !!rd || (rs && rd && rs.host !== rd.host)) return { ok: false, error: 'both terminals must run on the same machine' };
+  if (rs && rd && rs.own !== rd.own) return { ok: false, error: 'both terminals must run in the same tmux server' };
+  const run = runner(rs);
+  const src = await run(['display-message', '-p', '-t', windowTarget(sessionTarget(s, rs)), '#{pane_id}']);
+  if (src.code !== 0) return { ok: false, error: `terminal ${srcId} is not running (${src.stderr})` };
+  const dst = await run(['list-panes', '-t', windowTarget(sessionTarget(d, rd)), '-F', '#{pane_id}']);
+  if (dst.code !== 0) return { ok: false, error: `terminal ${dstId} is not running (${dst.stderr})` };
+  const dstPanes = dst.stdout.split('\n').filter(Boolean);
+  const mine = clients.get(keyOf(wcId, String(srcId)));
+  if (mine) mine.quietExit = true;
+  const args = dstPanes.length === 1
+    ? ['join-pane', '-d', '-h', '-s', src.stdout.trim(), '-t', dstPanes[0]]
+    : ['join-pane', '-d', '-v', '-s', src.stdout.trim(), '-t', dstPanes[dstPanes.length - 1]];
+  const r = await run(args);
+  if (r.code !== 0) {
+    if (mine) mine.quietExit = false;
+    return { ok: false, error: 'tmux join-pane: ' + r.stderr };
+  }
+  return { ok: true, error: null };
+}
+
+module.exports = {
+  init, open, write, resize, detach, detachAll, shutdown,
+  kill, restoreAttach, exists, list, panes, find, breakPane, joinPane, teammate, teamSessions, sshExec, sshSpawn, sshRetry, resumeCommand, holds,
+  isEnding: (pid) => ending.has(pid),
+  ready: () => cfg.ready,
+  pending: () => running.size > 0,
+  info: () => ({ socket: cfg.socket, tmux: cfg.tmux, claude: cfg.env ? resolveClaude() : null, conf: CONF }),
+};
+
+
+
+
