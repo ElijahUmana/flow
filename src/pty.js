@@ -886,3 +886,299 @@ const ENDING_MAX_MS = 120000;
 const ENDING_WAIT_MS = 30000;
 const SESSION_ARG = /(?:^|\s)(?:--session-id|--resume|-r)(?:=|\s+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\s|$)/i;
 const FORK_ARG = /(?:^|\s)--session-id(?:=|\s+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\s|$)/i;
+let endingTick = null;
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    if (e.code === 'ESRCH') return false;
+    if (e.code === 'EPERM') return true;
+    throw e;
+  }
+}
+
+function watchEnding() {
+  if (endingTick) return;
+  endingTick = setInterval(() => {
+    const now = Date.now();
+    for (const [pid, e] of ending) if (!alive(pid) || now - e.at > ENDING_MAX_MS) ending.delete(pid);
+    if (!ending.size) {
+      clearInterval(endingTick);
+      endingTick = null;
+    }
+  }, 250);
+  endingTick.unref();
+}
+
+const isClaudeArgs = (args) => {
+  const [a0, a1] = args.split(/\s+/), exe = path.basename(a0 || '');
+  return /claude/i.test(exe) || (/^(node|bun|sh|bash|zsh)$/.test(exe) && /claude/i.test(a1 || ''));
+};
+
+function sessionFromArgs(args) {
+  if (!isClaudeArgs(args)) return null;
+  const m = (/(?:^|\s)--fork-session(?:\s|$)/.test(args) ? FORK_ARG : SESSION_ARG).exec(args);
+  return m ? m[1].toLowerCase() : null;
+}
+
+// The conversation a claude holds: Claude Code's own registry entry, else its --session-id or --resume argument (a fork
+// starts as `--resume <parent> --fork-session --session-id <new>` and holds the new one).
+function sessionOfProcess(pid, args) {
+  try {
+    const o = JSON.parse(fs.readFileSync(path.join(claudeDir(), 'sessions', `${pid}.json`), 'utf8'));
+    if (o && typeof o.sessionId === 'string' && UUID_RE.test(o.sessionId)) return o.sessionId.toLowerCase();
+  } catch (e) {
+    // none, or caught half written: the argument says it
+    if (e.code !== 'ENOENT' && !(e instanceof SyntaxError)) throw e;
+  }
+  return sessionFromArgs(args);
+}
+
+// The claudes under the session's panes, read before the session is killed: once a pane's shell has gone, the claude it
+// started belongs to no pane.
+async function sessionClaudes(target) {
+  const r = await runLocal(['list-panes', '-s', '-t', target, '-F', '#{pane_pid}\t#{pane_current_path}']);
+  if (r.code !== 0) {
+    if (noServer(r.stderr) || noTarget(r.stderr)) return [];
+    throw new Error('tmux list-panes: ' + r.stderr);
+  }
+  const under = new Map();   // pid -> the folder of the pane it runs under
+  for (const line of r.stdout.split('\n')) {
+    const [pid, ...dir] = line.split('\t');
+    if (Number.isInteger(Number(pid)) && Number(pid) > 1) under.set(Number(pid), dir.join('\t'));
+  }
+  if (!under.size) return [];
+  const ps = await exec('/bin/ps', ['-axww', '-o', 'pid=,ppid=,args='], 10000);
+  if (ps.code !== 0) throw new Error('ps: ' + ps.stderr);
+  const procs = [];
+  for (const line of ps.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), args: m[3] });
+  }
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const p of procs) if (!under.has(p.pid) && under.has(p.ppid)) { under.set(p.pid, under.get(p.ppid)); grew = true; }
+  }
+  // A teammate has no registry entry and no conversation argument: its conversation is the one teammate() gave its window.
+  return procs.filter((p) => under.has(p.pid)).map((p) => {
+    const mate = parseMate(p.args);
+    return { pid: p.pid, sessionId: sessionOfProcess(p.pid, p.args) || (mate && mateSessionLocal(under.get(p.pid), mate.name, mate.team)), mate: mate && mate.agentId };
+  }).filter((p) => p.sessionId);
+}
+
+const waitIds = (opts) => [...new Set((opts && Array.isArray(opts.waitSessionIds) ? opts.waitSessionIds : [])
+  .map((x) => String(x).toLowerCase()).filter((x) => UUID_RE.test(x)))];
+async function remoteSessionProcesses(remote, sid, expectedPanes) {
+  const oneWindow = !!(remote.attach && attachIsWindow(remote.attach));
+  const target = expectedPanes && expectedPanes.length ? exactPaneScope(expectedPanes, oneWindow) : sessionTarget(sid, remote);
+  const panes = await runner(remote)(['list-panes', ...(oneWindow ? [] : ['-s']), '-t', target, '-F', '#{pane_pid}']);
+  if (panes.code !== 0) {
+    if (noServer(panes.stderr) || noTarget(panes.stderr)) return [];
+    throw new Error(`tmux list-panes -t ${target} on ${remote.host}: ${panes.stderr}`);
+  }
+  const roots = new Set(panes.stdout.split('\n').map(Number).filter((pid) => pid > 1));
+  if (!roots.size) return [];
+  const script = `for d in /proc/[0-9]*; do p=\${d##*/}; [ -r "$d/stat" ] && [ -r "$d/cmdline" ] || continue; ` +
+    `s=$(cat "$d/stat") || continue; r=\${s##*) }; set -- $r; pp=$2; shift 19; st=$1; ` +
+    `a=$(tr '\\000\\011\\012' '   ' < "$d/cmdline"); printf '%s\\t%s\\t%s\\t%s\\n' "$p" "$pp" "$st" "$a"; done`;
+  const ps = await sshExec(remote.host, ['sh', '-c', script]);
+  if (ps.code !== 0) throw new Error(`could not read processes on ${remote.host}: ${ps.stderr}`);
+  const procs = [];
+  for (const line of ps.stdout.split('\n')) {
+    const m = /^(\d+)\t(\d+)\t(\d+)\t(.*)$/.exec(line);
+    if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), start: m[3], args: m[4] });
+  }
+  const under = new Set(roots);
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const p of procs) if (!under.has(p.pid) && under.has(p.ppid)) { under.add(p.pid); grew = true; }
+  }
+  return procs.filter((p) => under.has(p.pid) && (isClaudeArgs(p.args) || !!parseMate(p.args)))
+    .map(({ pid, start }) => ({ pid, start }));
+}
+async function waitRemoteSessions(host, processes) {
+  if (!processes.length) return;
+  const pairs = processes.map((p) => `${p.pid}:${p.start}`).join(' ');
+  const script = `pairs=${shq(pairs)}; same() { p=\${1%%:*}; want=\${1#*:}; [ -r "/proc/$p/stat" ] || return 1; ` +
+    `s=$(cat "/proc/$p/stat") || return 1; r=\${s##*) }; set -- $r; shift 19; [ "$1" = "$want" ]; }; ` +
+    `left() { for x in $pairs; do same "$x" && return 0; done; return 1; }; ` +
+    `n=0; while left && [ "$n" -lt 300 ]; do sleep .1; n=$((n+1)); done; ` +
+    `if left; then for x in $pairs; do same "$x" && kill -TERM "\${x%%:*}" 2>/dev/null; done; n=0; while left && [ "$n" -lt 50 ]; do sleep .1; n=$((n+1)); done; fi; ` +
+    `if left; then for x in $pairs; do same "$x" && kill -KILL "\${x%%:*}" 2>/dev/null; done; n=0; while left && [ "$n" -lt 20 ]; do sleep .1; n=$((n+1)); done; fi; ! left`;
+  const r = await sshExec(host, ['sh', '-c', script], 40000);
+  if (r.code !== 0) throw new Error(`the ended conversations on ${host} did not exit`);
+}
+
+async function waitKilledRemote(sid, remote, processes) {
+  if (!processes.length) return;
+  const pending = { host: remote.host, processes };
+  recoveryProcesses.set(sid, pending);
+  await waitRemoteSessions(remote.host, processes);
+  if (recoveryProcesses.get(sid) === pending) recoveryProcesses.delete(sid);
+}
+async function waitRecoveryProcesses(sid, remote) {
+  const pending = recoveryProcesses.get(sid);
+  if (!pending) return;
+  if (!remote || pending.host !== remote.host) throw new Error(`cannot verify the ended conversations of ${sid}`);
+  await waitRemoteSessions(pending.host, pending.processes);
+  if (recoveryProcesses.get(sid) === pending) recoveryProcesses.delete(sid);
+}
+
+function exactPaneScope(panes, windowOnly) {
+  const sessions = new Set(panes.map((p) => p && p.sessionTmuxId).filter((v) => /^\$\d+$/.test(String(v))));
+  const windows = new Set(panes.map((p) => p && p.windowId).filter((v) => /^@\d+$/.test(String(v))));
+  if (sessions.size !== 1 || (windowOnly && windows.size !== 1)) throw new Error('the verified panes do not share one exact tmux target');
+  return windowOnly ? [...windows][0] : [...sessions][0];
+}
+
+const paneMembership = (p) => ({ paneId: p.paneId, panePid: p.panePid, sessionTmuxId: p.sessionTmuxId,
+  windowId: p.windowId, windowIndex: p.windowIndex, windowLayout: p.windowLayout || '', windowName: p.windowName || '', windowWidth: Number(p.windowWidth),
+  windowHeight: Number(p.windowHeight), index: p.index, left: Number(p.left), top: Number(p.top), width: Number(p.width),
+  height: Number(p.height), cwd: p.cwd, sessionId: p.sessionId || null,
+  mate: p.mate ? { agentId: p.mate.agentId || '', name: p.mate.name || '', team: p.mate.team || '' } : null });
+const restoredPane = (p) => ({ windowIndex: Number(p.windowIndex), windowActive: !!p.windowActive,
+  windowWidth: Number(p.windowWidth), windowHeight: Number(p.windowHeight), index: Number(p.index), active: !!p.active,
+  left: Number(p.left), top: Number(p.top), width: Number(p.width), height: Number(p.height), cwd: p.cwd, sessionId: p.sessionId || null });
+const samePanes = (a, b, shape = false) => JSON.stringify(a.map(shape ? restoredPane : paneMembership)) === JSON.stringify(b.map(shape ? restoredPane : paneMembership));
+
+async function requirePaneMembership(id, opts) {
+  const expected = opts && Array.isArray(opts.expectedPanes) ? opts.expectedPanes : [];
+  if (!expected.length) return;
+  const current = await teamSessions(id, opts);
+  if (!current.exists) throw new Error(`terminal ${id} ended before its verified shutdown`);
+  if (!samePanes(current.panes, expected)) {
+    throw new Error(`terminal ${id} pane membership changed before shutdown: expected ${JSON.stringify(expected.map(paneMembership))}, got ${JSON.stringify(current.panes.map(paneMembership))}`);
+  }
+}
+
+async function restoreSnapshot(id, opts) {
+  const sid = sanitize(id), panes = opts && Array.isArray(opts.expectedPanes) ? opts.expectedPanes : [];
+  if (!sid) throw new Error('terminal id is empty');
+  if (!panes.length || panes.some((p) => !p || !UUID_RE.test(String(p.sessionId || '')) || !p.cwd)) throw new Error(`cannot restore ${id}: its pane snapshot is incomplete`);
+  const remote = await remoteAt(id, opts), attach = remote && remote.attach ? String(remote.attach) : '';
+  const m = attach ? attachParts(attach) : null;
+  if (attach && !m) throw new Error(`cannot restore tmux target ${attach}`);
+  const session = attach ? m[1] : 'flow_' + sid, target = attach || '=' + session;
+  const current = await teamSessions(id, opts);
+  if (current.exists) {
+    if (samePanes(current.panes, panes, true)) return { ok: true, error: null };
+    throw new Error(`refusing to replace ${target}: its pane membership no longer matches the stopped terminal`);
+  }
+  const run = runner(remote), sessionBefore = await run(['has-session', '-t', '=' + session]);
+  if (sessionBefore.code !== 0 && !noServer(sessionBefore.stderr) && !noTarget(sessionBefore.stderr)) throw new Error(`tmux has-session: ${sessionBefore.stderr}`);
+  const hadSession = sessionBefore.code === 0;
+  if (remote) await waitRecoveryProcesses(sid, remote);
+  else await untilEnded(panes.map((p) => p.sessionId), () => false);
+  const groups = new Map();
+  for (const p of panes) {
+    const index = Number.isInteger(Number(p.windowIndex)) ? Number(p.windowIndex) : Number(m && m[2] || 0);
+    if (!groups.has(index)) groups.set(index, []);
+    groups.get(index).push(p);
+  }
+  const command = (p) => remote ? [remoteClaude(String(p.sessionId), true, null)] : localRecoveryCommand(String(p.sessionId));
+  let madeSession = false;
+  const madeWindows = [];
+  try {
+    for (const [index, members] of [...groups].sort((a, b) => a[0] - b[0])) {
+      members.sort((a, b) => Number(a.index) - Number(b.index));
+      const first = members[0];
+      if (!hadSession && !madeSession) {
+        const made = await run(['new-session', '-d', '-P', '-F', '#{window_id}', '-s', session, '-n', String(first.windowName || 'flow-restore'), '-c', String(first.cwd),
+          '-x', String(first.windowWidth || 80), '-y', String(first.windowHeight || 24), ...command(first)]);
+        if (made.code !== 0) throw new Error(`tmux new-session: ${made.stderr}`);
+        madeSession = true;
+        const windowId = String(made.stdout || '').trim();
+        if (!/^@\d+$/.test(windowId)) throw new Error(`tmux new-session did not return its window id: ${windowId}`);
+        const actual = await run(['display-message', '-p', '-t', windowId, '#{window_index}']);
+        if (actual.code !== 0) throw new Error(`tmux display-message: ${actual.stderr}`);
+        if (Number(actual.stdout.trim()) !== index) {
+          const moved = await run(['move-window', '-s', windowId, '-t', `=${session}:${index}`]);
+          if (moved.code !== 0) throw new Error(`tmux move-window: ${moved.stderr}`);
+        }
+      } else {
+        const made = await run(['new-window', '-d', '-t', `=${session}:${index}`, '-n', String(first.windowName || 'flow-restore'), '-c', String(first.cwd), ...command(first)]);
+        if (made.code !== 0) throw new Error(`tmux new-window: ${made.stderr}`);
+        madeWindows.push(index);
+      }
+      if (first.windowWidth && first.windowHeight) {
+        const resized = await run(['resize-window', '-t', `=${session}:${index}`, '-x', String(first.windowWidth), '-y', String(first.windowHeight)]);
+        if (resized.code !== 0) throw new Error(`tmux resize-window: ${resized.stderr}`);
+      }
+      for (const p of members.slice(1)) {
+        const split = await run(['split-window', '-d', '-t', `=${session}:${index}`, '-c', String(p.cwd), ...command(p)]);
+        if (split.code !== 0) throw new Error(`tmux split-window: ${split.stderr}`);
+      }
+      if (first.windowLayout) {
+        const layout = await run(['select-layout', '-t', `=${session}:${index}`, String(first.windowLayout)]);
+        if (layout.code !== 0) throw new Error(`tmux select-layout: ${layout.stderr}`);
+      }
+      const active = members.find((p) => p.active);
+      if (active) {
+        const selected = await run(['select-pane', '-t', `=${session}:${index}.${Number(active.index)}`]);
+        if (selected.code !== 0) throw new Error(`tmux select-pane: ${selected.stderr}`);
+      }
+      if (first.windowActive) {
+        const selected = await run(['select-window', '-t', `=${session}:${index}`]);
+        if (selected.code !== 0) throw new Error(`tmux select-window: ${selected.stderr}`);
+      }
+    }
+    const until = Date.now() + 15000;
+    let last = [];
+    while (Date.now() < until) {
+      const restored = await teamSessions(id, opts);
+      last = restored.panes || [];
+      if (restored.exists && samePanes(last, panes, true)) return { ok: true, error: null };
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(`the conversations of ${target} did not resume after recovery: expected ${JSON.stringify(panes.map(restoredPane))}, got ${JSON.stringify(last.map(restoredPane))}`);
+  } catch (error) {
+    if (madeSession) await run(['kill-session', '-t', '=' + session]).catch(() => {});
+    else for (const index of madeWindows.reverse()) await run(['kill-window', '-t', `=${session}:${index}`]).catch(() => {});
+    throw error;
+  }
+}
+
+const restoreAttach = restoreSnapshot;
+
+function kill(id, opts) {
+  const sid = sanitize(id);
+  ends.set(sid, (ends.get(sid) || 0) + 1);
+  const now = killNow(id, opts);
+  inTurn(sid, Promise.allSettled([turns.get(sid) || Promise.resolve(), now]));
+  return now;
+}
+
+async function killNow(id, opts) {
+  const sid = sanitize(id);
+  if (!sid) throw new Error('terminal id is empty');
+  const remote = await remoteAt(id, opts);
+  const ids = waitIds(opts);
+  const strict = !!(opts && opts.requireExists === true);
+  const expectedPanes = opts && Array.isArray(opts.expectedPanes) ? opts.expectedPanes : [];
+  const processes = remote && ids.length && (!remote.attach || (opts && opts.shutdownAttach === true))
+    ? await remoteSessionProcesses(remote, sid, expectedPanes) : [];
+  let localClaudes = null;
+  if (!remote && expectedPanes.length) localClaudes = await sessionClaudes('=flow_' + sid);
+  await requirePaneMembership(id, opts);
+  if (remote && remote.attach) {
+    // Flow did not create this session. A normal end only ends Flow's connection to it. A workspace close may end it
+    // only after the owner explicitly selected it in the VM-items confirmation (shutdownAttach).
+    if (!(opts && opts.shutdownAttach === true)) {
+      for (const c of [...clients.values()]) if (sanitize(c.id) === sid) c.proc.kill();
+      return;
+    }
+    const windowOnly = attachIsWindow(remote.attach);
+    const command = windowOnly ? 'kill-window' : 'kill-session';
+    const target = exactPaneScope(expectedPanes, windowOnly);
+    const r = await runner(remote)([command, '-t', target]);
+    if (r.code !== 0 && (strict || (!noServer(r.stderr) && !noTarget(r.stderr)))) throw new Error(`tmux ${command}: ${r.stderr || 'target is not running'}`);
+    for (const c of [...clients.values()]) if (sanitize(c.id) === sid) c.proc.kill();
+    await waitKilledRemote(sid, remote, processes);
+    return;
+  }
+  await endSession(sid, remote, localClaudes, strict);
+  if (remote) await waitKilledRemote(sid, remote, processes);
+}
+
