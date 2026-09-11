@@ -149,3 +149,154 @@ class Store {
   // How many accepted saves changed this workspace's model (not its views): equal content reached through a change and
   // its reversal still counts, so a close can tell that another window touched the workspace while it was deciding.
   revision(id) { this.ensureLoaded(); return this.revisions.get(String(id)) || 0; }
+
+  save(obj, senderId, pages, base) {
+    this.ensureLoaded();
+    return this.accept(this.merge(obj, senderId, pages, base), senderId, false);
+  }
+
+  flush(obj, senderId, pages, base) {
+    this.ensureLoaded();
+    return this.accept(this.merge(obj, senderId, pages, base), senderId, true);
+  }
+
+  closeWorkspace(obj, senderId, pages, base, targetId, expected, revision) {
+    this.ensureLoaded();
+    this.flushPending();
+    const current = this.doc && Array.isArray(this.doc.ws) ? this.doc.ws.find((ws) => ws && String(ws.id) === String(targetId)) : null;
+    if (!current || this.revision(targetId) !== revision || JSON.stringify(stableWorkspace(current)) !== JSON.stringify(expected)) return { ok: false, doc: clone(this.doc) };
+    return { ok: true, doc: this.accept(this.merge(obj, senderId, pages, base), senderId, true) };
+  }
+
+  merge(obj, senderId, pages, baseDoc) {
+    this.senderBehind = false;
+    const current = this.doc;
+    const known = this.senderDocs.has(senderId) ? this.senderDocs.get(senderId) : current;
+    const base = baseDoc && typeof baseDoc === 'object' ? clone(baseDoc) : clone(known);
+    let incoming = clone(obj);
+    if (Array.isArray(pages) && !this.frozen) this.claims.set(senderId, new Set(pages.map(String)));
+    if (incoming && typeof incoming === 'object' && current && ('pages' in incoming || 'pages' in current)) {
+      const r = mergePages(current.pages, incoming.pages);
+      incoming.pages = r.pages;
+      if (r.ahead) this.senderBehind = true;
+    }
+    const main = !this.isMain || this.isMain(senderId);
+    if (!main && incoming && Array.isArray(incoming.ws) && current && Array.isArray(current.ws)) {
+      const ownedSpace = this.workspaceOf ? this.workspaceOf(senderId) : null;
+      const owned = ownedSpace && typeof ownedSpace === 'object' ? ownedSpace.ws : ownedSpace;
+      const incomingById = new Map(incoming.ws.filter((ws) => ws && ws.id != null).map((ws) => [String(ws.id), ws]));
+      const baseById = new Map((base && Array.isArray(base.ws) ? base.ws : []).filter((ws) => ws && ws.id != null).map((ws) => [String(ws.id), ws]));
+      incoming.ws = current.ws.map((ws) => owned != null && String(ws.id) === String(owned) && incomingById.has(String(ws.id))
+        ? incomingById.get(String(ws.id)) : baseById.get(String(ws.id)) || ws);
+      const baseUi = base && record(base.ui) ? base.ui : {};
+      incoming.ui = record(incoming.ui) ? { ...incoming.ui } : clone(baseUi);
+      for (const key of ['at', 'sbHidden', 'workspaceUndos']) {
+        if (key in baseUi) incoming.ui[key] = baseUi[key];
+        else delete incoming.ui[key];
+      }
+    }
+    let next = base && current ? mergeValue(base, incoming, current) : incoming;
+    if (!next || !Array.isArray(next.ws) || !current || !Array.isArray(current.ws)) return next;
+    const byId = new Map(next.ws.filter((ws) => ws && ws.id != null).map((ws) => [String(ws.id), ws]));
+    const order = main && incoming && Array.isArray(incoming.ws) ? incoming.ws : current.ws;
+    next.ws = order.map((ws) => byId.get(String(ws.id)) || clone(ws));
+    if (main && incoming && record(incoming.ui)) {
+      next.ui = record(next.ui) ? next.ui : {};
+      for (const key of ['at', 'sbHidden', 'workspaceUndos']) {
+        if (key in incoming.ui) next.ui[key] = clone(incoming.ui[key]);
+        else delete next.ui[key];
+      }
+    }
+    const last = new Map(), sent = new Map();
+    for (const ws of current.ws) for (const w of (ws && Array.isArray(ws.windows) ? ws.windows : [])) if (w && w.type === 'page') last.set(w.id, w);
+    for (const ws of (incoming && Array.isArray(incoming.ws) ? incoming.ws : [])) for (const w of (ws && Array.isArray(ws.windows) ? ws.windows : [])) if (w && w.type === 'page') sent.set(w.id, w);
+    for (const ws of next.ws) for (const w of (ws && Array.isArray(ws.windows) ? ws.windows : [])) {
+      if (!w || w.type !== 'page' || !last.has(w.id)) continue;
+      const owner = this.ownerOf(w.id);
+      // A page window's tabs and shown tab are whole: the window that shows it, or any window while none does, sets them.
+      if (owner === undefined || owner === senderId) {
+        const mine = sent.get(w.id);
+        if (mine) for (const key of ['tabs', 'tab']) { if (key in mine) w[key] = clone(mine[key]); else delete w[key]; }
+        continue;
+      }
+      const kept = last.get(w.id);
+      if (JSON.stringify([kept.tabs, kept.tab]) === JSON.stringify([w.tabs, w.tab])) continue;
+      for (const key of ['tabs', 'tab']) {
+        if (key in kept) w[key] = kept[key];
+        else delete w[key];
+      }
+      this.senderBehind = true;
+    }
+    if (!same(next, incoming)) this.senderBehind = true;
+    return next;
+  }
+
+  ownerOf(id) {
+    if (this.frozen) return this.owners.get(id);
+    const open = (wc) => {
+      if (this.alive && this.alive(wc)) return true;
+      this.claims.delete(wc);
+      return false;
+    };
+    const cur = this.owners.get(id);
+    if (cur !== undefined && open(cur) && this.claims.has(cur) && this.claims.get(cur).has(id)) return cur;
+    for (const [wc, ids] of [...this.claims]) if (ids.has(id) && open(wc)) { this.owners.set(id, wc); return wc; }
+    this.owners.delete(id);
+    return undefined;
+  }
+
+  freezeOwners() { for (const ids of [...this.claims.values()]) for (const id of ids) this.ownerOf(id); this.frozen = true; }
+  flushPending() { if (this.timer || this.seq > this.committed) this.writeNowSync(); }
+
+  schedule() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      const seq = ++this.seq;
+      const text = this.serialize();
+      this.announce();
+      this.chain = this.chain.then(() => this.writeAsync(seq, text)).catch((e) => console.error(`[flow] could not save ${this.file}: ${e.message}`));
+    }, DEBOUNCE_MS);
+  }
+
+  serialize() {
+    return JSON.stringify(Object.assign({}, this.doc || {}, this.bounds ? { bounds: this.bounds } : {}, this.popouts.length ? { popouts: this.popouts } : {},
+      Object.keys(this.permissions).length ? { permissions: this.permissions } : {}));
+  }
+
+  announce() {
+    if (!this.pendingBroadcast) return;
+    this.pendingBroadcast = false;
+    if (this.doc) this.broadcast(this.doc, this.senderBehind ? null : this.lastSender);
+  }
+
+  writeNowSync() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    const seq = ++this.seq;
+    const text = this.serialize();
+    const tmp = `${this.file}.${process.pid}.${seq}.tmp`;
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    const fd = fs.openSync(tmp, 'w', 0o600);
+    try { fs.writeSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, this.file);
+    this.committed = seq;
+    this.announce();
+  }
+
+  async writeAsync(seq, text) {
+    const tmp = `${this.file}.${process.pid}.${seq}.tmp`;
+    await fs.promises.mkdir(path.dirname(this.file), { recursive: true });
+    const fh = await fs.promises.open(tmp, 'w', 0o600);
+    try { await fh.writeFile(text); await fh.sync(); } finally { await fh.close(); }
+    if (seq < this.committed) { await fs.promises.unlink(tmp); return; }
+    fs.renameSync(tmp, this.file);
+    this.committed = seq;
+  }
+}
+
+module.exports = { Store };
+
+
+
+
