@@ -589,3 +589,200 @@
               const b = inPane ? clampTo(inPane, cellAt(e.clientX, e.clientY)) : cellAt(e.clientX, e.clientY);
               selectCells(Math.min(p.at, b), Math.max(p.at, b) + 1);
             }
+            clip();
+            copy();
+          });
+          return;
+        }
+        if (moved || p.detail > 1) return;
+        /* on the screen element, which stays; the row xterm drew under the press may have been drawn again since */
+        const screen = term.element.querySelector('.xterm-screen');
+        const down = mouseEv('mousedown', p, { buttons: 1 });
+        ours.add(down);
+        screen.dispatchEvent(down);
+        const up = mouseEv('mouseup', p, { buttons: 0 });
+        ours.add(up);
+        document.dispatchEvent(up);
+      }, 0);
+    }
+
+    /* addon-fit divides by xterm's css cell width, which xterm derives as round(cols * charWidth) / cols, so its answer
+       depends on the current column count and can land one column short until a second fit. The device cell size
+       does not depend on cols. */
+    function propose() {
+      const cell = term._core._renderService.dimensions.device.cell;
+      const dpr = window.devicePixelRatio;
+      if (!(cell.width > 0) || !(cell.height > 0)) return null;
+      const cs = getComputedStyle(box);
+      return {
+        cols: Math.max(2, Math.floor((parseFloat(cs.width) * dpr) / cell.width)),
+        rows: Math.max(1, Math.floor((parseFloat(cs.height) * dpr) / cell.height)),
+      };
+    }
+
+    function fitNow() {
+      if (!term || !sized()) return;
+      if (!natural && term.options.fontSize !== fontSize()) { setFont(fontSize()); fitted = ''; }
+      const d = natural ? fitFont(natural) : propose();
+      if (!d) return;
+      if (d.cols !== term.cols || d.rows !== term.rows) term.resize(d.cols, d.rows);
+      pushSize();
+      layoutMates();
+    }
+
+    /* A VM window attached with ignore-size is shown at that window's own size (natural: from open, then from the
+       panes' extent plus tmux's status lines): xterm keeps its cols x rows and the font shrinks until it fits, never
+       above FONT_SIZE. A smaller font rather than a CSS scale keeps mouse cells, selection and links exact. */
+    function fitFont(n) {
+      const cs = getComputedStyle(box);
+      const w = parseFloat(cs.width), h = parseFloat(cs.height);
+      const key = `${n.cols}x${n.rows} in ${w}x${h}`;
+      if (key === fitted) return n;
+      const dpr = window.devicePixelRatio;
+      const need = () => {
+        const cell = term._core._renderService.dimensions.device.cell;
+        return Math.max((n.cols * cell.width) / dpr / w, (n.rows * cell.height) / dpr / h);
+      };
+      setFont(FONT_SIZE);
+      let size = FONT_SIZE;
+      const over = need();
+      if (over > 1) {
+        size = Math.max(MIN_FONT_SIZE, Math.floor((FONT_SIZE / over) * 10) / 10);
+        setFont(size);
+        while (need() > 1 && size > MIN_FONT_SIZE) {
+          size = Math.round((size - 0.1) * 10) / 10;
+          setFont(size);
+        }
+      }
+      fitted = key;
+      return n;
+    }
+
+    function setFont(size) {
+      if (term.options.fontSize === size) return;
+      term.options.fontSize = size;
+      term.options.lineHeight = lineHeight(size);
+    }
+
+    /* nav.js hands a pinch over this window to what is under the fingers as 'flow-pinch' { factor, x, y, t }. The font
+       follows the fingers; once they rest, cols and rows follow the new font with one resize, as at the end of a window
+       drag, since every resize redraws the program. A VM window shown at its own size (natural) keeps the font that
+       fits it: its cols and rows are that window's. */
+    let pinch = null;
+    el.addEventListener('flow-pinch', (e) => {
+      e.stopPropagation();
+      const d = e.detail || {}, f = +d.factor;
+      if (!term || natural || !(f > 0) || !Number.isFinite(f)) return;
+      const t = Number.isFinite(+d.t) ? +d.t : Date.now();
+      if (!pinch || t - pinch.last > PINCH_GAP_MS) pinch = { last: t, hold: null, timer: 0 };
+      pinch.last = Math.max(pinch.last, t);
+      const was = Math.log(zoom), step = Math.log(f);
+      let lz = was + step;
+      if (pinch.hold !== null) pinch.hold += step;
+      else if (was !== 0 && Math.sign(lz) !== Math.sign(was)) pinch.hold = 0;   // the step that crosses 100% stops there
+      if (pinch.hold !== null) {
+        lz = Math.abs(pinch.hold) < ZOOM_HOLD ? 0 : pinch.hold - Math.sign(pinch.hold) * ZOOM_HOLD;
+        if (lz !== 0) pinch.hold = null;
+      }
+      zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.exp(lz)));
+      setFont(fontSize());
+      const p = pinch;
+      clearTimeout(p.timer);
+      p.timer = setTimeout(() => {
+        if (pinch === p) pinch = null;
+        if (state === 'disposed') return;
+        if (held) heldFits.add(fitNow);
+        else fitNow();
+      }, PINCH_GAP_MS);
+    });
+
+    function pushSize() {
+      if (state !== 'open' || (sent.cols === term.cols && sent.rows === term.rows)) return;
+      sent = { cols: term.cols, rows: term.rows };
+      window.flow.term.resize(id, term.cols, term.rows);
+    }
+
+    function scheduleFit() {
+      if (state === 'disposed') return;
+      if (!term) { activate(); return; }
+      clearTimeout(fitTimer);
+      if (held) heldFits.add(fitNow);
+      else fitTimer = setTimeout(fitNow, FIT_DELAY_MS);
+    }
+
+    function watchDpr() {
+      const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      const changed = () => {
+        unwatchDpr();
+        if (!term) return;
+        term.options.lineHeight = lineHeight(term.options.fontSize);
+        fitted = '';
+        scheduleFit();
+        watchDpr();
+      };
+      mq.addEventListener('change', changed);
+      unwatchDpr = () => mq.removeEventListener('change', changed);
+    }
+
+    /* ---------- team: a grab handle on each pane's title row ---------- */
+    /* With panesFrom: 'app' the app's single poller (teams.js, only what is on screen) hands the list to setPanes. */
+    function startPanes() {
+      if (!(o.team || natural) || o.panesFrom === 'app' || paneTimer || !visible || state !== 'open') return;
+      pollPanes();
+      paneTimer = setInterval(pollPanes, PANE_POLL_MS);
+    }
+
+    function stopPanes() {
+      clearInterval(paneTimer);
+      paneTimer = 0;
+    }
+
+    function pollPanes() {
+      if (paneBusy) return;
+      paneBusy = true;
+      window.flow.term.panes(id, o.host ? { host: o.host, attach: o.attach } : undefined).then((list) => {
+        paneBusy = false;
+        paneErr = '';
+        if (state === 'open') takePanes(list);
+      }, (err) => {
+        paneBusy = false;
+        const msg = String((err && err.message) || err);
+        if (msg !== paneErr) console.error(`FlowTerm: flow.term.panes failed for ${id}`, err);
+        paneErr = msg;
+      });
+    }
+
+    function takePanes(list) {
+      panes = Array.isArray(list) ? list : [];
+      /* a selection in a pane that moved, changed size or went no longer covers what it did */
+      if (inPane) {
+        const now = panes.find((p) => p.paneId === inPane.paneId);
+        if (!now || ['left', 'top', 'width', 'height'].some((k) => now[k] !== inPane[k])) {
+          inPane = null;
+          if (term) {
+            term.clearSelection();
+            clip();
+          }
+        }
+      }
+      if (natural && panes.length) {
+        const cols = Math.max(...panes.map((p) => p.left + p.width));
+        const rows = Math.max(...panes.map((p) => p.top + p.height)) + statusRows;
+        if (cols !== natural.cols || rows !== natural.rows) {
+          natural = { cols, rows };
+          fitNow();
+          return;
+        }
+      }
+      layoutMates();
+    }
+
+    function mateEl(entry) {
+      const m = document.createElement('div');
+      m.className = 'fterm-mate';
+      m.title = 'drag this teammate out to make it its own window';
+      m.innerHTML = '<i></i>';
+      m.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        if (o.onMateDragStart) o.onMateDragStart(entry.pane, e);
