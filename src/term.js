@@ -786,3 +786,200 @@
         if (e.button !== 0) return;
         e.preventDefault();
         if (o.onMateDragStart) o.onMateDragStart(entry.pane, e);
+      });
+      return m;
+    }
+
+    function layoutMates() {
+      if (!o.team) return;
+      const keep = new Set();
+      if (term && state === 'open' && panes.length > 1) {
+        /* the same cell size addon-fit reads */
+        const cell = term._core._renderService.dimensions.css.cell;
+        const x0 = box.offsetLeft, y0 = box.offsetTop;
+        for (const p of panes) {
+          keep.add(p.paneId);
+          let entry = mates.get(p.paneId);
+          if (!entry) {
+            entry = { pane: p, el: null };
+            entry.el = mateEl(entry);
+            mates.set(p.paneId, entry);
+            layer.appendChild(entry.el);
+          }
+          entry.pane = p;
+          /* pane-border-status top draws the pane title on the row just above the pane */
+          const titled = p.top > 0;
+          const cols = titled ? Math.max(2, Math.min(p.width, String(p.title || '').length + 5)) : 2;
+          const left = titled ? p.left : p.left + Math.max(0, p.width - 2);
+          const s = entry.el.style;
+          s.left = `${x0 + left * cell.width}px`;
+          s.top = `${y0 + (titled ? p.top - 1 : p.top) * cell.height}px`;
+          s.width = `${cols * cell.width}px`;
+          s.height = `${cell.height}px`;
+          s.setProperty('--cw', `${cell.width}px`);
+          entry.el.classList.toggle('active', !!p.active);
+        }
+      }
+      for (const [paneId, entry] of mates) {
+        if (keep.has(paneId)) continue;
+        entry.el.remove();
+        mates.delete(paneId);
+      }
+    }
+
+    /* ---------- find bar ---------- */
+    /* ⌘F finds in the whole history, which tmux keeps (scrollback 0 here): flow.term.find runs tmux's copy mode on the
+       active pane, which shows each match where it is. Typing finds the nearest match up from where the view was, ↩ the
+       next one up, ⇧↩ the next one down. Closing the bar keeps the view there; a key, or scrolling down to the end, goes
+       back to the end, as after the wheel. tmux has no count, so the bar says only "no matches". Finds run one at a
+       time, in order, and a newer text replaces one not sent yet. An attach window, whose tmux is not Flow's, finds on
+       its screen with xterm's search. */
+    let finds = [], finding = false, foundInTmux = false;
+    const viaTmux = () => !o.attach && state === 'open' && !!window.flow.term.find;
+
+    function openFind() {
+      if (!term) return;
+      findBar.hidden = false;
+      findInput.focus();
+      findInput.select();
+    }
+
+    function closeFind() {
+      findBar.hidden = true;
+      findCount.textContent = '';
+      if (!term) return;
+      if (foundInTmux) tmuxFind({ done: true });
+      foundInTmux = false;
+      finder.clearDecorations();
+      term.focus();
+    }
+
+    /* dir: FIND_UP or FIND_DOWN; incremental: the text changed, so the nearest match up from where this find started */
+    function search(dir, incremental) {
+      if (!term) return;
+      /* find selects or shows its match wherever it is, so a pane's clip from an earlier drag must not hide or cut it */
+      inPane = null;
+      clip();
+      const text = findInput.value;
+      if (viaTmux()) {
+        /* the rows under an xterm selection are about to show other lines */
+        term.clearSelection();
+        foundInTmux = true;
+        /* tmux matches any case for lowercase text, as this bar always has */
+        tmuxFind({ text: text.toLowerCase(), step: incremental ? 0 : dir === FIND_UP ? 1 : -1 });
+        return;
+      }
+      if (!text) {
+        finder.clearDecorations();
+        term.clearSelection();
+        findCount.textContent = '';
+        findCount.classList.remove('none');
+        return;
+      }
+      const options = { caseSensitive: false, incremental, decorations: FIND_DECORATIONS };
+      if (dir === FIND_UP) finder.findPrevious(text, options);
+      else finder.findNext(text, options);
+    }
+
+    function tmuxFind(op) {
+      const last = finds[finds.length - 1];
+      if (op.step === 0 && last && last.step === 0) finds[finds.length - 1] = op;
+      else finds.push(op);
+      if (!finding) nextFind();
+    }
+
+    function nextFind() {
+      const op = finds.shift();
+      finding = !!op;
+      if (!op) return;
+      window.flow.term.find(id, op, o.host ? { host: o.host } : undefined).then((r) => r, (err) => ({ ok: false, error: String((err && err.message) || err) })).then((r) => {
+        if (!r.ok) console.error(`FlowTerm: find in ${id} failed: ${r.error}`);
+        if (state !== 'disposed' && !op.done && !findBar.hidden) {
+          const none = r.ok && !!op.text && !r.found;
+          findCount.textContent = !r.ok ? 'could not search' : none ? 'no matches' : '';
+          findCount.classList.toggle('none', !r.ok || none);
+        }
+        nextFind();
+      });
+    }
+
+    findInput.addEventListener('input', () => search(FIND_UP, true));
+    findInput.addEventListener('focus', focused);
+    findInput.addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (e.key === 'Enter') { e.preventDefault(); search(e.shiftKey ? FIND_DOWN : FIND_UP, false); }
+      else if (e.key === 'Escape') { e.preventDefault(); closeFind(); }
+      else if (e.metaKey && k === 'f') { e.preventDefault(); findInput.select(); }
+      else if (e.metaKey && k === 'g') { e.preventDefault(); search(e.shiftKey ? FIND_DOWN : FIND_UP, false); }
+    });
+    findBar.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-find]');
+      if (!b) return;
+      if (b.dataset.find === 'close') { closeFind(); return; }
+      search(b.dataset.find === 'up' ? FIND_UP : FIND_DOWN, false);
+      findInput.focus();
+    });
+
+    /* ---------- events on the whole view ---------- */
+    /* Typing in a terminal never triggers the app's single-key shortcuts; ⌘ combos still reach the app and menu. */
+    el.addEventListener('keydown', (e) => { if (!e.metaKey) e.stopPropagation(); });
+
+    /* In tmux mouse mode xterm cancels every wheel event, so sideways swipes are handed to the app from above. */
+    el.addEventListener('wheel', (e) => {
+      if (Math.abs(e.deltaX) <= Math.abs(e.deltaY) || !el.parentElement) return;
+      e.stopPropagation();
+      if (!el.parentElement.dispatchEvent(new WheelEvent('wheel', e))) e.preventDefault();
+    }, { capture: true, passive: false });
+
+    /* ⌘V of files copied in Finder (the paste carries them as Files) types their paths the way a drop does. ⌘V with no
+       text on the clipboard: main saves a clipboard image as a PNG and its path is pasted the same way as a dropped
+       file, so Claude Code attaches it as [Image #N]; on a VM terminal it is put there first. Text pastes stay with
+       xterm. Capture on the root runs before xterm's own paste handler. */
+    /* the Edit menu's Copy and execCommand('copy') reach xterm's own copy, which takes whole rows */
+    el.addEventListener('copy', (e) => {
+      if (!term || !inPane || !term.hasSelection()) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      e.clipboardData.setData('text/plain', selected());
+    }, true);
+    /* A right-click on the terminal's screen is the terminal's own menu, as in Terminal.app: Copy, Paste, Select All, the
+       same as ⌘C, ⌘V and ⌘A, and no Cut (owner's right-click Cut/Copy/Paste, batch 10). The window's menu (fork, move)
+       is on its title bar. A program that takes the mouse still gets the right-click itself. */
+    el.addEventListener('contextmenu', (e) => {
+      if (!term || !term.element.contains(e.target) || !(window.flow.menu && window.flow.menu.popup)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const items = [
+        { id: 'copy', label: 'Copy', enabled: term.hasSelection() },
+        { id: 'paste', label: 'Paste', enabled: true },
+        { type: 'separator' },
+        { id: 'all', label: 'Select All', enabled: true },
+      ];
+      window.flow.menu.popup(items, { x: e.clientX, y: e.clientY }).then((chosen) => {
+        if (!term) return;
+        if (chosen === 'copy') copy();
+        else if (chosen === 'all') selectShown();
+        else if (chosen === 'paste') {
+          /* main pastes into xterm's input as the Edit menu's Paste does, so it is the page's own paste, as ⌘V: files and
+             images as well as text, and out of the scrollback first */
+          term.focus();
+          window.flow.nativeEdit('paste');
+        }
+      }, (err) => console.error(`FlowTerm: the terminal menu of ${id} could not open`, err));
+    });
+    el.addEventListener('paste', (e) => {
+      if (!term || e.target !== term.textarea) return;
+      const viaCtrlV = !!ctrlV;
+      clearTimeout(ctrlV);
+      ctrlV = 0;
+      const dt = e.clipboardData;
+      if (!dt) { if (viaCtrlV) send('\x16'); return; }
+      const rows = Array.from(dt.files, (f) => ({ host: null, path: window.flow.pathForFile(f) })).filter((r) => r.path);
+      if (rows.length) {
+        e.preventDefault();
+        e.stopPropagation();
+        bring(rows).then((paths) => { if (paths) typePaths(paths); });
+        return;
+      }
+      if (viaCtrlV) {
+        e.preventDefault();
