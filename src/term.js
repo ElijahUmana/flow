@@ -983,3 +983,199 @@
       }
       if (viaCtrlV) {
         e.preventDefault();
+        e.stopPropagation();
+        pasteImage().then((done) => { if (!done) send('\x16'); });
+        return;
+      }
+      /* xterm takes the text but lets Chromium put it in its hidden input too, where Select All would find it */
+      if (dt.getData('text/plain')) {
+        setTimeout(() => { if (term) term.textarea.value = ''; }, 0);
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      pasteImage();
+    }, true);
+    /* A clipboard image: main saves it as a PNG on this Mac, and on a VM terminal it is put into ~/.flow/pasted-images
+       there first; its path is typed as a dropped file's is, so Claude Code attaches it. Resolves false when the
+       clipboard holds no image. */
+    let ctrlV = 0;   // the timer that sends Control-V itself if the paste a VM terminal's Control-V asked for never comes
+    function pasteImage() {
+      return window.flow.saveClipboardImage().then((file) => {
+        if (!file) return false;
+        if (!o.host) { typePaths([file]); return true; }
+        return bring([{ host: null, path: file }], PASTED_ON_VM).then((paths) => { if (paths) typePaths(paths); return true; });
+      }, (err) => {
+        console.error(`FlowTerm: could not save the clipboard image for ${id}`, err);
+        cannot(`the image on the clipboard could not be saved: ${(err && err.message) || err}`);
+        return true;
+      });
+    }
+
+    /* Files come from Finder ('Files') or from Flow's files group: FLOW_FILES is JSON [{ host, path }], host null on
+       this Mac, path absolute on that machine. */
+    const dragTypes = (e) => (e.dataTransfer ? Array.from(e.dataTransfer.types) : []);
+    const hasFiles = (e) => dragTypes(e).some((t) => t === 'Files' || t === FLOW_FILES);
+    function flowRows(raw) {
+      let rows;
+      try {
+        rows = JSON.parse(raw);
+      } catch (err) {
+        console.error(`FlowTerm: ${id} got a ${FLOW_FILES} drop that is not JSON`, err);
+        return [];
+      }
+      return Array.isArray(rows) ? rows.filter((r) => r && typeof r.path === 'string' && r.path) : [];
+    }
+    /* Why a drop typed nothing, for the app to say (the one kind of notice the owner keeps). */
+    function cannot(text) {
+      if (o.onCannot) o.onCannot(text);
+      else console.error(`FlowTerm: ${id}: ${text}`);
+    }
+    function typePaths(paths) {
+      if (term && (state === 'open' || state === 'opening')) term.paste(`${paths.map(shellQuote).join(' ')} `);
+    }
+    /* Files on the other machine are carried first (vmfiles through flow.files): a Mac file to a VM terminal is put
+       into the workspace's VM folder (vmFolder, or dir), a VM file to a Mac terminal is copied into the Mac's downloads
+       and the app hears of it (onDownload). Resolves the paths to type in order, or null after saying why. */
+    function bring(rows, dir) {
+      const here = o.host || null;
+      return Promise.all(rows.map(async (r) => {
+        const from = r.host || null;
+        const name = r.path.split('/').pop();
+        if (from === here) return { path: r.path };
+        if (from && here) return { error: `${name} is on ${from}, and this terminal runs on ${here}` };
+        try {
+          const res = here
+            ? await window.flow.files.put(r.path, here, dir || o.vmFolder || '~', { make: !!dir })
+            : await window.flow.files.copy(from, r.path);
+          if (!res || !res.ok) return { error: `${name}: ${(res && res.error) || 'no answer'}` };
+          if (!here && o.onDownload) o.onDownload(res.file);
+          return { path: here ? res.path : res.file };
+        } catch (err) {
+          console.error(`FlowTerm: could not carry ${r.path} for ${id}`, err);
+          return { error: `${name}: ${(err && err.message) || err}` };
+        }
+      })).then((landed) => {
+        const failed = landed.find((x) => x.error);
+        if (failed) { cannot(failed.error); return null; }
+        return landed.map((x) => x.path);
+      });
+    }
+    el.addEventListener('dragover', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = 'copy';
+      el.classList.add('fterm-drop');
+    });
+    el.addEventListener('dragleave', (e) => { if (!el.contains(e.relatedTarget)) el.classList.remove('fterm-drop'); });
+    el.addEventListener('drop', (e) => {
+      el.classList.remove('fterm-drop');
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (!term) return;
+      const rows = dragTypes(e).includes(FLOW_FILES)
+        ? flowRows(e.dataTransfer.getData(FLOW_FILES))
+        : Array.from(e.dataTransfer.files, (f) => ({ host: null, path: window.flow.pathForFile(f) })).filter((r) => r.path);
+      if (!rows.length) return;
+      term.focus();
+      bring(rows).then((paths) => { if (paths) typePaths(paths); });
+    });
+
+    const ro = new ResizeObserver(scheduleFit);
+    ro.observe(box);
+
+    const internal = {
+      data(data) { if (term) term.write(data); },
+      exit(code) {
+        if (state !== 'open' && state !== 'opening') return;
+        state = 'ended';
+        stopPanes();
+        panes = [];
+        layoutMates();
+        notice(ENDED);
+        if (o.onExit) o.onExit(code);
+      },
+    };
+    live.set(id, internal);
+
+    /* returns whether this window still had (or was getting) a tmux client */
+    function teardown() {
+      if (state === 'disposed') return false;
+      const attached = state === 'open' || state === 'opening';
+      state = 'disposed';
+      if (live.get(id) === internal) live.delete(id);
+      clearTimeout(fitTimer);
+      clearTimeout(parkTimer);
+      clearTimeout(waitTimer);
+      heldFits.delete(fitNow);
+      stopPanes();
+      ro.disconnect();
+      if (unwatchDpr) unwatchDpr();
+      document.removeEventListener('mousemove', optionMove, true);
+      document.removeEventListener('mouseup', release, true);
+      clearTimeout(linkWait);
+      finds = [];
+      if (term) term.dispose();
+      term = null;
+      finder = null;
+      mates.clear();
+      el.remove();
+      return attached;
+    }
+
+    return {
+      el,
+      focus() { if (term) term.focus(); else wantFocus = true; },
+      fit() {
+        if (!term) { activate(); return; }
+        clearTimeout(fitTimer);
+        if (held) heldFits.add(fitNow);
+        else fitNow();
+      },
+      setVisible(v) {
+        if (state === 'disposed') return;
+        visible = !!v;
+        if (!visible) { stopPanes(); schedulePark(); return; }
+        clearTimeout(parkTimer);
+        if (!term) { activate(); return; }
+        if (state === 'parked') { unpark(); return; }
+        scheduleFit();
+        startPanes();
+      },
+      setPanes(list) { if (state === 'open') takePanes(list); },
+      find() { openFind(); },
+      selectAll() { selectShown(); },
+      detach() { if (teardown()) window.flow.term.detach(id); },
+      kill() {
+        if (teardown()) killed.add(id);
+        return window.flow.term.kill(id, o.host ? { host: o.host, attach: o.attach } : undefined);
+      },
+      dispose() { if (teardown()) window.flow.term.detach(id); },
+      getText(maxLines) {
+        if (!term) return '';
+        const buf = term.buffer.active;
+        const lines = [];
+        for (let y = buf.viewportY; y < buf.viewportY + term.rows; y++) {
+          const line = buf.getLine(y);
+          /* to cols: after the terminal narrows, the alternate buffer (tmux's) keeps the cells past the right edge */
+          lines.push(line ? line.translateToString(true, 0, term.cols) : '');
+        }
+        while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+        const n = maxLines > 0 ? Math.min(maxLines, lines.length) : lines.length;
+        return lines.slice(lines.length - n).join('\n');
+      },
+      get state() { return state; },
+      get cols() { return term ? term.cols : 0; },
+      get rows() { return term ? term.rows : 0; },
+      get fontSize() { return term ? term.options.fontSize : 0; },
+    };
+  }
+
+  window.FlowTerm = { mount, hold, nameFrom };
+})();
+
+
+
+
