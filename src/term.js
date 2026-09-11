@@ -392,3 +392,200 @@
       navigator.clipboard.writeText(selected()).catch((err) => {
         console.error('FlowTerm: clipboard write failed, trying execCommand', err);
         if (!document.execCommand('copy')) console.error('FlowTerm: execCommand copy failed too');
+      });
+    }
+
+    /* A drag selects here: xterm draws it as the pointer moves, where tmux drew it through the pty and back, a step
+       behind (owner, Nov 2: "highlighting is not smooth"). Letting go of a drag or a double or triple click copies it,
+       and it stays highlighted until the next click. While tmux has the mouse, xterm selects only for a press with its
+       force key, so a plain or Shift press goes on with that key; a click without a drag is then handed to tmux as
+       before (a pane, a program that takes clicks). A Shift-click extends the selection to it and copies. An Option
+       press goes on without Option, to tmux, which selects in a shell, or to a program that takes the mouse, as Claude
+       does. Right, middle, ⌘ and Control presses are as they were. With two or more panes a selection stays in the
+       pane it started in: its highlight is clipped to that pane and only that pane's part of each row is copied. A
+       press on a border goes to tmux, which moves the border. */
+    const ours = new WeakSet();
+    let pressed = null, presses = 0, force, option = false, inPane = null;
+    /* The force key is asked of xterm itself, so it follows xterm's own platform test (Option with
+       macOptionClickForcesSelection on the Mac, Shift elsewhere); one that would start a column selection does not do. */
+    function forceKey() {
+      if (force === undefined) {
+        const svc = term._core._selectionService;
+        force = ['altKey', 'shiftKey'].find((k) => svc.shouldForceSelection({ [k]: true }) && !svc.shouldColumnSelect({ [k]: true })) || null;
+        if (!force) console.error(`FlowTerm: xterm forces a selection with no key here, so ${id} keeps tmux's selection`);
+      }
+      return force;
+    }
+    /* Option is xterm's force key on the Mac, and tmux reads an Option drag as M-MouseDrag1Pane, which nothing is bound
+       to; so every event of an Option drag reaches xterm's mouse reporting as a plain one. */
+    const unOption = (e) => Object.defineProperty(e, 'altKey', { value: false });
+    function optionMove(e) {
+      if (option) unOption(e);
+    }
+    /* Nobody polls the panes of a terminal that is not a team or attached, yet it can be split by hand: its panes are
+       asked of tmux on each press, and while the pointer moves over it at most every 2 s. */
+    let split = [], splitAsk = null, splitAsked = 0, splitErr = '';
+    function askSplit(now) {
+      if (paneTimer || o.panesFrom === 'app' || state !== 'open' || (now !== true && Date.now() - splitAsked < 2000)) return;
+      splitAsked = Date.now();
+      splitAsk = window.flow.term.panes(id, o.host ? { host: o.host, attach: o.attach } : undefined).then((list) => {
+        split = Array.isArray(list) ? list : [];
+        splitErr = '';
+      }, (err) => {
+        const msg = String((err && err.message) || err);
+        if (msg !== splitErr) console.error(`FlowTerm: flow.term.panes failed for ${id}`, err);
+        splitErr = msg;
+      });
+    }
+    const mouseEv = (type, p, init) => new MouseEvent(type, { bubbles: true, cancelable: true, view: window, button: 0,
+      detail: p.detail, clientX: p.x, clientY: p.y, screenX: p.sx, screenY: p.sy, ...init });
+    /* the cell under a point, as an index into the buffer's rows */
+    function cellAt(x, y) {
+      const r = term.element.querySelector('.xterm-screen').getBoundingClientRect();
+      const col = Math.min(term.cols - 1, Math.max(0, Math.floor(((x - r.left) * term.cols) / r.width)));
+      const row = Math.min(term.rows - 1, Math.max(0, Math.floor(((y - r.top) * term.rows) / r.height)));
+      return (row + term.buffer.active.viewportY) * term.cols + col;
+    }
+    const selectCells = (from, to) => term.select(from % term.cols, Math.floor(from / term.cols), to - from);
+    /* null with fewer than two panes; else the pane the cell is in, undefined on a border */
+    function paneAt(cell) {
+      const list = paneTimer || o.panesFrom === 'app' ? panes : split;
+      if (list.length < 2) return null;
+      const x = cell % term.cols, y = Math.floor(cell / term.cols) - term.buffer.active.viewportY;
+      return list.find((p) => x >= p.left && x < p.left + p.width && y >= p.top && y < p.top + p.height);
+    }
+    function clampTo(p, cell) {
+      const top = p.top + term.buffer.active.viewportY;
+      const x = Math.min(p.left + p.width - 1, Math.max(p.left, cell % term.cols));
+      const y = Math.min(top + p.height - 1, Math.max(top, Math.floor(cell / term.cols)));
+      return y * term.cols + x;
+    }
+    /* xterm's selection runs across the terminal's whole width, so in one pane of several what it draws is clipped */
+    function clip() {
+      const layer = term.element.querySelector('.xterm-selection');
+      if (!layer) return;
+      if (!inPane) {
+        layer.style.clipPath = '';
+        return;
+      }
+      const { width: w, height: h } = term._core._renderService.dimensions.css.cell;
+      const l = inPane.left * w, t = inPane.top * h, r = (inPane.left + inPane.width) * w, b = (inPane.top + inPane.height) * h;
+      layer.style.clipPath = `polygon(${l}px ${t}px, ${r}px ${t}px, ${r}px ${b}px, ${l}px ${b}px)`;
+    }
+    /* the selection as text; in one pane of several, that pane's part of each row */
+    function selected() {
+      if (!inPane) return term.getSelection();
+      const pos = term.getSelectionPosition();
+      if (!pos) return '';
+      const p = inPane, buf = term.buffer.active, top = p.top + buf.viewportY, rows = [];
+      for (let y = Math.max(pos.start.y, top); y <= Math.min(pos.end.y, top + p.height - 1); y++) {
+        if (y === pos.end.y && pos.end.x === 0 && y > pos.start.y) break;
+        const from = y === pos.start.y ? Math.max(pos.start.x, p.left) : p.left;
+        const to = y === pos.end.y ? Math.min(pos.end.x, p.left + p.width) : p.left + p.width;
+        const line = buf.getLine(y);
+        /* xterm trims only at the end of the whole row, which runs on into the next pane */
+        rows.push(line && to > from ? line.translateToString(false, from, to).replace(/\s+$/, '') : '');
+      }
+      return rows.join('\n');
+    }
+    /* Select All: what the terminal shows; with two or more panes, tmux's active pane. Not xterm's selectAll, which also
+       takes the lines a resize left above the screen. It selects at once with the panes known now, and again if tmux's
+       answer about them (asked now, for a terminal split by hand) differs, unless a press came in between. */
+    function selectShown() {
+      if (!term) return;
+      const pick = () => {
+        const list = paneTimer || o.panesFrom === 'app' ? panes : split;
+        inPane = list.length > 1 ? list.find((p) => p.active) || null : null;
+        const y = term.buffer.active.viewportY;
+        if (inPane) selectCells((y + inPane.top) * term.cols + inPane.left, (y + inPane.top + inPane.height - 1) * term.cols + inPane.left + inPane.width);
+        else selectCells(y * term.cols, (y + term.rows) * term.cols);
+        clip();
+        return JSON.stringify(inPane && [inPane.left, inPane.top, inPane.width, inPane.height]);
+      };
+      const was = pick(), n = presses;
+      askSplit(true);
+      Promise.resolve(splitAsk).then(() => {
+        if (term && n === presses && term.hasSelection() && !(paneTimer || o.panesFrom === 'app')) {
+          const list = split;
+          const now = list.length > 1 ? list.find((p) => p.active) || null : null;
+          if (JSON.stringify(now && [now.left, now.top, now.width, now.height]) !== was) pick();
+        }
+      });
+    }
+    /* the selection from its far end to the cell under the pointer, as Shift-click does in a Mac app */
+    function extendTo(e) {
+      const { start, end } = term.getSelectionPosition();
+      const at = inPane ? clampTo(inPane, cellAt(e.clientX, e.clientY)) : cellAt(e.clientX, e.clientY);
+      const s = start.y * term.cols + start.x, en = end.y * term.cols + end.x;
+      if (at < (s + en) / 2) selectCells(at, en);
+      else selectCells(s, at + 1);
+      copy();
+    }
+    function press(e) {
+      /* a right-click on a selection is for the terminal's menu: reported to tmux it would be input, which clears the
+         selection before the menu opens */
+      if (e.button === 2 && term && !ours.has(e) && term.hasSelection() && term.element.contains(e.target) && window.flow.menu && window.flow.menu.popup) {
+        e.stopImmediatePropagation();
+        return;
+      }
+      if (ours.has(e) || !term || e.button !== 0 || !term.element.contains(e.target)) return;
+      presses += 1;
+      clearTimeout(linkWait);
+      downAt = { x: e.clientX, y: e.clientY, plain: !(e.altKey || e.shiftKey || e.metaKey || e.ctrlKey) };
+      option = false;
+      if (term.modes.mouseTrackingMode === 'none' || !forceKey() || e.metaKey || e.ctrlKey) return;
+      if (e.altKey) {
+        option = true;
+        unOption(e);
+        term.clearSelection();
+        return;
+      }
+      askSplit(true);
+      const at = cellAt(e.clientX, e.clientY), pane = paneAt(at);
+      if (pane === undefined) {
+        term.clearSelection();
+        return;
+      }
+      if (e.shiftKey && term.hasSelection() && (pane && pane.paneId) === (inPane && inPane.paneId)) {
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        term.focus();
+        extendTo(e);
+        return;
+      }
+      inPane = pane;
+      pressed = { target: e.target, x: e.clientX, y: e.clientY, sx: e.screenX, sy: e.screenY, detail: e.detail, at };
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      const f = mouseEv('mousedown', pressed, { buttons: 1, [force]: true });
+      ours.add(f);
+      e.target.dispatchEvent(f);
+      clip();
+    }
+    function release(e) {
+      if (option) {
+        unOption(e);
+        if (!e.buttons) option = false;
+        return;
+      }
+      if (!pressed || ours.has(e) || e.button !== 0) return;
+      const p = pressed, moved = Math.hypot(e.clientX - p.x, e.clientY - p.y) > 2, ask = splitAsk, n = presses;
+      pressed = null;
+      setTimeout(() => {
+        if (!term) return;
+        if (term.hasSelection() && (moved || p.detail > 1)) {
+          /* the panes as tmux has them now, which a split made since the last look changes; a press since then has a
+             selection of its own, which this must not redo */
+          Promise.resolve(ask).then(() => {
+            if (!term || n !== presses || !term.hasSelection()) return;
+            const pane = paneAt(p.at);
+            if (pane === undefined) {
+              term.clearSelection();
+              return;
+            }
+            inPane = pane;
+            /* xterm ends a drag at the cell edge nearest the pointer; a drag takes in the letters it starts and ends on */
+            if (moved && p.detail === 1) {
+              const b = inPane ? clampTo(inPane, cellAt(e.clientX, e.clientY)) : cellAt(e.clientX, e.clientY);
+              selectCells(Math.min(p.at, b), Math.max(p.at, b) + 1);
+            }
