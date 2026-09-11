@@ -195,3 +195,200 @@
       term.onData(send);
       term.onTitleChange((title) => { if (o.onTitle) o.onTitle(nameFrom(title) ? title : ''); });
       /* tmux hands every copy to the outer terminal as OSC 52, Flow's tmux on the Mac or the VM and the VM's own alike;
+         this is what puts it on the Mac's clipboard. Writes only: a "?" query, which would read the clipboard, is ignored. */
+      term.parser.registerOscHandler(52, (data) => {
+        const b64 = data.slice(data.indexOf(';') + 1);
+        if (!b64 || b64 === '?') return true;
+        let text;
+        try {
+          text = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
+        } catch (err) {
+          console.error(`FlowTerm: ${id} sent an OSC 52 copy that is not base64 UTF-8`, err);
+          return true;
+        }
+        navigator.clipboard.writeText(text).catch((err) => console.error(`FlowTerm: OSC 52 copy from ${id} could not be written to the clipboard`, err));
+        return true;
+      });
+      term.attachCustomKeyEventHandler(keys);
+      term.textarea.addEventListener('focus', focused);
+      box.addEventListener('mousedown', press, true);
+      box.addEventListener('pointermove', askSplit);
+      document.addEventListener('mousemove', optionMove, true);
+      document.addEventListener('mouseup', release, true);
+      finder.onDidChangeResults(({ resultIndex, resultCount }) => {
+        if (!findInput.value) { findCount.textContent = ''; return; }
+        findCount.textContent = resultCount === 0 ? 'no matches' : resultIndex >= 0 ? `${resultIndex + 1} of ${resultCount}` : `${resultCount} matches`;
+        findCount.classList.toggle('none', resultCount === 0);
+      });
+      watchDpr();
+      if (wantFocus) { wantFocus = false; term.focus(); }
+    }
+
+    function activate() {
+      if (term || state === 'disposed' || !visible || !sized()) return;
+      create();
+      fitNow();
+      open();
+    }
+
+    function open() {
+      state = 'opening';
+      const seq = ++openSeq;
+      const size = { cols: term.cols, rows: term.rows };
+      const req = {
+        id, cmd: o.cmd, cwd: o.cwd, host: o.host, attach: o.attach, sessionId: o.sessionId, forkFrom: o.forkFrom,
+        resume: restarting ? true : !!o.resume, cols: size.cols, rows: size.rows,
+      };
+      window.flow.term.open(req).then((r) => r, (err) => {
+        console.error(`FlowTerm: flow.term.open failed for ${id}`, err);
+        return { ok: false, error: String((err && err.message) || err) };
+      }).then((r) => {
+        if (state === 'disposed') {
+          if (r.ok && !live.has(id)) window.flow.term.detach(id);
+          return;
+        }
+        killed.delete(id);
+        if (seq !== openSeq) return;
+        if (state === 'opening') {
+          if (r.ok) {
+            state = 'open';
+            sent = size;
+            natural = o.attach && r.size ? { cols: r.size.cols, rows: r.size.rows } : null;
+            statusRows = natural ? r.size.status || 0 : 0;
+            if (natural) fitNow();
+            pushSize();
+            startPanes();
+          } else if (r.retry) {
+            /* its conversation is open in another Claude, or that could not be checked: the open goes on once it is
+               free, so no onOpened yet */
+            state = 'waiting';
+            waitNotice(`[${r.error}]`);
+            waitTimer = setTimeout(open, RECHECK_MS);
+            return;
+          } else {
+            state = 'failed';
+            notice(`[could not start: ${r.error || 'no reason given'}, press return to try again]`);
+          }
+        }
+        if (o.onOpened) o.onOpened(r);
+      });
+    }
+
+    function restart() {
+      restarting = true;
+      term.reset();
+      open();
+    }
+
+    /* A hidden local terminal gives up its tmux client, whose output would keep the renderer busy, and gets a new one
+       when shown again. Remote ones stay attached: a new client there is a new ssh connection. */
+    function schedulePark() {
+      clearTimeout(parkTimer);
+      if (!o.host) parkTimer = setTimeout(park, PARK_MS);
+    }
+
+    function park() {
+      if (visible) return;
+      if (state === 'opening' || state === 'waiting') { schedulePark(); return; }
+      if (state !== 'open') return;
+      state = 'parked';
+      window.flow.term.detach(id);
+    }
+
+    /* A session that ended while parked shows the ended line instead of starting again unasked. */
+    function unpark() {
+      state = 'unparking';
+      const seq = ++openSeq;
+      window.flow.term.exists(id).then((alive) => alive, (err) => {
+        console.error(`FlowTerm: flow.term.exists failed for ${id}, attaching anyway`, err);
+        return true;
+      }).then((alive) => {
+        if (state === 'disposed' || seq !== openSeq) return;
+        if (!visible) { state = 'parked'; return; }
+        if (!alive) {
+          state = 'ended';
+          notice(ENDED);
+          if (o.onExit) o.onExit(null);
+          return;
+        }
+        restarting = true;
+        open();
+        scheduleFit();
+      });
+    }
+
+    /* In the alternate screen, which tmux clears as its client starts, so none of it is left once that claude ends. */
+    function waitNotice(text) {
+      term.write(`${RESTORE}\x1b[?1049h\x1b[H\r\n${DIM}${text}\x1b[0m`);
+    }
+
+    function notice(text) {
+      term.write(`${RESTORE}\r\n${DIM}${text}\x1b[0m`);
+    }
+
+    /* A VM pane's tmux is not this Mac's, so the User0 key cannot take it out of the scrollback: pty leaves copy mode
+       there first, and input typed meanwhile waits behind the paste so nothing is reordered. */
+    let sendAfter = null;
+    function write(data) {
+      if (state === 'open' || state === 'opening') window.flow.term.write(id, data);
+    }
+    function send(data) {
+      if (state === 'open' || state === 'opening') {
+        const paste = data.startsWith(PASTE_START);
+        if (!o.host) { write(paste ? LEAVE_COPY_MODE + data : data); return; }
+        if (!paste && !sendAfter) { write(data); return; }
+        const before = paste
+          ? (sendAfter || Promise.resolve()).then(() => window.flow.term.find(id, { leave: true }, { host: o.host, attach: o.attach }))
+            .then((r) => { if (r && !r.ok) console.error(`FlowTerm: ${id} could not leave the scrollback before a paste: ${r.error}`); },
+              (err) => console.error(`FlowTerm: ${id} could not leave the scrollback before a paste`, err))
+          : sendAfter;
+        const next = before.then(() => write(data));
+        sendAfter = next;
+        next.then(() => { if (sendAfter === next) sendAfter = null; });
+      } else if ((state === 'ended' || state === 'failed') && data.includes('\r')) restart();
+    }
+
+    function keys(e) {
+      if (e.isComposing) return true;
+      if (e.key === 'Enter' && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (e.type === 'keydown') { e.preventDefault(); send('\x1b\r'); }
+        return false;
+      }
+      /* Claude Code's own image key is Control-V, which on a VM reads the VM's clipboard, where a Mac image never is
+         ("No image found in clipboard. You're SSH'd"). So on a VM terminal Control-V pastes as ⌘V does when this Mac's
+         clipboard holds files or an image, and stays the program's Control-V otherwise (the paste listener below). */
+      if (o.host && e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'v') {
+        if (e.type === 'keydown' && !ctrlV) {
+          e.preventDefault();
+          ctrlV = setTimeout(() => { ctrlV = 0; send('\x16'); }, 1000);
+          window.flow.nativeEdit('paste');
+        }
+        return false;
+      }
+      if (!e.metaKey || e.ctrlKey || e.altKey) return true;
+      const k = e.key.toLowerCase();
+      /* ⌘K is the app's search: never consumed here, so the menu gets it */
+      if (k === 'k') return false;
+      if (k === 'f' && !e.shiftKey) {
+        if (e.type === 'keydown') { e.preventDefault(); openFind(); }
+        return false;
+      }
+      if (k === 'g' && !findBar.hidden) {
+        if (e.type === 'keydown') { e.preventDefault(); search(e.shiftKey ? FIND_DOWN : FIND_UP, false); }
+        return false;
+      }
+      if (k === 'a' && !e.shiftKey) {
+        if (e.type === 'keydown') { e.preventDefault(); selectShown(); }
+        return false;
+      }
+      if (k === 'c' && !e.shiftKey && term.hasSelection()) {
+        if (e.type === 'keydown') { e.preventDefault(); copy(); }
+        return false;
+      }
+      return true;
+    }
+
+    function copy() {
+      navigator.clipboard.writeText(selected()).catch((err) => {
+        console.error('FlowTerm: clipboard write failed, trying execCommand', err);
+        if (!document.execCommand('copy')) console.error('FlowTerm: execCommand copy failed too');
