@@ -1666,3 +1666,559 @@ function addWindow(ws, w, at, sp = curSpace(ws)) {
   syncVisible();
   save();
   return w;
+}
+function removeWindow(ws, w) {
+  const r = WIN.get(w.id);
+  window.FlowNotes.detach(w.id);
+  if (r) { disposeBody(r); r.el.remove(); WIN.delete(w.id); }
+  const i = ws.windows.indexOf(w);
+  if (i >= 0) ws.windows.splice(i, 1);
+  layout(ws);
+}
+/* Quitting, or closing this window, while pages here guard unsaved typing (main waits and names them): nothing is
+   asked and nothing comes into view; it goes on at once (owner, Nov 1 20:47). */
+function onUnsavedPages({ action } = {}) {
+  flow.closeAnyway(action);
+}
+/* The red light and ⌘W on a page's last tab: a page guarding unsaved changes asks Leave or Stay first. */
+function closeAsked(ws, w) {
+  const r = WIN.get(w.id);
+  if (!r || !r.page) { closeWin(ws, w); return; }
+  r.page.confirmClose().then((ok) => { if (ok && locate(w.id)) closeWin(ws, w); }, (err) => {
+    console.error(`could not ask ${w.id}'s page before closing it`, err);
+    toast(`could not close ${winTitle(ws, w)}: ${(err && err.message) || 'no reason given'}`, 5000);
+  });
+}
+function closeWin(ws, w) {
+  return board(() => closeWinNow(ws, w));
+}
+function closeWinNow(ws, w) {
+  const r = w.type === 'page' && WIN.get(w.id);
+  if (r && r.page) holdWin(ws, w, r);
+  else removeWindow(ws, w);
+  w.max = null;
+  if (isTerm(w)) {
+    ws.closed.push(w);
+  } else if (w.type === 'page' && !(r && r.page)) {
+    dropPageNote(ws, w);
+  }
+  renderSidebar();
+  save();
+}
+const dropPageNote = (ws, w) => {
+  const n = noteById(ws, w.noteId);
+  if (n && (!n.url || window.FlowNotes.unused(ws, w))) ws.notes.splice(ws.notes.indexOf(n), 1);
+};
+/* A page window leaves at once when it closes. If its site guards unsaved typing (Docs, Gmail), it stays in the
+   document, hidden, for 10 s so the site can finish saving (a webview dies when it leaves the document), and ⇧⌘T in
+   that time brings it back as it was (owner, Nov 1 20:47; lead, Nov 2). */
+const HELD = [];
+function holdWin(ws, w, r) {
+  const h = { ws, w, r, at: ws.windows.indexOf(w), timer: 0 };
+  WIN.delete(w.id);
+  if (h.at >= 0) ws.windows.splice(h.at, 1);
+  r.el.classList.replace('win', 'held');
+  HELD.push(h);
+  layout(ws);
+  r.page.guarded().then((yes) => {
+    if (!HELD.includes(h)) return;
+    if (yes) h.timer = setTimeout(() => dropHeld(h), 10000);
+    else dropHeld(h);
+  }, (err) => {
+    console.error(`could not ask ${w.id}'s page about unsaved typing`, err);
+    dropHeld(h);
+  });
+}
+function dropWorkspaceHeld(ws) {
+  for (const h of HELD.filter((x) => x.ws === ws)) dropHeld(h);
+}
+function dropHeld(h) {
+  const i = HELD.indexOf(h);
+  if (i < 0) return;
+  HELD.splice(i, 1);
+  clearTimeout(h.timer);
+  window.FlowNotes.detach(h.w.id);
+  disposeBody(h.r);
+  h.r.el.remove();
+  dropPageNote(h.ws, h.w);
+  renderSidebar();
+  save();
+}
+function reopenHeld() {
+  const h = HELD.pop();
+  if (!h) return false;
+  clearTimeout(h.timer);
+  h.r.el.classList.replace('held', 'win');
+  WIN.set(h.w.id, h.r);
+  h.ws.windows.splice(Math.max(0, Math.min(h.at, h.ws.windows.length)), 0, h.w);
+  layout(h.ws);
+  focusWin(h.ws, h.w);
+  renderSidebar();
+  save();
+  return true;
+}
+function reopen(ws, wid) {
+  board(() => reopenNow(ws, wid));
+}
+function reopenNow(ws, wid) {
+  const i = ws.closed.findIndex((w) => w.id === wid);
+  if (i < 0) return;
+  const w = ws.closed.splice(i, 1)[0];
+  const zone = w.zone && zoneById(ws, w.zone) ? w.zone : null;
+  // back where it was, at its own size; a record with no place of its own takes a free spot (lead, browse r6)
+  const placed = [w.x, w.y, w.w, w.h].every((n) => Number.isFinite(n));
+  if (!placed) Object.assign(w, freeSpot(ws, w.w || 36, w.h || 44, zone));
+  addWindow(ws, w, null, zone);
+  focusWin(ws, w);
+  // after focusWin has shown its space: nav.clear makes way in the space on screen
+  if (placed && inSpace(ws, w)) nav.clear(ws, w);
+  renderSidebar();
+}
+/* The sidebar's × on an agent, shell or team, open or closed: its window goes and its session ends; a team's own
+   teammates end with it. An attached VM session Flow did not start only loses Flow's connection (pty.kill). */
+async function endAgent(ws, wid) {
+  if (closingWorkspace || undoingWorkspace) return;
+  const w = findWin(ws, wid) || ws.closed.find((x) => x.id === wid);
+  if (!w) return;
+  const all = [w, ...(w.type === 'team' ? [...ws.windows, ...ws.closed].filter((m) => m.mate && m.mate.lead === w.id) : [])];
+  const title = termTitle(w);
+  // the click shows its result at once and the sessions end behind it; one that can't end comes back, closed
+  const ended = all.map((x) => {
+    const kept = window.FlowNotes.keep(ws, x), open = ws.windows.includes(x);
+    if (open) removeWindow(ws, x);
+    else ws.closed.splice(ws.closed.indexOf(x), 1);
+    return { w: x, kept, open };
+  });
+  renderSidebar();
+  save();
+  if ((w.cmd === 'claude' && w.sessionId) || w.cmd === 'shell') toast(`ended ${title}`, 8000, { label: 'undo', run: () => unend(ws, ended) });
+  const failed = [];
+  await Promise.all(ended.map(async (e) => {
+    const k = flow.term.kill(e.w.id, remoteOpts(e.w));
+    ending.set(e.w.id, k);
+    try {
+      await k;
+    } catch (err) {
+      console.error(`could not end ${e.w.id}`, err);
+      failed.push(err);
+      if (WS.includes(ws) && !ws.closed.includes(e.w) && !findWin(ws, e.w.id)) {
+        if (e.kept) window.FlowNotes.take(e.w.sessionId);
+        ws.closed.push(e.w);
+      }
+    } finally {
+      if (ending.get(e.w.id) === k) ending.delete(e.w.id);
+    }
+  }));
+  if (failed.length) {
+    renderSidebar();
+    save();
+    toast(`could not end ${title}: ${(failed[0] && failed[0].message) || 'no reason given'}`, 5000);
+  }
+}
+/* Undo after ending an agent, a shell or a team: what was open opens again where it was, resuming its conversation
+   (or a shell in its folder) once its end has settled; what was closed comes back closed. */
+function unend(ws, ended) {
+  if (!WS.includes(ws)) return;
+  const ids = openSessionIds();
+  for (const { w, kept, open } of ended) {
+    if ((w.sessionId && ids.has(w.sessionId)) || findWin(ws, w.id) || ws.closed.includes(w)) continue;
+    if (kept) window.FlowNotes.take(w.sessionId);
+    ws.closed.push(w);
+    // the toast's own undo, not a step of the board's
+    if (open) reopenNow(ws, w.id);
+  }
+  renderSidebar();
+  save();
+}
+function park(ws, w) {
+  board(() => parkNow(ws, w));
+}
+function parkNow(ws, w) {
+  w.max = null;
+  w.x = contentEnd(ws, w) + 1.5;
+  w.y = clamp(w.y, 6.6, 60);
+  apply(w, w);
+  sizeCanvas(ws);
+  renderSidebar();
+  save();
+}
+function toggleMax(ws, w) {
+  board(() => toggleMaxNow(ws, w));
+}
+function toggleMaxNow(ws, w) {
+  if (w.max) {
+    Object.assign(w, w.max);
+    w.max = null;
+  } else {
+    w.max = { x: w.x, y: w.y, w: w.w, h: w.h };
+    Object.assign(w, nav.fillRect(ws));
+  }
+  if (ws.mode !== 'float') { ws.mode = 'float'; renderModes(); }
+  apply(w, w);
+  bringFront(ws, w);
+  sizeCanvas(ws);
+  fitSoon();
+  save();
+}
+function resizeTo(ws, w, wPct, hPct, xPct = w.x, yPct = w.y) {
+  w.max = null;
+  w.w = Math.max(16, wPct);
+  w.h = Math.max(16, hPct);
+  w.x = xPct;
+  w.y = yPct;
+  apply(w, w);
+}
+function moveWindow(from, w, to) {
+  board(() => moveWindowNow(from, w, to));
+}
+function moveWindowNow(from, w, to) {
+  const r = WIN.get(w.id);
+  const i = from.windows.indexOf(w);
+  if (i >= 0) from.windows.splice(i, 1);
+  w.max = null;
+  if (w.noteId) {
+    const n = noteById(from, w.noteId);
+    if (n) {
+      from.notes.splice(from.notes.indexOf(n), 1);
+      n.parent = null;
+      to.notes.unshift(n);
+    }
+  }
+  if (r) r.cur = null;
+  const sp = curSpace(to);
+  if (sp) w.zone = sp;
+  else delete w.zone;
+  Object.assign(w, freeSpot(to, w.w, w.h, sp || null, true) || endSpot(to, w.w, w.h, sp || null));
+  to.windows.push(w);
+  const canvas = canvasOf(to);
+  if (r && canvas) {
+    canvas.appendChild(r.el);
+    if (r.page) { r.page.dispose(); r.page = null; r.vis = null; ensureBody(to, w); }
+  } else if (r) {
+    disposeBody(r);
+    r.el.remove();
+    WIN.delete(w.id);
+  }
+  layout(from);
+  layout(to);
+  syncVisible();
+  renderSidebar();
+  save();
+}
+const openNote = (ws, nid) => window.FlowNotes.open(ws, nid);
+/* A page opened from a link, a popup or a terminal goes right next to the window it came from when there is room. */
+function openPageWin(ws, url, near, last, extra, pt) {
+  return board(() => openPageWinNow(ws, url, near, last, extra, pt));
+}
+function openPageWinNow(ws, url, near, last, extra, pt) {
+  const n = { id: newId('n'), kind: 'page', title: url ? prettyTitle(url) : 'new page', url: url || '', body: '' };
+  ws.notes.unshift(n);
+  const W = 46, H = 64;
+  let pos = null;
+  /* a tab or a file dropped in the view: where it was dropped, as for a dock button. A file drag captures its world
+     point at drop, after every edge-pan frame; opening it is async, so converting its screen point later would drift. */
+  const vr = pt && !pt.world && viewport.getBoundingClientRect();
+  const hand = pt && pt.world ? pt.hand : vr && pt.x >= vr.left && pt.x <= vr.right && pt.y >= vr.top && pt.y <= vr.bottom ? nav.toSpace(ws, pt.x, pt.y) : null;
+  if (hand) {
+    pos = nav.placeRoom(ws, { x: hand.x - W / 2, y: hand.y - (14 / nav.zoom(ws) / VH) * 100, hand }, W, H, hand);
+  }
+  /* from a terminal's or a note's link: its own page at that window's height and a page's width, flush and level with it,
+     on its right unless only the left moves no window; the next one beside the last, the same way; what is in the way
+     makes way (nav.beside; lead, batch 7) */
+  if (!pos && near) {
+    const dims = { w: W, h: geo(near).h };
+    let from = near, side = 'right';
+    if (last) { from = last; side = geo(last).x < geo(near).x ? 'left' : 'right'; }
+    else {
+      const R = nav.beside(ws, near, 'right', false, true, dims), Lf = nav.beside(ws, near, 'left', false, true, dims);
+      if (R && Lf && R.moved > 0 && Lf.moved === 0) side = 'left';
+    }
+    const r = nav.beside(ws, from, side, false, false, dims);
+    if (r) pos = r.at;
+  }
+  const w = addWindow(ws, { id: newId('w'), type: 'page', noteId: n.id, ...(pos || freeSpot(ws, W, H)), ...extra });
+  focusWin(ws, w);
+  renderSidebar();
+  return w;
+}
+
+/* ---------- old sessions: every Claude Code session on this Mac ---------- */
+let SESS = null, sessLoading = null, sessAll = false, dragSession = null;
+function loadSessions() {
+  if (sessLoading) return sessLoading;
+  sessLoading = flow.sessions.list().then((list) => {
+    SESS = Array.isArray(list) ? list : [];
+    sessLoading = null;
+    if (q.value.trim()) renderSidebar();
+  }, (err) => {
+    sessLoading = null;
+    console.error('could not read the old sessions', err);
+    toast('could not read the old sessions', 4000);
+  });
+  return sessLoading;
+}
+function openSessionIds() {
+  const ids = new Set();
+  WS.forEach((ws) => [...ws.windows, ...ws.closed].forEach((w) => { if (w.sessionId) ids.add(w.sessionId); }));
+  return ids;
+}
+function ago(t) {
+  const ms = typeof t === 'number' ? t : Date.parse(t);
+  if (!ms) return '';
+  const s = (Date.now() - ms) / 1000;
+  if (s < 3600) return `${Math.max(1, Math.round(s / 60))}m`;
+  if (s < 86400) return `${Math.round(s / 3600)}h`;
+  if (s < 7 * 86400) return `${Math.round(s / 86400)}d`;
+  const d = new Date(ms);
+  const m = d.toLocaleString('en-US', { month: 'short' });
+  return d.getFullYear() === new Date().getFullYear() ? `${m} ${d.getDate()}` : `${m} ${d.getDate()} ${d.getFullYear()}`;
+}
+/* at: where a session dragged from the sidebar is let go (the drop handler): the window's corner, and at.hand, the
+   point held. It takes the open space there and covers no window, as a dock drop does (nav.placeRoom). */
+function openSession(sid, at) {
+  const s = SESS && SESS.find((x) => x.id === sid);
+  if (!s) return null;
+  if (s.resumable === false) { toast(`${s.title || 'that session'} cannot be resumed: its transcript is gone`, 5000); return null; }
+  const ws = WS[cur];
+  const note = window.FlowNotes.take(s.id);
+  const w = addWindow(ws, { id: newId('w'), type: 'term', title: '', label: s.title || '', where: 'this Mac', note, noted: !!note, cmd: 'claude', cwd: tilde(s.cwd) || ws.folder, sessionId: s.id, resume: true, ...(at ? nav.placeRoom(ws, at, 34, 42, at.hand) : freeSpot(ws, 34, 42)) });
+  q.value = '';
+  sessAll = false;
+  renderSidebar();
+  return w;
+}
+
+/* ---------- pointer and clicks on windows ---------- */
+function onPointerDown(e, ws, w) {
+  if (dragging) return;
+  bringFront(ws, w);
+  if (e.button !== 0) return;
+  if (e.target.closest('.rz')) { startResize(e, ws, w); return; }
+  if (e.target.closest('[data-l]')) return;
+  const r = WIN.get(w.id);
+  const tb = e.target.closest('.tb');
+  if (!r || tb !== r.tb || e.target.closest('button')) return;
+  e.preventDefault();
+  const boardBefore = boardSnap();
+  const pointerId = e.pointerId, initialMode = ws.mode, initialSpace = curSpace(ws), viewKeys = ['pan', 'panY', 'zoom'];
+  const snapView = (o, keys = viewKeys) => Object.fromEntries(viewKeys.map((key, i) => [key, { has: Object.hasOwn(o, keys[i]), value: o[keys[i]] }]));
+  const putView = (o, at, keys = viewKeys) => viewKeys.forEach((key, i) => { if (at[key].has) o[keys[i]] = at[key].value; else delete o[keys[i]]; });
+  const initialLiveView = snapView(ws);
+  const initialMainView = snapView(ws, ['mainPan', 'mainPanY', 'mainZoom']);
+  const initialZoneViews = new Map((ws.zones || []).map((zn) => [zn.id, snapView(zn)]));
+  const initialViewOf = (sid) => sid === initialSpace ? initialLiveView : sid ? initialZoneViews.get(sid) : initialMainView;
+  const restoreViews = () => {
+    const currentSpace = curSpace(ws), currentView = initialViewOf(currentSpace);
+    if (currentView) putView(ws, currentView);
+    putView(ws, initialMainView, ['mainPan', 'mainPanY', 'mainZoom']);
+    (ws.zones || []).forEach((zn) => { const at = initialZoneViews.get(zn.id); if (at) putView(zn, at); });
+    if (currentSpace !== initialSpace) {
+      if (initialSpace) { const zn = zoneById(ws, initialSpace); if (zn) putView(zn, initialLiveView); }
+      else putView(ws, initialLiveView, ['mainPan', 'mainPanY', 'mainZoom']);
+    }
+  };
+  const initialGeometry = ws.windows.map((win) => ({ win, x: win.x, y: win.y, w: win.w, h: win.h, hasMax: Object.hasOwn(win, 'max'), max: win.max ? { ...win.max } : win.max }));
+  keysTo(ws, w, r);
+  if (ws.mode !== 'float') { captureFloat(ws); ws.mode = 'float'; layout(ws); renderModes(); }
+  let sx = e.clientX, sy = e.clientY, ox = w.x, oy = w.y, zf = nav.zoom(ws);
+  let teamTarget = null, tabTarget = null, spaceTarget = null, moved = false, panned = 0, pannedY = 0, lx = sx, ly = sy, finished = false;
+  const place = () => {
+    w.x = ox + (((lx - sx) / zf + panned) / VW) * 100;
+    w.y = oy + (((ly - sy) / zf + pannedY) / VH) * 100;
+    apply(w, w);
+  };
+  setDragging(true);
+  busy.add(w.id);
+  r.el.classList.add('drag');
+  if (e.isTrusted) tb.setPointerCapture(pointerId);
+  const move = (ev) => {
+    if (ev.pointerId !== pointerId) return;
+    /* A press alone keeps a filled window's old size, so a double-click on its title can put it back. */
+    if (!moved && Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) < 3) return;
+    moved = true;
+    w.max = null;
+    /* A pinch while the window is held zoomed around the pointer: go on from there at the new zoom. */
+    if (nav.zoom(ws) !== zf) { sx = lx; sy = ly; ox = w.x; oy = w.y; panned = 0; pannedY = 0; zf = nav.zoom(ws); }
+    lx = ev.clientX;
+    ly = ev.clientY;
+    place();
+    feedEdgePan(ws, ev.clientX, ev.clientY, (d, dy) => { panned += d; pannedY += dy; place(); });
+    const t = w.type === 'term' && window.FlowTeams ? window.FlowTeams.teamAt(ws, ev.clientX, ev.clientY, w) : null;
+    if (t !== teamTarget) { if (teamTarget && elOf(teamTarget)) elOf(teamTarget).classList.remove('dropon'); teamTarget = t; if (t) elOf(t).classList.add('dropon'); }
+    const under = document.elementFromPoint(ev.clientX, ev.clientY);
+    const tabEl = under && !SOLO ? under.closest('.sp[data-i]') : null;
+    const target = tabEl && +tabEl.dataset.i !== WS.indexOf(ws) ? tabEl : null;
+    if (target !== tabTarget) { if (tabTarget) tabTarget.classList.remove('dropon'); tabTarget = target; if (target) target.classList.add('dropon'); }
+    const zrow = under && !SOLO ? under.closest('#sblist .tr[data-act^="zone|"]') : null;
+    const home = tabEl && !target && curSpace(ws) ? tabEl : null;
+    const sp = home || (zrow && zrow.dataset.act.slice(5) !== curSpace(ws) ? zrow : null);
+    if (sp !== spaceTarget) { if (spaceTarget) spaceTarget.classList.remove('dropon'); spaceTarget = sp; if (sp) sp.classList.add('dropon'); }
+    if (window.FlowSidebar) window.FlowSidebar.windowDrag(ws, w, under);
+  };
+  const clearTargets = () => {
+    if (tabTarget) tabTarget.classList.remove('dropon');
+    if (spaceTarget) spaceTarget.classList.remove('dropon');
+    if (teamTarget && elOf(teamTarget)) elOf(teamTarget).classList.remove('dropon');
+    if (window.FlowSidebar && window.FlowSidebar.windowCancel) window.FlowSidebar.windowCancel();
+  };
+  const finish = (commit) => {
+    if (finished) return;
+    // a window dropped on a team joins its tmux panes, which the board cannot put back
+    if (commit && teamTarget) finishNow(commit);
+    else board(() => finishNow(commit), boardBefore);
+  };
+  const finishNow = (commit) => {
+    finished = true;
+    stopEdgePan(ws);
+    tb.removeEventListener('pointermove', move);
+    tb.removeEventListener('pointerup', up);
+    tb.removeEventListener('pointercancel', cancel);
+    tb.removeEventListener('lostpointercapture', cancel);
+    window.removeEventListener('blur', blur);
+    if (tb.hasPointerCapture && tb.hasPointerCapture(pointerId)) tb.releasePointerCapture(pointerId);
+    r.el.classList.remove('drag');
+    setDragging(false);
+    busy.delete(w.id);
+    if (!commit) {
+      clearTargets();
+      initialGeometry.forEach((at) => {
+        Object.assign(at.win, { x: at.x, y: at.y, w: at.w, h: at.h });
+        if (at.hasMax) at.win.max = at.max ? { ...at.max } : at.max;
+        else delete at.win.max;
+      });
+      ws.mode = initialMode;
+      restoreViews();
+      layout(ws);
+      restoreViews();
+      renderModes();
+      renderSidebar();
+      save();
+      return;
+    }
+    if (window.FlowSidebar && window.FlowSidebar.windowDrop(ws, w)) { w.x = ox; w.y = oy; apply(w, w); sizeCanvas(ws); save(); return; }
+    if (tabTarget) { tabTarget.classList.remove('dropon'); w.x = ox; w.y = oy; moveWindow(ws, w, WS[+tabTarget.dataset.i]); return; }
+    if (spaceTarget) { const t = spaceTarget; t.classList.remove('dropon'); w.x = ox; w.y = oy; moveToSpace(ws, w, t.classList.contains('sp') ? null : t.dataset.act.slice(5)); return; }
+    if (teamTarget) { const t = teamTarget; if (elOf(t)) elOf(t).classList.remove('dropon'); window.FlowTeams.dropOnTeam(ws, w, t); return; }
+    if (moved) keepSpaceOrigin(ws);
+    sizeCanvas(ws);
+    renderSidebar();
+    save();
+  };
+  const up = (ev) => { if (ev.pointerId === pointerId) finish(true); };
+  const cancel = (ev) => { if (ev.pointerId === pointerId) finish(false); };
+  const blur = () => finish(false);
+  tb.addEventListener('pointermove', move);
+  tb.addEventListener('pointerup', up);
+  tb.addEventListener('pointercancel', cancel);
+  tb.addEventListener('lostpointercapture', cancel);
+  window.addEventListener('blur', blur);
+}
+function startResize(e, ws, w) {
+  e.preventDefault();
+  e.stopPropagation();
+  const handle = e.target.closest('.rz');
+  const r = WIN.get(w.id), side = handle.dataset.rz || 'se';
+  let sx = e.clientX, sy = e.clientY, o = { x: w.x, y: w.y, w: w.w, h: w.h };
+  const o0 = { ...o }, boardBefore = boardSnap();
+  if (ws.mode !== 'float') { captureFloat(ws); ws.mode = 'float'; layout(ws); renderModes(); }
+  setDragging(true);
+  if (window.FlowTerm && window.FlowTerm.hold) window.FlowTerm.hold(true);
+  busy.add(w.id);
+  r.el.classList.add('drag');
+  if (e.isTrusted) handle.setPointerCapture(e.pointerId);
+  let zf = nav.zoom(ws), lx = sx, ly = sy;
+  const move = (ev) => {
+    if (nav.zoom(ws) !== zf) { sx = lx; sy = ly; o = { x: w.x, y: w.y, w: w.w, h: w.h }; zf = nav.zoom(ws); }
+    lx = ev.clientX;
+    ly = ev.clientY;
+    const dx = ((ev.clientX - sx) / zf / VW) * 100, dy = ((ev.clientY - sy) / zf / VH) * 100;
+    // a left or top grip moves that edge only, and no further than a title-bar drag can take the window
+    const W = Math.max(16, side.includes('e') ? o.w + dx : side.includes('w') ? Math.min(o.w - dx, o.x + o.w) : o.w);
+    const H = Math.max(16, side.includes('s') ? o.h + dy : side.includes('n') ? Math.min(o.h - dy, o.y + o.h - 4.5) : o.h);
+    resizeTo(ws, w, W, H, side.includes('w') ? o.x + o.w - W : o.x, side.includes('n') ? o.y + o.h - H : o.y);
+  };
+  const up = () => board(upNow, boardBefore);
+  const upNow = () => {
+    setDragging(false);
+    if (window.FlowTerm && window.FlowTerm.hold) window.FlowTerm.hold(false);
+    busy.delete(w.id);
+    r.el.classList.remove('drag');
+    handle.removeEventListener('pointermove', move);
+    handle.removeEventListener('pointerup', up);
+    handle.removeEventListener('pointercancel', up);
+    // let go: what the window now covers makes way (layout's clear); a press that resized nothing moves nothing
+    if (w.x !== o0.x || w.y !== o0.y || w.w !== o0.w || w.h !== o0.h) nav.clear(ws, w, false, o0);
+    sizeCanvas(ws);
+    fitSoon(60);
+    save();
+  };
+  handle.addEventListener('pointermove', move);
+  handle.addEventListener('pointerup', up);
+  handle.addEventListener('pointercancel', up);
+}
+function onClick(e, ws, w) {
+  const r = WIN.get(w.id);
+  if (!r) return;
+  const l = e.target.closest('[data-l]');
+  if (l && l.closest('.tb') === r.tb) {
+    if (l.dataset.l === 'close') closeAsked(ws, w);
+    else if (l.dataset.l === 'park') park(ws, w);
+    else toggleMax(ws, w);
+    return;
+  }
+  const act = e.target.closest('[data-act]');
+  if (!act || act.closest('.tb') !== r.tb) return;
+  if (act.dataset.act === 'note') window.FlowNotes.toggle(ws, w);
+}
+
+
+/* ---------- sidebar: src/sidebar.js draws it (FlowSidebar, mounted in init) ---------- */
+function renderSidebar() {
+  if (window.FlowSidebar) window.FlowSidebar.render();
+}
+function toggleSidebar(force) {
+  const h = typeof force === 'boolean' ? force : !sbHidden();
+  setSbHidden(h);
+  sb.classList.toggle('hide', h);
+  fitSoon(360);
+  save();
+}
+function openSearch() {
+  if (sbHidden()) toggleSidebar(false);
+  q.focus();
+  q.select();
+  loadSessions();
+}
+async function pickFolder(ws = WS[cur]) {
+  const p = await flow.pickFolder(expand(ws.folder));
+  if (!p) return;
+  ws.folder = tilde(p);
+  renderSidebar();
+  save();
+}
+
+/* ---------- right-click on an agent: fork its conversation into a split beside it ---------- */
+const canFork = (w) => w.type === 'term' && w.cmd === 'claude' && !!w.sessionId && !w.attach;
+/* Whether a session on this Mac has a conversation to fork; says why not when it has none. */
+async function hasConversation(sid, title) {
+  let has;
+  try {
+    has = await flow.sessions.has(sid);
+  } catch (err) {
+    console.error(`could not read session ${sid} before forking`, err);
+    toast('could not read the session, so nothing was forked', 4000);
+    return false;
+  }
+  if (has) return true;
+  toast(`nothing to fork yet: ${title} has no conversation yet`, 4000);
+  return false;
+}
+async function forkWin(ws, w) {
+  if (!w.host && !(await hasConversation(w.sessionId, termTitle(w)))) return null;
+  const at = ws.windows.indexOf(w);
+  if (at < 0 || !canFork(w)) return null;
+  return board(() => forkNow(ws, w, at));
+}
+function forkNow(ws, w, at) {
+  const title = termTitle(w);
+  const f = { id: newId('w'), type: 'term', title: '', label: `fork of ${title}`, where: w.where || 'this Mac', note: '', cmd: 'claude', cwd: w.cwd, sessionId: uuid(), forkFrom: w.sessionId };
