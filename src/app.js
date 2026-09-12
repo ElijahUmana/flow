@@ -1110,3 +1110,559 @@ function keepSpaceOrigin(ws, sid = curSpace(ws)) {
   void track.offsetWidth;
   here.forEach((w) => {
     if (Number.isFinite(w.x)) w.x += dx;
+    if (Number.isFinite(w.y)) w.y += dy;
+    if (w.max && Number.isFinite(w.max.x)) w.max.x += dx;
+    if (w.max && Number.isFinite(w.max.y)) w.max.y += dy;
+  });
+  const holder = sid && zoneById(ws, sid);
+  if (onScreen) {
+    ws.pan = (Number.isFinite(ws.pan) ? ws.pan : 0) + dx;
+    ws.panY = (Number.isFinite(ws.panY) ? ws.panY : 0) + dy;
+  } else if (holder) {
+    holder.pan = (Number.isFinite(holder.pan) ? holder.pan : 0) + dx;
+    holder.panY = (Number.isFinite(holder.panY) ? holder.panY : 0) + dy;
+  } else {
+    ws.mainPan = (Number.isFinite(ws.mainPan) ? ws.mainPan : 0) + dx;
+    ws.mainPanY = (Number.isFinite(ws.mainPanY) ? ws.mainPanY : 0) + dy;
+  }
+  layout(ws);
+  void track.offsetWidth;
+  requestAnimationFrame(() => requestAnimationFrame(() => track.classList.remove('noanim')));
+}
+/* Before the first window of a space, at its top: the dock's "at the start". */
+function startSpot(ws, w, h, sid) {
+  return { x: contentStart(ws, null, sid) - w - 1.5, y: 6.6, w, h: Math.min(h, nav.bottom() - 6.6) };
+}
+/* Past the last window of a space, at its top: the dock's "at the end". */
+function endSpot(ws, w, h, sid) {
+  return { x: contentEnd(ws, null, sid) + 1.5, y: 6.6, w, h: Math.min(h, nav.bottom() - 6.6) };
+}
+/* Into another space of the same workspace, at its own size and over no window: the first free spot in that space's
+   view, else past its last window, where nothing moves (lead, item 55). */
+function moveToSpace(ws, w, zid) {
+  board(() => moveToSpaceNow(ws, w, zid));
+}
+function moveToSpaceNow(ws, w, zid) {
+  const to = zid && zoneById(ws, zid) ? zid : null;
+  if ((w.zone || null) === to) return;
+  w.max = null;
+  Object.assign(w, freeSpot(ws, w.w, w.h, to, true) || endSpot(ws, w.w, w.h, to));
+  if (to) w.zone = to;
+  else delete w.zone;
+  const r = WIN.get(w.id);
+  if (r) r.cur = null;
+  layout(ws);
+  syncVisible();
+  renderSidebar();
+  save();
+}
+
+
+/* ---------- renaming in place: Enter saves, Esc cancels ---------- */
+let renaming = null;
+function renameInline(el, value, done, kind) {
+  if (renaming) renaming.finish(true);
+  const old = value;
+  const host = el.closest('[draggable="true"]');
+  el.textContent = value;
+  el.setAttribute('contenteditable', 'plaintext-only');
+  el.spellcheck = false;
+  el.classList.add('rn');
+  if (host) host.draggable = false;
+  let over = false;
+  const finish = (commit) => {
+    if (over) return;
+    over = true;
+    renaming = null;
+    el.removeEventListener('keydown', key);
+    el.removeEventListener('blur', blur);
+    el.removeEventListener('focus', back);
+    document.removeEventListener('pointerdown', touch, true);
+    document.removeEventListener('keydown', touch, true);
+    clearTimeout(away);
+    el.removeAttribute('contenteditable');
+    el.classList.remove('rn');
+    if (host) host.draggable = true;
+    const v = el.textContent.replace(/\s+/g, ' ').trim();
+    done(commit ? v : null, old);
+  };
+  const key = (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  };
+  /* A name being typed keeps the keys until Enter or Escape. When they leave without the owner pressing or typing
+     somewhere else (a page's late focus, which the page hands back), the name ends only if they stay away. */
+  let elsewhere = false, away = 0, at = null;
+  const touch = (e) => { if (!el.contains(e.target)) elsewhere = true; };
+  document.addEventListener('pointerdown', touch, true);
+  document.addEventListener('keydown', touch, true);
+  const blur = () => {
+    if (elsewhere) { finish(true); return; }
+    const sel = getSelection();
+    at = sel.rangeCount && el.contains(sel.anchorNode) ? sel.getRangeAt(0).cloneRange() : null;
+    away = setTimeout(() => finish(true), 150);
+  };
+  const back = () => {
+    if (!away) return;
+    clearTimeout(away);
+    away = 0;
+    if (at) { const s = getSelection(); s.removeAllRanges(); s.addRange(at); at = null; }
+  };
+  el.addEventListener('focus', back);
+  el.addEventListener('keydown', key);
+  el.addEventListener('blur', blur);
+  renaming = { el, kind, finish };
+  el.focus({ preventScroll: true });
+  selectAll(el);
+}
+function renamePill(i, after) {
+  const pill = spacesEl.querySelector(`.sp[data-i="${i}"]`);
+  const ws = WS[i];
+  if (!pill || !ws) return;
+  renameInline(pill.querySelector('.sn'), ws.name, (v) => {
+    if (v && v !== ws.name) {
+      ws.name = v;
+      if (after) after(v);
+      save();
+    }
+    renderNav();
+    renderSidebar();
+  }, 'pill');
+}
+function renameAgent(ws, w, label) {
+  renameInline(label, termTitle(w), (v) => {
+    if (v !== null) {
+      w.title = v;
+      const r = WIN.get(w.id);
+      if (r) renderTitle(ws, w);
+      save();
+    }
+    renderSidebar();
+  }, 'row');
+}
+
+/* ---------- workspaces and sub-workspaces ---------- */
+function renameZone(ws, zid, label) {
+  const zn = ws && zoneById(ws, zid);
+  if (!zn || !label) return;
+  const inPill = spacesEl.contains(label);
+  renameInline(label, zn.name, (v) => {
+    if (v && v !== zn.name) { zn.name = v; save(); }
+    renderSidebar();
+    if (inPill) label.textContent = `› ${zn.name}`;
+    renderNav();
+  }, inPill ? 'pill' : 'zone');
+}
+function buildWS(ws) {
+  ws.mode = ws.mode || 'float';
+  ws.pan = ws.pan || 0;
+  ws.zones = ws.zones || [];
+  ws.closed = ws.closed || [];
+  ws.notes = ws.notes || [];
+  ws.windows = ws.windows || [];
+  const sec = document.createElement('section');
+  sec.className = 'ws';
+  sec.dataset.id = ws.id;
+  sec.style.background = ws.bg;
+  const canvas = document.createElement('div');
+  canvas.className = 'canvas';
+  sec.appendChild(canvas);
+  SEC.set(ws.id, { sec, canvas, rubber: 0 });
+  const wid = ws.id;
+  [...ws.windows].sort((a, b) => (a.z || 0) - (b.z || 0)).forEach((w) => buildWin(ws, w));
+  const top = ws.windows.reduce((a, b) => ((b.z || 0) > ((a && a.z) || 0) ? b : a), null);
+  const front = (top && top.z ? top : null) || ws.windows.find((w) => w.front) || ws.windows[ws.windows.length - 1];
+  // the saved order comes back as it was: a launch raises the front window on screen and saves nothing
+  if (front) raise(ws, front);
+  return sec;
+}
+function buildAll() {
+  track.innerHTML = '';
+  shown().forEach((ws) => track.appendChild(buildWS(ws)));
+  shown().forEach((ws) => ws.windows.forEach((w) => ensureBody(ws, w)));
+  layoutAll();
+  syncVisible();
+}
+function jumpTo(i) {
+  track.style.transition = 'none';
+  track.style.transform = SOLO ? 'none' : `translateX(${-i * 100}%)`;
+  requestAnimationFrame(() => requestAnimationFrame(() => { track.style.transition = ''; }));
+}
+function go(i) {
+  if (SOLO || i < 0 || i >= WS.length || i === cur) return false;
+  cur = i;
+  track.style.transform = `translateX(${-i * 100}%)`;
+  renderNav();
+  renderModes();
+  edges();
+  renderSidebar();
+  syncVisible();
+  fitSoon(600);
+  save();
+  return true;
+}
+function step(dir) {
+  if (!go(cur + dir)) bounce(dir);
+}
+/* go(i) for a three-finger swipe that has already brought the strip there (nav.js): no slide of its own; the same i
+   puts the strip back where it belongs, also without one. */
+function goWs(i, o) {
+  if (!(o && o.still)) return go(i);
+  track.style.transition = 'none';
+  const moved = go(i);
+  if (!moved) track.style.transform = SOLO ? 'none' : `translateX(${-cur * 100}%)`;
+  requestAnimationFrame(() => requestAnimationFrame(() => { track.style.transition = ''; }));
+  return moved;
+}
+function bounce(dir) {
+  const base = `translateX(${-cur * 100}%)`;
+  track.animate([{ transform: base }, { transform: `translateX(calc(${-cur * 100}% + ${-dir * 26}px))` }, { transform: base }], { duration: 300, easing: 'ease-out' });
+}
+/* Pills rebuilt under a press would drop its click (the click that ends a rename, on another workspace's pill for one),
+   so while the pills are pressed they are rebuilt once the press is over, as the sidebar does with its rows. */
+let navPressed = false, navHeld = false, szxAt = -Infinity;
+function renderNav() {
+  if (renaming && renaming.kind === 'pill') return;
+  if (navPressed) { navHeld = true; return; }
+  if (SOLO) {
+    const ws = WS[cur];
+    const zn = SOLO_ZONE && zoneById(ws, SOLO_ZONE);
+    spacesEl.innerHTML = `<span class="sp on">${esc(ws.name)}${zn ? ` › ${esc(zn.name)}` : ''}</span>`;
+    document.title = zn ? `${ws.name} › ${zn.name}` : ws.name;
+    return;
+  }
+  spacesEl.innerHTML = '<div class="pills">' + WS.map((ws, i) => { const zn = zoneById(ws, curSpace(ws)); return `<div class="sp${i === cur ? ' on' : ''}" draggable="true" data-i="${i}"><span class="sn">${esc(ws.name)}</span>${zn ? `<span class="sz">${i === cur ? '›' : `<span class="szx" data-szx="${i}" title="back to ${esc(ws.name)}">›</span>`} ${esc(zn.name)}</span>` : ''}<span class="pop" data-pop="${i}" title="open in its own window">⤢</span>${WS.length > 1 ? `<button type="button" draggable="false" class="pillx" data-close-ws="${i}" aria-label="close ${esc(ws.name)}" title="close ${esc(ws.name)}">×</button>` : ''}</div>`; }).join('') + '</div>'
+    + '<button class="addws" id="addws" title="new workspace">+</button>';
+  const on = spacesEl.querySelector('.sp.on');
+  if (on) on.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+const PALETTE = [
+  ['#24304a', '#2f2446', '#121318'], ['#16323a', '#1d3a2f', '#10171a'], ['#3a2a17', '#33241a', '#17130f'],
+  ['#33203b', '#2a1c33', '#151018'], ['#1c2a45', '#1b2f4a', '#0f131b'], ['#2b2444', '#3b2236', '#141319'],
+];
+function addWorkspace(name) {
+  const [a, b, c] = PALETTE[WS.length % PALETTE.length];
+  const ws = {
+    id: newId('ws'), name, folder: '~', zones: [], closed: [], notes: [], saved: [],
+    bg: `radial-gradient(1100px 650px at 15% 10%, ${a} 0%, transparent 62%), radial-gradient(900px 600px at 90% 92%, ${b} 0%, transparent 60%), ${c}`,
+    windows: [],
+  };
+  WS.push(ws);
+  track.appendChild(buildWS(ws));
+  layout(ws);
+  go(WS.length - 1);
+  return ws;
+}
+/* + makes the workspace right away, empty, and puts its name into rename. */
+function newWorkspace() {
+  if (SOLO) return null;
+  const ws = addWorkspace('new workspace');
+  // named, it picks up a home folder of that name; flushNow first: files.list lists only folders of the saved state
+  renamePill(WS.indexOf(ws), (name) => {
+    if (!window.FlowWsMenu || ws.folder !== '~') return;
+    flushNow().then(() => window.FlowWsMenu.folderFor(name)).then((f) => { if (f && ws.folder === '~') { ws.folder = f; renderSidebar(); save(); } },
+      (err) => console.error('could not pick up the new workspace\'s folder', err));
+  });
+  return ws;
+}
+async function popOut(wsId, zoneId, frame) {
+  try {
+    await flushPages();
+  } catch (err) {
+    console.error('could not save before opening a window', err);
+    toast('could not save, so the new window did not open', 4000);
+    return;
+  }
+  flow.openWindow('solo=' + encodeURIComponent(wsId) + (zoneId ? '&zone=' + encodeURIComponent(zoneId) : ''), frame);
+}
+/* The spaces of a workspace in the sidebar's order, depth first: main (null), then each sub-workspace followed by its own
+   (zn.parent), siblings in ws.zones order. A zone whose parent is gone counts as top level. */
+function spaceOrder(ws) {
+  const zs = ws.zones || [], ids = new Set(zs.map((z) => z.id)), seen = new Set(), out = [null];
+  const under = (z, pid) => (pid ? z.parent === pid : !z.parent || !ids.has(z.parent));
+  const walk = (pid) => zs.forEach((z) => { if (!seen.has(z.id) && under(z, pid)) { seen.add(z.id); out.push(z.id); walk(z.id); } });
+  walk(null);
+  zs.forEach((z) => { if (!seen.has(z.id)) out.push(z.id); });
+  return out;
+}
+/* A new sub-workspace in parentId's space (null: directly in the workspace), last among that space's own; ws.zones is
+   kept in the sidebar's order. Flow goes there. */
+function addZone(ws, parentId) {
+  if (SOLO) return null;
+  const parent = parentId && zoneById(ws, parentId) ? parentId : null;
+  const zn = { id: newId('z'), name: 'new sub-workspace', pan: 0, ...(parent ? { parent } : {}) };
+  // within: in parent's subtree (a parent chain never made by Flow cannot loop it)
+  const order = spaceOrder(ws).slice(1), within = (id) => {
+    let z = zoneById(ws, id);
+    for (let i = 0; z && i < 64; i++) { if (z.parent === parent) return true; z = z.parent ? zoneById(ws, z.parent) : null; }
+    return false;
+  };
+  let at = parent ? order.indexOf(parent) : order.length - 1;
+  if (parent) while (at + 1 < order.length && within(order[at + 1])) at++;
+  order.splice(at + 1, 0, zn.id);
+  const byId = new Map([...ws.zones, zn].map((z) => [z.id, z]));
+  ws.zones.splice(0, ws.zones.length, ...order.map((id) => byId.get(id)));
+  showSpace(ws, zn.id);
+  return zn;
+}
+/* Show another space of this workspace (zid null: the main one). The canvas slides in from the side it lies on. */
+/* still: no slide in, when a swipe has already brought the space in (nav). */
+function showSpace(ws, zid, opts) {
+  if (SOLO_ZONE && ws.id === SOLO) return;
+  const to = zid && zoneById(ws, zid) ? zid : null, from = curSpace(ws);
+  if (to === from) return;
+  const order = spaceOrder(ws);
+  const dir = order.indexOf(to) > order.indexOf(from) ? 1 : -1;
+  nav.swap(ws, from, to);
+  ws.at = to;
+  layout(ws);
+  const c = canvasOf(ws);
+  if (c && ws === WS[cur] && !(opts && opts.still)) c.animate([{ translate: `${dir * 48}px 0`, opacity: 0.4 }, { translate: '0 0', opacity: 1 }], { duration: 220, easing: 'ease-out' });
+  syncVisible();
+  edges();
+  renderNav();
+  renderSidebar();
+  fitSoon(260);
+  save();
+}
+
+
+/* ---------- undo for the board (owner, Nov 7: "undo say whatever last action that was say taken and it sort of like
+   auto repalys that back") ---------- */
+/* ⌘Z and ⇧⌘Z, and Edit > Undo and Redo, take back and put again what the hands last did to the board: a window moved,
+   resized, filled, parked, made, closed, reopened, sent to another space or workspace, an arrange. The screen goes back
+   to the workspace and space it was done in, the view to where it was unless the owner moved it since, and the windows
+   glide there, so the undo is seen. A step covers only the windows and notes it changed. Typing since then (a note, a
+   field, a terminal) keeps ⌘Z for the text, and a workspace closed since keeps it for that (the silent undo above). A
+   page that has the keys undoes in itself: main sends Edit > Undo to it. Kept for this window's run. */
+const BOARD_STEPS = 50;
+const boardPast = [], boardFuture = [];
+let boardDepth = 0, boardReplaying = false, editAt = -Infinity, boardLast = { t: -Infinity, by: '' };
+const boardGeo = (w) => ({ x: w.x, y: w.y, w: w.w, h: w.h, max: w.max ? { ...w.max } : null, zone: w.zone || null });
+const boardView = (ws) => ({ at: ws.at || null, pan: ws.pan || 0, panY: ws.panY || 0, zoom: ws.zoom || 1 });
+const boardWinKey = (e) => (e ? JSON.stringify([e.ws, e.list, e.g], (_k, v) => (typeof v === 'number' ? Math.round(v * 1000) / 1000 : v)) : '');
+const boardNoteKey = (e) => (e ? JSON.stringify([e.ws, e.parent]) : '');
+function boardSnap() {
+  const wins = new Map(), notes = new Map(), modes = new Map(), views = new Map();
+  WS.forEach((ws) => {
+    const note = (w) => (w.noteId ? noteById(ws, w.noteId) || null : null);
+    ws.windows.forEach((w, i) => wins.set(w.id, { ws: ws.id, list: 'windows', i, g: boardGeo(w), ref: w, note: note(w) }));
+    ws.closed.forEach((w, i) => wins.set(w.id, { ws: ws.id, list: 'closed', i, g: boardGeo(w), ref: w, note: null }));
+    ws.notes.forEach((n, i) => notes.set(n.id, { ws: ws.id, i, parent: n.parent || null, ref: n }));
+    modes.set(ws.id, ws.mode);
+    views.set(ws.id, boardView(ws));
+  });
+  return { wins, notes, modes, views, cur: WS[cur] ? WS[cur].id : null };
+}
+/* Runs one board action as one step. before: taken earlier, for an action that starts before it is known to be one
+   (a drag, a resize). Actions inside another, or an undo replaying, are part of that one. */
+function board(fn, before) {
+  if (boardReplaying || boardDepth) return fn();
+  const was = before || boardSnap();
+  boardDepth++;
+  try { return fn(); } finally { boardDepth--; boardDone(was); }
+}
+function boardDone(before) {
+  const after = boardSnap(), changed = (a, b, key) => [...new Set([...a.keys(), ...b.keys()])].filter((id) => key(a.get(id)) !== key(b.get(id)));
+  const wins = changed(before.wins, after.wins, boardWinKey), notes = changed(before.notes, after.notes, boardNoteKey);
+  const modes = changed(before.modes, after.modes, (m) => m || '');
+  if (!wins.length && !notes.length && !modes.length) return;
+  const keep = (s) => ({ ...s, wins: new Map(wins.filter((id) => s.wins.has(id)).map((id) => [id, s.wins.get(id)])),
+    notes: new Map(notes.filter((id) => s.notes.has(id)).map((id) => [id, s.notes.get(id)])) });
+  boardPast.push({ before: keep(before), after: keep(after), wins, notes, modes, t: performance.now() });
+  if (boardPast.length > BOARD_STEPS) boardPast.shift();
+  boardFuture.length = 0;
+}
+/* The next undo (or redo) is the board's when it has a step, unless the keys are in text typed in since that step (the
+   text's own undo comes first there) or a workspace closed since then can still come back. */
+function boardTurn(stack) {
+  const top = stack[stack.length - 1];
+  if (!top || dragging || closingWorkspace || workspaceCritical || undoingWorkspace) return false;
+  if (workspaceClosedAt > top.t && workspaceUndoReady()) return false;
+  // space cut or added since (nav's own ⌘Z, the newer action) goes back first
+  if (stack === boardPast && nav.spaceUndoReady(top.t)) return false;
+  return top.t > editAt || !isEditingTarget(document.activeElement);
+}
+/* by: 'key' or 'menu'. One ⌘Z can reach this window both as a key and as Edit > Undo: the second is the same press. */
+function boardStep(back, by) {
+  const now = performance.now();
+  if (boardLast.by && boardLast.by !== by && now - boardLast.t < 400) return true;
+  if (back && !dragging && !closingWorkspace && !workspaceCritical && !undoingWorkspace) {
+    // the space cut or added and the closed workspace keep their own undo; the newest of them and the board's step goes
+    // back first, and the keys in text keep the press only when something was typed there since (the board's rule)
+    const top = boardPast[boardPast.length - 1], topT = top ? top.t : -Infinity;
+    const closed = workspaceUndoReady() ? workspaceClosedAt : -Infinity, inText = isEditingTarget(document.activeElement);
+    if (nav.spaceUndoReady(Math.max(topT, closed)) && (nav.spaceUndoReady(editAt) || !inText)) {
+      undoSpace();
+      boardLast = { t: performance.now(), by };
+      return true;
+    }
+    if (closed > topT && (closed > editAt || !inText)) {
+      undoWorkspaceClose();
+      boardLast = { t: performance.now(), by };
+      return true;
+    }
+  }
+  const from = back ? boardPast : boardFuture, to = back ? boardFuture : boardPast;
+  let rec = null;
+  while (boardTurn(from)) {
+    const r = from.pop(), O = back ? r.after : r.before;
+    // only what is still as the step left it: a window closed, deleted or moved again since stays as it is now
+    const live = { ...r, wins: r.wins.filter((id) => boardNowWin(id) === boardWinKey(O.wins.get(id))),
+      notes: r.notes.filter((id) => boardNowNote(id) === boardNoteKey(O.notes.get(id))),
+      modes: r.modes.filter((id) => { const ws = WS.find((x) => x.id === id); return !!ws && ws.mode === O.modes.get(id); }) };
+    if (live.wins.length || live.notes.length || live.modes.length) { rec = live; break; }
+  }
+  if (!rec) return false;
+  boardReplaying = true;
+  try {
+    boardApply(rec, back ? rec.before : rec.after, back ? rec.after : rec.before);
+  } catch (err) {
+    console.error('could not undo that on the board', err);
+  } finally {
+    boardReplaying = false;
+  }
+  rec.t = performance.now();
+  to.push(rec);
+  boardLast = { t: rec.t, by };
+  return true;
+}
+/* A plain note made by the step and written in since stays when the step is undone; a page's note goes or stays with
+   its window as closing decides (dropPageNote). */
+const boardKeepsNote = (n) => n.kind === 'page' || !!n.titleSet || !!(n.body && n.body.trim());
+function boardPutGeo(ws, w, g) {
+  Object.assign(w, { x: g.x, y: g.y, w: g.w, h: g.h });
+  w.max = g.max ? { ...g.max } : null;
+  if (g.zone && zoneById(ws, g.zone)) w.zone = g.zone;
+  else delete w.zone;
+  const r = WIN.get(w.id);
+  if (r) r.cur = null;
+}
+function boardNowWin(id) {
+  const f = boardFind(id);
+  return f && f.list !== 'held' ? boardWinKey({ ws: f.ws.id, list: f.list, g: boardGeo(f.w) }) : '';
+}
+function boardNowNote(id) {
+  for (const ws of WS) { const n = noteById(ws, id); if (n) return boardNoteKey({ ws: ws.id, parent: n.parent || null }); }
+  return '';
+}
+function boardFind(id) {
+  for (const ws of WS) {
+    let i = ws.windows.findIndex((w) => w.id === id);
+    if (i >= 0) return { ws, list: 'windows', i, w: ws.windows[i] };
+    i = ws.closed.findIndex((w) => w.id === id);
+    if (i >= 0) return { ws, list: 'closed', i, w: ws.closed[i] };
+  }
+  const h = HELD.find((x) => x.w.id === id);
+  return h ? { ws: h.ws, list: 'held', h, w: h.w } : null;
+}
+/* Puts the board as S has it for the step's windows and notes; O is the other side, what is there now if nothing
+   moved since. */
+function boardApply(rec, S, O) {
+  const wsOf = (id) => WS.find((x) => x.id === id) || null;
+  const touched = new Set(), back = [];
+  rec.modes.forEach((id) => { const ws = wsOf(id); if (ws && S.modes.has(id)) { ws.mode = S.modes.get(id); touched.add(ws); } });
+  // notes first, so a window coming back finds its note
+  const noteAt = (id) => { for (const ws of WS) { const i = ws.notes.findIndex((n) => n.id === id); if (i >= 0) return { ws, i, n: ws.notes[i] }; } return null; };
+  rec.notes.forEach((id) => {
+    const t = S.notes.get(id), now = noteAt(id), to = t && wsOf(t.ws), n = now ? now.n : (t || O.notes.get(id)).ref;
+    if (!t && boardKeepsNote(n)) return;
+    if (t) { if (t.parent) n.parent = t.parent; else delete n.parent; }
+    if (now && now.ws === to) return;
+    if (now) now.ws.notes.splice(now.i, 1);
+    if (to) to.notes.splice(Math.min(t.i, to.notes.length), 0, n);
+  });
+  rec.wins.forEach((id) => {
+    const t = S.wins.get(id), now = boardFind(id), to = t && wsOf(t.ws);
+    if (!to) {
+      // made by the step: it closes as the red light closes it (a terminal goes to the closed list, its session on)
+      if (now && now.list === 'windows') { closeWin(now.ws, now.w); touched.add(now.ws); }
+      return;
+    }
+    const w = now ? now.w : t.ref;
+    if (now && now.list === 'windows' && now.ws === to && t.list === 'windows') {
+      boardPutGeo(to, w, t.g);
+      touched.add(to);
+      back.push({ ws: to, w });
+      return;
+    }
+    if (now && now.list === 'windows' && t.list === 'windows') { now.ws.windows.splice(now.i, 1); touched.add(now.ws); }
+    else if (now && now.list === 'windows') { removeWindow(now.ws, w); touched.add(now.ws); }
+    else if (now && now.list === 'closed') now.ws.closed.splice(now.i, 1);
+    else if (now && now.list === 'held') {
+      const h = now.h;
+      HELD.splice(HELD.indexOf(h), 1);
+      clearTimeout(h.timer);
+      if (t.list === 'windows' && h.ws === to) { h.r.el.classList.replace('held', 'win'); WIN.set(id, h.r); }
+      else { disposeBody(h.r); h.r.el.remove(); }
+    }
+    boardPutGeo(to, w, t.g);
+    if (t.list === 'closed') { to.closed.splice(Math.min(t.i, to.closed.length), 0, w); touched.add(to); return; }
+    // a window coming back whose note went after the step (a closed page's, once its site was done saving)
+    const nt = t.note || (O.wins.get(id) && O.wins.get(id).note);
+    if (w.noteId && !noteById(to, w.noteId) && nt && !noteAt(w.noteId)) to.notes.unshift(nt);
+    to.windows.splice(Math.min(t.i, to.windows.length), 0, w);
+    touched.add(to);
+    back.push({ ws: to, w });
+  });
+  touched.forEach((ws) => {
+    const canvas = canvasOf(ws);
+    ws.windows.forEach((w) => {
+      const r = WIN.get(w.id);
+      if (!canvas) { if (r) { disposeBody(r); r.el.remove(); WIN.delete(w.id); } return; }
+      if (!r) { buildWin(ws, w).classList.add('pop-in'); ensureBody(ws, w); return; }
+      if (r.el.parentElement !== canvas) {
+        canvas.appendChild(r.el);
+        if (r.page) { r.page.dispose(); r.page = null; r.vis = null; }
+        ensureBody(ws, w);
+      }
+    });
+    layout(ws);
+  });
+  // the screen where the step was done: its workspace, its space, and its view unless the owner moved it since
+  const there = wsOf(S.cur);
+  if (there && !SOLO && WS[cur] !== there) go(WS.indexOf(there));
+  const ws = WS[cur], sv = ws && S.views.get(ws.id), ov = ws && O.views.get(ws.id);
+  if (sv && (ws.at || null) !== sv.at && (!sv.at || zoneById(ws, sv.at))) showSpace(ws, sv.at);
+  syncVisible();
+  const live = ws && boardView(ws);
+  const same = (a, b) => !!a && !!b && a.at === b.at && Math.abs(a.pan - b.pan) < 0.01 && Math.abs(a.panY - b.panY) < 0.01 && Math.abs(a.zoom - b.zoom) < 0.0001;
+  const seen = back.filter((x) => x.ws === ws && inSpace(ws, x.w) && WIN.get(x.w.id));
+  if (sv && same(live, ov) && sv.at === live.at) {
+    ws.panY = sv.panY;
+    ws.zoom = sv.zoom;
+    nav.setPan(ws, (sv.pan / 100) * VW, true);
+  } else if (seen.length) {
+    const x = Math.min(...seen.map((s) => s.w.x)), y = Math.min(...seen.map((s) => s.w.y));
+    nav.reveal(ws, { x, y, w: Math.max(...seen.map((s) => s.w.x + s.w.w)) - x, h: Math.max(...seen.map((s) => s.w.y + s.w.h)) - y });
+  }
+  seen.forEach((s) => flash(WIN.get(s.w.id).el));
+  if (seen.length) bringFront(ws, seen[seen.length - 1].w);
+  fitSoon();
+  renderSidebar();
+  save();
+}
+/* ⌘Z and ⇧⌘Z before anything else has them (a note's or a terminal's own keys), when the board's step is the newest. */
+function boardKey(e) {
+  if (!e.metaKey || e.altKey || e.ctrlKey || e.key.toLowerCase() !== 'z') return;
+  if (document.body.classList.contains('workspace-committing')) return;
+  if (!boardStep(!e.shiftKey, 'key')) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+}
+
+/* ---------- window actions ---------- */
+function addWindow(ws, w, at, sp = curSpace(ws)) {
+  if (sp) w.zone = sp;
+  else delete w.zone;
+  if (at == null) ws.windows.push(w);
+  else ws.windows.splice(at, 0, w);
+  const el = buildWin(ws, w);
+  ensureBody(ws, w);
+  layout(ws);
+  el.classList.add('pop-in');
+  bringFront(ws, w);
+  syncVisible();
+  save();
+  return w;
