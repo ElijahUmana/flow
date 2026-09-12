@@ -2222,3 +2222,559 @@ async function forkWin(ws, w) {
 function forkNow(ws, w, at) {
   const title = termTitle(w);
   const f = { id: newId('w'), type: 'term', title: '', label: `fork of ${title}`, where: w.where || 'this Mac', note: '', cmd: 'claude', cwd: w.cwd, sessionId: uuid(), forkFrom: w.sessionId };
+  if (w.host) f.host = w.host;
+  const halves = ws.mode === 'float' ? splitRect(w) : null;
+  if (halves) {
+    w.max = null;
+    Object.assign(w, halves[0]);
+    Object.assign(f, halves[1]);
+  } else {
+    Object.assign(f, besideSpot(ws, w));
+  }
+  addWindow(ws, f, at + 1);
+  fitSoon();
+  focusWin(ws, f);
+  const r = WIN.get(f.id);
+  if (r && r.term) r.term.focus();
+  renderSidebar();
+  return f;
+}
+/* The + beside the window in front (beside.js): one of the same kind on that side, the same size, or the two sharing
+   w's space half each (nav.beside makes the room); a page with its address to type in and its own empty note, an agent
+   fresh in the same folder (not a fork), a shell there too, a note. In columns and grid the tiling sizes it: it goes
+   after w for right and below, before w for left and above, and there is no split. */
+function openBeside(ws, w, side, split) {
+  return board(() => openBesideNow(ws, w, side, split));
+}
+function openBesideNow(ws, w, side, split) {
+  const r = ws.mode === 'float' ? nav.beside(ws, w, side, split, false) : null;
+  if (!r && (ws.mode === 'float' || split)) return null;
+  if (r && r.own) { w.max = null; Object.assign(w, r.own); }
+  const at = ws.windows.indexOf(w) + (side === 'right' || side === 'below' ? 1 : 0);
+  // a tiling only takes windows left of x 99: a free place there, else w's own, for when the space goes back to float
+  const spot = r ? null : nav.openSpot(ws, w.w, w.h);
+  const rect = r ? r.at : spot && spot.x < 99 ? spot : { x: w.x, y: w.y, w: w.w, h: w.h };
+  let nw;
+  if (w.type === 'page' || w.type === 'note') {
+    const n = w.type === 'page' ? { id: newId('n'), kind: 'page', title: 'new page', url: '', body: '' } : { id: newId('n'), kind: 'note', title: 'new note', body: '' };
+    ws.notes.unshift(n);
+    nw = addWindow(ws, { id: newId('w'), type: w.type, noteId: n.id, ...rect }, at);
+  } else {
+    const shell = w.cmd === 'shell';
+    nw = addWindow(ws, { id: newId('w'), type: 'term', title: '', where: w.where || 'this Mac', ...(w.host ? { host: w.host } : {}), note: '', cmd: shell ? 'shell' : 'claude', ...(shell ? {} : { sessionId: uuid() }), cwd: w.cwd || ws.folder, ...rect }, at);
+  }
+  if (ws.mode !== 'float') layout(ws);
+  fitSoon();
+  focusWin(ws, nw);
+  const nr = WIN.get(nw.id);
+  if (nw.type === 'page') { if (nr && nr.page) nr.page.focusAddress(); }
+  else if (nw.type === 'note') { const f = nr && nr.el.querySelector('.ntitle'); if (f) f.focus({ preventScroll: true }); }
+  else if (nr && nr.term) nr.term.focus();
+  renderSidebar();
+  save();
+  return nw;
+}
+/* A conversation with no open window (an old session, a closed agent) forks into the current workspace's first free spot. */
+async function forkSession(src) {
+  const ws = WS[cur];
+  if (!ws || (!src.host && !(await hasConversation(src.sessionId, src.title)))) return null;
+  const f = { id: newId('w'), type: 'term', title: '', label: `fork of ${src.title}`, where: src.where || 'this Mac', note: '', cmd: 'claude', cwd: src.cwd || ws.folder, sessionId: uuid(), forkFrom: src.sessionId, ...freeSpot(ws, 36, 44) };
+  if (src.host) f.host = src.host;
+  addWindow(ws, f);
+  focusWin(ws, f);
+  const r = WIN.get(f.id);
+  if (r && r.term) r.term.focus();
+  q.value = '';
+  sessAll = false;
+  renderSidebar();
+  return f;
+}
+/* Wide windows split side by side, tall ones top and bottom, as long as each half stays usable for Claude Code
+   (300px wide, 160px tall); otherwise null. */
+function splitRect(w) {
+  const gx = 1.1, gy = 1.8;
+  const sideHalf = (w.w - gx) / 2, stackHalf = (w.h - gy) / 2;
+  const side = (sideHalf / 100) * VW >= 300 && [{ x: w.x, y: w.y, w: sideHalf, h: w.h }, { x: w.x + sideHalf + gx, y: w.y, w: sideHalf, h: w.h }];
+  const stack = (stackHalf / 100) * VH >= 160 && [{ x: w.x, y: w.y, w: w.w, h: stackHalf }, { x: w.x, y: w.y + stackHalf + gy, w: w.w, h: stackHalf }];
+  return ((w.w / 100) * VW >= (w.h / 100) * VH ? side || stack : stack || side) || null;
+}
+/* The same size right next to the window (right, then below) when that space is free, else the first free spot. */
+function besideSpot(ws, w) {
+  const g = geo(w), bottom = nav.bottom();
+  const right = { x: g.x + g.w + 1.3, y: g.y, w: g.w, h: g.h };
+  if (!collides(ws, right.x, right.y, right.w, right.h)) return right;
+  const below = { x: g.x, y: g.y + g.h + 1.3, w: g.w, h: g.h };
+  if (below.y + below.h <= bottom && !collides(ws, below.x, below.y, below.w, below.h)) return below;
+  return freeSpot(ws, g.w, g.h);
+}
+let ctxEl = null, ctxItems = [];
+function agentItems(ws, w) {
+  const items = [];
+  if (canFork(w)) {
+    items.push(findWin(ws, w.id) ? { label: 'fork', hint: 'opens beside it', run: () => forkWin(ws, w) }
+      : { label: 'fork', hint: 'opens here', run: () => forkSession({ sessionId: w.sessionId, cwd: w.cwd, title: termTitle(w), where: w.where, host: w.host }) });
+  }
+  if (isTerm(w) && w.cmd === 'claude' && w.sessionId) items.push({ label: 'copy resume command', hint: `${w.sessionId.slice(0, 8)}…`, run: () => copyResume(w) });
+  return items;
+}
+function openCtx(e, ws, w) {
+  const items = window.FlowSidebar ? window.FlowSidebar.windowItems(ws, w) : agentItems(ws, w);
+  showMenu(e, [...(groups ? groups.menuItems(ws, w) : []), ...items]);
+}
+function showMenu(e, items) {
+  if (!items.length) return;
+  e.preventDefault();
+  closeCtx();
+  ctxItems = items;
+  ctxEl = document.createElement('div');
+  ctxEl.className = 'ctx';
+  ctxEl.innerHTML = items.map((it, i) => `<button data-i="${i}">${esc(it.label)}<span class="k">${esc(it.hint)}</span></button>`).join('');
+  ctxEl.addEventListener('click', (ev) => {
+    const b = ev.target.closest('button');
+    const it = b && ctxItems[+b.dataset.i];
+    closeCtx();
+    if (it) it.run();
+  });
+  document.body.appendChild(ctxEl);
+  const m = ctxEl.getBoundingClientRect();
+  ctxEl.style.left = Math.max(6, Math.min(e.clientX, innerWidth - m.width - 6)) + 'px';
+  ctxEl.style.top = Math.max(6, Math.min(e.clientY, innerHeight - m.height - 6)) + 'px';
+  document.addEventListener('pointerdown', ctxOutside, true);
+  document.addEventListener('keydown', ctxKey, true);
+  window.addEventListener('blur', closeCtx);
+}
+/* What to type in any terminal to get back into this conversation, as main builds it (the claude Flow runs, in the
+   transcript's folder, over ssh for a window on another host); with no transcript there is nothing to copy. */
+function copyResume(w) {
+  flow.term.resumeCommand(w.sessionId, { host: w.host, cwd: w.cwd }).then((r) => {
+    if (r.command) copyText(r.command);
+    else toast(r.error);
+  }, (err) => console.error('could not build the resume command', err));
+}
+function copyText(text) {
+  navigator.clipboard.writeText(text).catch((err) => {
+    console.error('copying to the clipboard failed', err);
+    toast(`could not copy: ${(err && err.message) || err}`, 6000);
+  });
+}
+function closeCtx() {
+  if (!ctxEl) return;
+  ctxEl.remove();
+  ctxEl = null;
+  ctxItems = [];
+  document.removeEventListener('pointerdown', ctxOutside, true);
+  document.removeEventListener('keydown', ctxKey, true);
+  window.removeEventListener('blur', closeCtx);
+}
+function ctxOutside(e) {
+  if (ctxEl && !ctxEl.contains(e.target)) closeCtx();
+}
+function ctxKey(e) {
+  if (e.key !== 'Escape') return;
+  e.preventDefault();
+  e.stopPropagation();
+  closeCtx();
+}
+
+/* ---------- spawning from the dock and the menu ---------- */
+/* at: a point on the desktop in % ({ x, y }), from a right-click there or a dock button carried there (at.hand: where
+   the hand let go); without it the window takes the first free spot. at.start: before the first window; at.end: past the
+   last window, where park puts one. A new window the owner can see takes the keys, ready to type; one that lands out of
+   view, as at the start or end often does, leaves the view, the front and the keys as they are (lead, Nov 5). */
+function spawn(kind, at) {
+  return kind === 'zone' ? spawnNow(kind, at) : board(() => spawnNow(kind, at));
+}
+function spawnNow(kind, at) {
+  const ws = WS[cur];
+  if (!ws) return null;
+  if (kind === 'zone') {
+    // made from the dock or the menu: in the space on screen, its name open for typing in the pill, as + does for a
+    // workspace
+    const zn = addZone(ws, curSpace(ws));
+    if (zn) renameZone(ws, zn.id, spacesEl.querySelector('.sp.on .sz'));
+    return zn;
+  }
+  const edge = !!(at && (at.start || at.end)), was = edge && frontWin();
+  const place = (w, h) => (at && at.start ? startSpot(ws, w, h) : at && at.end ? endSpot(ws, w, h) : at && at.direct ? at.direct : at ? nav.placeRoom(ws, at, w, h, at.hand) : nav.openSpot(ws, w, h));
+  /* A window carried out of the dock lands exactly on the outline the hand was shown (lead, Nov 2 19:2x), at the board's
+     scale: the hand chose its size there. Made any other way (a click on the dock, the board's menu, a key), far out it
+     opens readable over its spot (lensOpen). */
+  const readable = (w) => (at && at.outlined ? true : lensOpen(ws, w));
+  const shown = (w) => {
+    if (at && at.direct) { bringFront(ws, w); keysTo(ws, w); return readable(w); }
+    if (edge && !wholly(ws, w)) { if (was) bringFront(ws, was.w); return false; }
+    focusWin(ws, w);
+    return readable(w);
+  };
+  if (kind === 'note' || kind === 'page') {
+    const n = kind === 'page' ? { id: newId('n'), kind, title: 'new page', url: '', body: '' } : { id: newId('n'), kind, title: 'new note', body: '' };
+    ws.notes.unshift(n);
+    const w = addWindow(ws, { id: newId('w'), type: kind, noteId: n.id, ...place(kind === 'page' ? 46 : 34, kind === 'page' ? 64 : 46) });
+    const r = WIN.get(w.id);
+    if (shown(w)) {
+      if (kind === 'page') { if (r.page) r.page.focusAddress(); }
+      else { const f = r.el.querySelector('.ntitle'); if (f) { f.focus({ preventScroll: true }); selectAll(f); } }
+    }
+    renderSidebar();
+    return w;
+  }
+  if (kind === 'agent' || kind === 'team' || kind === 'shell') {
+    const team = kind === 'team', shell = kind === 'shell';
+    const w = addWindow(ws, { id: newId('w'), type: team ? 'team' : 'term', title: '', ...window.FlowTeams.runsOn(ws, zoneById(ws, curSpace(ws))), note: '', cmd: shell ? 'shell' : 'claude', ...(shell ? {} : { sessionId: uuid() }), ...place(team ? 46 : 36, team ? 50 : 44) });
+    const r = WIN.get(w.id);
+    if (shown(w) && r.term) r.term.focus();
+    renderSidebar();
+    return w;
+  }
+  return null;
+}
+/* ---------- zoomed out, a new window is drawn at actual size where it is made ---------- */
+/* Owner, Nov 7 02/10: zoomed out, a new note, page or agent must not come out tiny; MAC_NOTES 54: readable where it is
+   made, no forced zoom-in. The board zoom scales what a window shows with it, so a window made larger in the model would
+   still be unreadable, and over-zoomed once the owner pinched back ("does this new one then get over zoomed"). So it is
+   made at its usual size where it belongs, and drawn at actual size over that spot (centred on it, kept on screen) while
+   the hand works in it: typing, reading. As soon as the hand goes anywhere else (a press outside it, on its resize grip
+   or its title bar, a pinch, the view panned, another space) it settles into its place, the same scale as everything
+   around it. Nothing about it is saved: the model is the window's usual place and size throughout. */
+const LENS_Z = 0.75;   // further out than this, a window at its usual size is too small to read
+let lens = null;       // { ws, w, view }
+const lensView = (ws) => { const v = nav.visible(ws); return `${v.x}|${v.y}|${v.z}|${curSpace(ws)}`; };
+function lensPlace() {
+  const r = lens && WIN.get(lens.w.id);
+  if (!r) return;
+  const v = nav.visible(lens.ws), z = v.z, g = geo(lens.w), m = 12;
+  const x = (g.x / 100) * VW, y = (g.y / 100) * VH, W = (g.w / 100) * VW, H = (g.h / 100) * VH;
+  const vx = (v.x / 100) * VW, vy = (v.y / 100) * VH;
+  const bar = document.querySelector('.menubar'), under = bar ? Math.max(0, bar.getBoundingClientRect().bottom - viewport.getBoundingClientRect().top) : 0;
+  const L = clamp((x + W / 2 - vx) * z - W / 2, m, Math.max(m, VW - m - W));
+  const T = clamp((y + H / 2 - vy) * z - H / 2, under + m, Math.max(under + m, VH - m - H));
+  r.el.style.transformOrigin = '0 0';
+  r.el.style.transform = `translate(${L / z + vx - x}px, ${T / z + vy - y}px) scale(${1 / z})`;
+}
+function lensOpen(ws, w) {
+  lensClose();
+  const r = WIN.get(w.id);
+  if (!r || nav.zoom(ws) >= LENS_Z || !wholly(ws, w)) return true;
+  lens = { ws, w, view: lensView(ws) };
+  r.el.classList.add('lens', 'lensanim');
+  requestAnimationFrame(() => { if (lens && lens.w === w) lensPlace(); });
+  const watch = () => {
+    if (!lens || lens.w !== w) return;
+    if (WS[cur] !== ws || !ws.windows.includes(w) || !r.el.isConnected || lensView(ws) !== lens.view) { lensClose(); return; }
+    requestAnimationFrame(watch);
+  };
+  requestAnimationFrame(watch);
+  return true;
+}
+function lensClose() {
+  if (!lens) return;
+  const r = WIN.get(lens.w.id);
+  lens = null;
+  if (!r) return;
+  const el = r.el;
+  el.classList.add('lensanim');
+  el.style.transform = '';
+  const done = () => { if (!el.style.transform) el.classList.remove('lens', 'lensanim'); };
+  el.addEventListener('transitionend', done, { once: true });
+  setTimeout(done, 400);
+}
+window.addEventListener('pointerdown', (e) => {
+  if (!lens) return;
+  const r = WIN.get(lens.w.id), inside = !!(r && r.el.contains(e.target));
+  // outside it, on its resize grip, or on its title bar (a drag moves it on the board, at the board's scale): it settles
+  if (!inside || e.target.closest('.rz') || (e.target.closest('.tb') === r.tb && !e.target.closest('[data-l], button'))) lensClose();
+}, true);
+window.addEventListener('wheel', (e) => { if (lens && e.ctrlKey) lensClose(); }, { capture: true, passive: true });
+/* A dock button carried out of the dock makes its window where it is let go. Its outline follows the hand, held by the
+   title bar: on open desktop it opens there, in a gap between windows it sits beside the first and what is past it
+   makes way (placeRoom), at the right side of the view it goes past the last window (spawn at.end), and back on the
+   dock or off the desktop nothing is made. A press that does not travel is the button's click. The press takes no
+   focus, so unless a new window opens in view, the keys stay with the window in use (lead, Nov 2). */
+/* Is a window of the space on screen wholly in view? */
+function wholly(ws, w) {
+  const v = nav.visible(ws), g = geo(w);
+  return g.x >= v.x - 0.05 && g.x + g.w <= v.x + v.w + 0.05 && g.y >= v.y - 0.05 && g.y + g.h <= v.y + v.h + 0.05;
+}
+const DOCK_SIZES = { agent: [36, 44], shell: [36, 44], team: [46, 50], note: [34, 46], page: [46, 64] };
+let dockCarried = false;
+function carryFromDock(e, b) {
+  const kind = b.dataset.k, size = DOCK_SIZES[kind], ws = WS[cur], dock = $('dock');
+  if (!size || !ws || SOLO || e.button !== 0) return;
+  e.preventDefault();
+  if (dragging) return;
+  setDragging(true);
+  const id = e.pointerId, sx = e.clientX, sy = e.clientY, keys = document.activeElement;
+  let ghost = null, drop = null, lx = sx, ly = sy, paintFrame = null, finished = false;
+  /* Past the board's left side (over the sidebar) is its left edge, as past its right side is the right edge: the right
+     ends at the screen, the left beside the sidebar, where a hand easily overshoots the edge band. */
+  const onBoard = (cx, cy) => {
+    const r = viewport.getBoundingClientRect();
+    return cx < r.left && cx >= 0 && cy >= r.top && cy <= r.bottom ? r.left : cx;
+  };
+  const dropAt = (cx, cy) => {
+    const r = viewport.getBoundingClientRect(), d = dock.getBoundingClientRect();
+    cx = onBoard(cx, cy);
+    if (cx < r.left || cx > r.right || cy < r.top || cy > r.bottom || (cx >= d.left - 20 && cx <= d.right + 20 && cy >= d.top - 20)) return null;
+    const side = nav.sideOf(cx);
+    if (side === -1) return { start: true };
+    if (side === 1) return { end: true };
+    const hand = nav.toSpace(ws, cx, cy), at = { x: hand.x - size[0] / 2, y: hand.y - (14 / nav.zoom(ws) / VH) * 100, hand };
+    const direct = at.x < 0 || at.y < 4.5;
+    return direct ? { at: { ...at, direct: { x: at.x, y: at.y, w: size[0], h: size[1] } }, spot: { x: at.x, y: at.y, w: size[0], h: size[1] } }
+      : { at, spot: nav.placeRoom(ws, at, size[0], size[1], hand, true) };
+  };
+  const paint = () => {
+    paintFrame = null;
+    drop = dropAt(lx, ly);
+    const v = nav.visible(ws), k = v.z, g = ghost.style;
+    g.display = drop ? '' : 'none';
+    if (!drop) return;
+    const box = drop.start ? { x: v.x - size[0] + 24 / k / VW * 100, y: nav.toSpace(ws, lx, ly).y - (14 / k / VH) * 100, w: size[0], h: size[1] }
+      : drop.end ? { x: v.x + v.w - 24 / k / VW * 100, y: nav.toSpace(ws, lx, ly).y - (14 / k / VH) * 100, w: size[0], h: size[1] } : drop.spot;
+    g.left = ((box.x - v.x) / 100) * VW * k + 'px';
+    g.top = ((box.y - v.y) / 100) * VH * k + 'px';
+    g.width = (box.w / 100) * VW * k + 'px';
+    g.height = (box.h / 100) * VH * k + 'px';
+  };
+  const schedulePaint = () => { if (paintFrame == null) paintFrame = requestAnimationFrame(paint); };
+  const move = (ev) => {
+    if (ev.pointerId !== id) return;
+    if (!ghost) {
+      if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 6) return;
+      ghost = document.createElement('div');
+      ghost.style.cssText = 'position:absolute;pointer-events:none;z-index:60;border:1px dashed rgba(255,255,255,.4);border-radius:10px;background:rgba(255,255,255,.04)';
+      viewport.appendChild(ghost);
+    }
+    lx = ev.clientX;
+    ly = ev.clientY;
+    schedulePaint();
+    feedEdgePan(ws, onBoard(ev.clientX, ev.clientY), ev.clientY, schedulePaint);
+  };
+  const finish = (commit) => {
+    if (finished) return;
+    finished = true;
+    stopEdgePan(ws);
+    if (paintFrame != null) {
+      cancelAnimationFrame(paintFrame);
+      paintFrame = null;
+      if (commit && ghost) paint();
+    }
+    b.removeEventListener('pointermove', move);
+    b.removeEventListener('pointerup', up);
+    b.removeEventListener('pointercancel', cancel);
+    b.removeEventListener('lostpointercapture', cancel);
+    window.removeEventListener('blur', blur);
+    if (b.hasPointerCapture && b.hasPointerCapture(id)) b.releasePointerCapture(id);
+    setDragging(false);
+    if (!ghost) return;
+    ghost.remove();
+    dockCarried = true;
+    setTimeout(() => { dockCarried = false; }, 0);
+    const made = board(() => {
+      const m = commit && drop ? spawn(kind, drop.start ? { start: true, outlined: true } : drop.end ? { end: true, outlined: true } : { ...drop.at, outlined: true }) : null;
+      if (m && drop.at && drop.at.direct) { keepSpaceOrigin(ws); sizeCanvas(ws); save(); }
+      return m;
+    });
+    if ((!made || ((drop.start || drop.end) && !wholly(ws, made))) && keys && keys !== document.body && keys.isConnected && document.activeElement !== keys) keys.focus({ preventScroll: true });
+  };
+  const up = (ev) => { if (ev.pointerId === id) finish(true); };
+  const cancel = (ev) => { if (ev.pointerId === id) finish(false); };
+  const blur = () => finish(false);
+  if (e.isTrusted) b.setPointerCapture(id);
+  b.addEventListener('pointermove', move);
+  b.addEventListener('pointerup', up);
+  b.addEventListener('pointercancel', cancel);
+  b.addEventListener('lostpointercapture', cancel);
+  window.addEventListener('blur', blur);
+}
+/* A wheel over a page behind another window scrolls that page. The shield that keeps a first click out of it (app.css
+   .pgv::after) would take the wheel, so a copy goes on to the page shown there. The wheel itself still reaches nav, which
+   reads the gesture from it at its true time: vertical stays the page's, sideways is the swipe. The page's own report
+   back (onWheel) says it is behind, which nav leaves out. */
+function backPageWheel(e) {
+  if (e.ctrlKey || document.body.classList.contains('busy') || !(e.target instanceof Element) || !e.target.classList.contains('pgv')) return;
+  // every wheel of a swipe nav took is the swipe's, its tail over a page included
+  if (nav.swiping(e.timeStamp)) return;
+  const win = e.target.closest('.win');
+  const wv = win && !win.classList.contains('front') && e.target.querySelector('webview:not(.off)');
+  // a page not loaded yet can't take it: the wheel goes on to nav
+  if (!wv || !livePage(WIN.get(win.dataset.id))) return;
+  e.preventDefault();
+  const b = wv.getBoundingClientRect(), s = b.width / (wv.offsetWidth || b.width) || 1;
+  const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1;
+  const input = { type: 'mouseWheel', x: Math.round((e.clientX - b.left) / s), y: Math.round((e.clientY - b.top) / s),
+    deltaX: -e.deltaX * k, deltaY: -e.deltaY * k, hasPreciseScrollingDeltas: true, canScroll: true };
+  // passed on once nav has seen this wheel too: a sideways swipe over a page behind moves to the next space and the
+  // page gets none of it, its first wheel included (lead 08:5x)
+  setTimeout(() => {
+    if (nav.swiping(e.timeStamp)) return;
+    try {
+      wv.sendInputEvent(input);
+    } catch (err) {
+      console.error(`could not pass a wheel on to the page in ${win.dataset.id}`, err);
+    }
+  }, 0);
+}
+/* Right-click on the empty desktop: make something right there. */
+function desktopCtx(e) {
+  if (SOLO || e.target.closest('.win, .ctx, #dock')) return;
+  const ws = WS[cur];
+  if (!ws) return;
+  const r = viewport.getBoundingClientRect();
+  const at = nav.toSpace(ws, e.clientX, e.clientY);
+  showMenu(e, [
+    { label: 'new agent', hint: '', run: () => spawn('agent', at) },
+    { label: 'new shell', hint: '', run: () => spawn('shell', at) },
+    { label: 'new team', hint: '', run: () => spawn('team', at) },
+    { label: 'new note', hint: '', run: () => spawn('note', at) },
+    { label: 'new page', hint: '', run: () => spawn('page', at) },
+    { label: 'new sub-workspace', hint: '', run: () => spawn('zone') },
+    ...(nav.canCut(ws, at) ? [{ label: 'remove empty space here', hint: '\u2325 drag', run: () => nav.cutAt(ws, at) }] : []),
+    { label: 'add space here', hint: '\u2325 drag', run: () => nav.addAt(ws, at, 100) },
+    { label: 'more workspace to the right', hint: '', run: () => nav.extendRight(ws) },
+    ...(groups ? [{ label: 'see whole workspace', hint: '\u21e71', run: () => groups.seeAll(ws) }] : []),
+  ]);
+}
+/* A link clicked in a terminal opens a page window of its own (lead, item 1): the first beside the terminal, each later
+   one beside the page the link before it opened, while that page is open in the same space. */
+function openLink(id, url) {
+  const L = locate(id);
+  if (!L) return;
+  const P = L.w.linkTo && locate(L.w.linkTo);
+  const prev = P && P.ws === L.ws && P.w.type === 'page' && inSpace(L.ws, P.w, L.w.zone || null) ? P.w : null;
+  const pw = openPageWin(L.ws, url, L.w, prev);
+  if (pw) { L.w.linkTo = pw.id; save(); }
+}
+/* ⌘T: a tab in the page window that has the keys; anywhere else a page window of its own, as the dock's page button
+   makes (lead, item 1). */
+function newPage() {
+  const f = frontWin();
+  const r = f && f.w.type === 'page' && WIN.get(f.w.id);
+  if (r && r.page && r.el.contains(document.activeElement)) { r.page.newTab(''); r.page.focusAddress(); return f.w; }
+  return spawn('page');
+}
+function frontWin() {
+  const ws = WS[cur];
+  if (!ws) return null;
+  const w = ws.windows.find((o) => { const el = elOf(o); return el && el.classList.contains('front') && el.style.display !== 'none'; });
+  return w ? { ws, w } : null;
+}
+/* Select All (⌘A): in a terminal, what it shows; elsewhere in this window, what has the keys. A page's own text is
+   selected by main, which knows the page has the keys. */
+const isEditingTarget = (el) => !!(el && el.closest && el.closest('[contenteditable], input, textarea, .xterm'));
+function selectAll() {
+  const a = document.activeElement;
+  const r = a && [...WIN.values()].find((x) => x.el.contains(a));
+  if (r && r.term && typeof r.term.selectAll === 'function') r.term.selectAll();
+  else document.execCommand('selectAll');
+}
+function withFrontPage(fn) {
+  const f = frontWin();
+  const r = f && WIN.get(f.w.id);
+  return r && r.page ? fn(r.page) : undefined;
+}
+const MENU = {
+  'new-agent': () => spawn('agent'),
+  'new-team': () => spawn('team'),
+  'new-shell': () => spawn('shell'),
+  'new-note': () => spawn('note'),
+  'new-page': () => newPage(),
+  'arrange': () => arrangeCtl && arrangeCtl.press(),
+  'new-page-window': () => spawn('page'),
+  'select-all': () => selectAll(),
+  undo: () => {
+    if (boardStep(true, 'menu')) return;
+    const N = window.FlowNotes;
+    if (N && typeof N.undo === 'function' && N.undo(document.activeElement)) return;
+    const a = document.activeElement;
+    if (isEditingTarget(a)) { document.execCommand('undo'); return; }
+    if (performance.now() - spaceUndoneAt < 400) return;
+    if (spaceUndoFirst()) undoSpace();
+    else if (workspaceUndoReady()) undoWorkspaceClose();
+    else document.execCommand('undo');
+  },
+  redo: () => { if (boardStep(false, 'menu')) return; const N = window.FlowNotes; if (!(N && typeof N.redo === 'function' && N.redo(document.activeElement))) document.execCommand('redo'); },
+  'tab-next': () => withFrontPage((p) => p.stepTab && p.stepTab(1)),
+  'tab-prev': () => withFrontPage((p) => p.stepTab && p.stepTab(-1)),
+  ...Object.fromEntries([1, 2, 3, 4, 5, 6, 7, 8].map((k) => [`tab-${k}`, () => withFrontPage((p) => p.showTab && p.showTab(k))])),
+  'tab-last': () => withFrontPage((p) => p.showTab && p.showTab(9)),
+  // a page window closed in the last 10 s with typing its site guards comes back first, else the front page's tab
+  'tab-reopen': () => reopenHeld() || withFrontPage((p) => p.reopenTab && p.reopenTab()),
+  'page-print': () => withFrontPage((p) => p.print && p.print()),
+  'beside-right': () => besideKeys && besideKeys.key('right'),
+  'beside-left': () => besideKeys && besideKeys.key('left'),
+  'beside-above': () => besideKeys && besideKeys.key('above'),
+  'beside-below': () => besideKeys && besideKeys.key('below'),
+  'new-zone': () => spawn('zone'),
+  'save-page': () => withFrontPage((p) => p.save()),
+  'new-workspace': () => newWorkspace(),
+  'close-window': () => {
+    const f = frontWin();
+    const r = f && WIN.get(f.w.id);
+    if (r && r.page && r.page.closeTab()) return;
+    if (f) closeAsked(f.ws, f.w);
+    else if (SOLO) window.close();
+  },
+  'page-zoom-in': () => withFrontPage((p) => p.zoom(1)),
+  'page-zoom-out': () => withFrontPage((p) => p.zoom(-1)),
+  'page-zoom-reset': () => withFrontPage((p) => p.zoom(0)),
+  search: () => openSearch(),
+  'toggle-sidebar': () => toggleSidebar(),
+  'next-ws': () => step(1),
+  'prev-ws': () => step(-1),
+  'reload-page': () => withFrontPage((p) => p.reload()),
+  'page-back': () => withFrontPage((p) => p.back()),
+  'page-forward': () => withFrontPage((p) => p.forward()),
+  'focus-address': () => withFrontPage((p) => p.focusAddress()),
+  find: () => { const f = frontWin(); const r = f && WIN.get(f.w.id); if (!r) return; if (r.page) r.page.find(); else if (r.term) r.term.find(); },
+  'mode-float': () => setMode(WS[cur], 'float'),
+  'mode-columns': () => setMode(WS[cur], 'columns'),
+  'mode-grid': () => setMode(WS[cur], 'grid'),
+};
+
+/* ---------- other Flow windows saved: patch this one in place, keeping live bodies ---------- */
+function patchObj(o, d, keep) {
+  Object.keys(o).forEach((k) => { if (!(k in d) && !keep.includes(k)) delete o[k]; });
+  Object.keys(d).forEach((k) => { if (!keep.includes(k)) o[k] = d[k]; });
+  return o;
+}
+function applyRemote(s, force = false) {
+  if (workspaceCritical && !force) { pendingRemoteState = s; return; }
+  if (!s || s.v !== 11 || !Array.isArray(s.ws)) return;
+  /* An edit here is still waiting for its save: send it against the state it was made on, so the store merges both, and
+     take the merged copy the store sends back instead of this one, which would drop the edit. */
+  if (saveTimer && !force) {
+    clearTimeout(saveTimer);
+    saveTimer = 0;
+    const doc = snapshot();
+    flow.saveState(doc, { pages: shownPages(), base: stateBase });
+    stateBase = doc;
+    return;
+  }
+  stateBase = JSON.parse(JSON.stringify(s));
+  window.FlowNotes.remote(s.pages);
+  const focused = document.activeElement && document.activeElement.closest ? document.activeElement.closest('.ned') : null;
+  const fkey = focused ? focused.dataset.key : '';
+  const atId = WS[cur] ? WS[cur].id : null;
+  const localWs = new Map(WS.map((ws) => [ws.id, ws]));
+  const localWin = new Map(), localNote = new Map();
+  WS.forEach((ws) => {
+    [...ws.windows, ...ws.closed].forEach((w) => localWin.set(w.id, w));
+    ws.notes.forEach((n) => localNote.set(n.id, n));
+  });
+  // a page live here is the one place its tabs are current: another window's save can carry an older copy
+  const winKeep = (id) => [...(busy.has(id) ? ['x', 'y', 'w', 'h', 'max'] : []), ...(fkey === `win:${id}` ? ['note'] : []),
+    ...(livePage(WIN.get(id)) ? ['tabs', 'tab'] : [])];
+  const noteKeep = (id) => [...(fkey === `note:${id}` ? ['body'] : []), ...(fkey === `title:${id}` ? ['title', 'titleSet'] : [])];
+  // Each Flow window owns which space it shows and every view it has used. Main and pop-outs merge the workspace's
+  // contents, but a save from another window never switches or moves this window's board.
+  const wsKeep = ['at', 'pan', 'panY', 'zoom', 'mainPan', 'mainPanY', 'mainZoom'];
+  const zoneKeep = ['pan', 'panY', 'zoom'];
+  WS = s.ws.map((d) => {
+    const old = localWs.get(d.id);
+    const reuse = (list, map, keep) => (list || []).map((x) => (map.has(x.id) ? patchObj(map.get(x.id), x, keep(x.id)) : x));
+    const zoneMap = new Map(old ? old.zones.map((zn) => [zn.id, zn]) : []);
+    const merged = {
+      ...d,
+      // a doc saved before any window built this workspace has no mode: it keeps the one it has (layout, a pop-out
+      // restored at start came up tiled)
