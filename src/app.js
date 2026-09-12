@@ -554,3 +554,559 @@ async function closeWorkspace(ws) {
     if (workspaceCloseState(ws) !== beforeLockState) throw new Error('the workspace changed while its team lock settled');
     workspaceCritical = true;
     pendingRemoteState = null;
+    await syncState();
+    if (!WS.includes(ws) || workspaceCloseState(ws) !== beforeLockState) throw new Error('the workspace changed before its final shutdown');
+    const freshRevision = await flow.workspaceRevision(ws.id);
+    const freshState = workspaceCloseState(ws);
+    const fresh = teams && typeof teams.closeSnapshot === 'function' ? await teams.closeSnapshot(ws) : null;
+    const freshChoices = fresh && Array.isArray(fresh.choices) ? fresh.choices : workspaceVM(ws);
+    if (pendingChangesWorkspace(ws) || workspaceCloseState(ws) !== freshState || workspaceCloseRuntime(fresh, freshChoices) !== preparedRuntime) throw new Error('the workspace changed before its final shutdown');
+    if (fresh && fresh.blocked && fresh.blocked.length) throw new Error('the final team inventory is incomplete');
+    const selectedTeams = ((fresh && fresh.restore) || []).filter((r) => {
+      const w = workspaceTerminals(ws).find((x) => x.id === r.teamId);
+      return w && (!w.host || answer.has(r.teamId));
+    });
+    const operations = (await preflightWorkspaceTerminals(ws, answer, selectedTeams))
+      .sort((a, b) => Number(!!b.w.host) - Number(!!a.w.host) || Number(!!b.w.attach) - Number(!!a.w.attach));
+    if (pendingChangesWorkspace(ws) || workspaceCloseState(ws) !== freshState) throw new Error('the workspace changed during terminal preflight');
+    const i = WS.indexOf(ws), keepId = WS[cur] && WS[cur].id, model = cloneModel(ws);
+    restoreIndex = i;
+    restoreKeepId = keepId;
+    shutdown = await endWorkspaceTerminals(ws, operations, freshState);
+    if (pendingChangesWorkspace(ws) || workspaceCloseState(ws) !== freshState) throw new Error('the workspace changed before commit');
+    for (const w of [...model.windows, ...model.closed]) if (shutdown.killed.has(w.id) && w.host && w.attach) delete w.attach;
+    const teamSnapshots = teamRestoreInto(model, selectedTeams);
+    const afterIds = WS.filter((x) => x !== ws).map((x) => x.id);
+    const afterCurrentId = keepId === ws.id ? afterIds[Math.min(i, afterIds.length - 1)] : keepId;
+    const undo = { ws: model, i, keepId, popouts, killed: [...shutdown.killed], teams: teamSnapshots, afterIds, afterCurrentId };
+    workspaceUndos().splice(0, Infinity, undo);
+    const expected = workspaceComparable(ws);
+    detachWorkspace(ws, false);
+    detached = true;
+    const committed = await flow.closeWorkspaceState(snapshot(), ws.id, expected, { pages: shownPages(), base: stateBase, revision: freshRevision });
+    if (!committed || !committed.ok) {
+      if (committed && committed.doc) pendingRemoteState = committed.doc;
+      throw new Error('the workspace changed before its state committed');
+    }
+    applyRemote(committed.doc, true);
+    if (WS.some((item) => item.id === ws.id)) throw new Error('the workspace remained after its state committed');
+    closed = true;
+    workspaceClosedAt = performance.now();
+    dropWorkspaceHeld(ws);
+    popouts = [];
+    return true;
+  } catch (err) {
+    const recovery = [];
+    if (shutdown) recovery.push(...await restoreWorkspaceTerminals(ws, shutdown.operations));
+    if (detached && !WS.includes(ws)) attachWorkspace(ws, restoreIndex < 0 ? WS.length : Math.min(restoreIndex, WS.length), restoreKeepId === ws.id);
+    workspaceUndos().splice(0, Infinity, ...oldUndos);
+    if (shutdown || detached || popouts.length || pendingRemoteState) {
+      pendingRemoteState = null;
+      try {
+        const merged = await flushNow();
+        if (merged) applyRemote(merged, true);
+      } catch (flushError) { recovery.push(`state: ${(flushError && flushError.message) || flushError}`); }
+    }
+    if (popouts.length) {
+      try { await reopenWorkspacePopouts(ws, popouts); } catch (reopenError) { recovery.push(`pop-outs: ${(reopenError && reopenError.message) || reopenError}`); }
+    }
+    console.error(`could not close workspace ${ws.name}`, recovery.length ? new Error(`${(err && err.message) || err}; recovery failed: ${recovery.join('; ')}`) : err);
+    return false;
+  } finally {
+    workspaceCritical = false;
+    document.body.classList.remove('workspace-committing');
+    if (teamLocked && teams && typeof teams.endClose === 'function') teams.endClose(ws);
+    const pending = pendingRemoteState;
+    pendingRemoteState = null;
+    closingWorkspace = false;
+    if (pending) applyRemote(pending);
+  }
+}
+async function openDetachedTerm(ws, w) {
+  const r = await flow.term.open(termRequest(ws, w));
+  if (!r || !r.ok) throw new Error((r && r.error) || `could not resume ${w.id} after undo`);
+  flow.term.detach(w.id);
+}
+async function restoreUndoTerminal(ws, w, panes) {
+  if (await flow.term.exists(w.id, remoteOpts(w))) return;
+  if (panes && panes.length) {
+    const restored = await flow.term.restoreAttach(w.id, { ...remoteOpts(w), expectedPanes: panes });
+    if (!restored || !restored.ok) throw new Error((restored && restored.error) || `could not restore ${w.id}`);
+    return;
+  }
+  await openDetachedTerm(ws, w);
+}
+let undoingWorkspace = false;
+/* ⌘Z on the bare board takes back the newer of a closed workspace and a change of space (nav: cut, added, more at the
+   right). One press can reach this window both as the key and as Edit > Undo: the second is the same press. */
+let workspaceClosedAt = -Infinity, spaceUndoneAt = -Infinity;
+const spaceUndoFirst = () => nav.spaceUndoReady(workspaceUndoReady() ? workspaceClosedAt : -Infinity);
+function undoSpace() {
+  if (!nav.undoSpace(workspaceUndoReady() ? workspaceClosedAt : -Infinity)) return false;
+  spaceUndoneAt = performance.now();
+  return true;
+}
+function workspaceUndoReady() {
+  const u = workspaceUndos().at(-1), currentId = WS[cur] && WS[cur].id;
+  return !!u && !undoingWorkspace && !closingWorkspace && !WS.some((x) => x.id === u.ws.id)
+    && JSON.stringify(WS.map((x) => x.id)) === JSON.stringify(u.afterIds) && currentId === u.afterCurrentId;
+}
+async function undoWorkspaceClose() {
+  if (!workspaceUndoReady()) return false;
+  undoingWorkspace = true;
+  try { return await restoreClosedWorkspace(); } finally { undoingWorkspace = false; }
+}
+async function restoreClosedWorkspace() {
+  const stack = workspaceUndos(), u = stack[stack.length - 1];
+  const killed = new Set(u.killed || []), teams = new Map((u.teams || []).map((r) => [r.teamId, r.panes]));
+  const records = [...u.ws.windows, ...u.ws.closed].filter((w) => isTerm(w) && killed.has(w.id));
+  try {
+    for (const w of records) {
+      const wait = ending.get(w.id) || (w.mate && ending.get(w.mate.lead));
+      if (wait) await wait.catch(() => {});
+      await restoreUndoTerminal(u.ws, w, teams.get(w.id));
+    }
+  } catch (err) {
+    console.error(`could not restore ${u.ws.name} after undo`, err);
+    return false;
+  }
+  stack.pop();
+  attachWorkspace(u.ws, u.i, u.keepId === u.ws.id);
+  const keep = WS.findIndex((x) => x.id === u.keepId);
+  if (keep >= 0 && u.keepId !== u.ws.id && cur !== keep) go(keep);
+  try {
+    await flushNow();
+    await reopenWorkspacePopouts(u.ws, u.popouts || []);
+  } catch (err) {
+    console.error(`could not finish restoring ${u.ws.name} after undo`, err);
+  }
+  return true;
+}
+function flash(el) {
+  if (!el) return;
+  el.classList.remove('flash');
+  void el.offsetWidth;
+  el.classList.add('flash');
+}
+function measure() {
+  const r = viewport.getBoundingClientRect();
+  VW = Math.max(1, r.width);
+  VH = Math.max(1, r.height);
+}
+function selectAll(el) {
+  const r = document.createRange();
+  r.selectNodeContents(el);
+  const s = getSelection();
+  s.removeAllRanges();
+  s.addRange(r);
+}
+const scheduleSidebar = () => { clearTimeout(sideTimer); sideTimer = setTimeout(renderSidebar, 300); };
+
+/* ---------- titles: Claude Code puts ✳ (idle) or a spinner (working) in front of its terminal title ---------- */
+const GLYPH = /^([\u2800-\u28ff✳✻✽✶✢·])\s*/;
+function splitTitle(t) {
+  const s = String(t || '').trim();
+  const m = GLYPH.exec(s);
+  return m ? { glyph: m[1], text: s.slice(m[0].length).trim() } : { glyph: '', text: s };
+}
+/* A terminal's title names it only when it names its conversation: the CLI's own name ("Free Code", "Claude Code") or a
+   prompt line ("❯") never does (term.js nameFrom; owner, Nov 2 14:54), also when it was saved before that rule. */
+const oscName = (t) => (t && window.FlowTerm.nameFrom(t) ? t : '');
+function termTitle(w) {
+  const r = WIN.get(w.id);
+  return w.title || oscName(r && r.osc) || oscName(w.osc) || w.label || (w.type === 'team' ? 'new team' : w.cmd === 'shell' ? 'shell' : 'new agent');
+}
+/* A page window's name: the page's own name (notes keeps the one the owner gives it), else its shown tab's title. */
+function pageName(ws, w) {
+  const t = Array.isArray(w.tabs) ? w.tabs[w.tab || 0] : null;
+  const n = noteById(ws, w.noteId);
+  const url = (t && t.url) || (n && n.url) || '';
+  return (url && window.FlowNotes.nameOf(url)) || (t && t.title) || (n && n.title) || 'untitled';
+}
+function winTitle(ws, w) {
+  if (isTerm(w)) return termTitle(w);
+  if (w.type === 'page') return pageName(ws, w);
+  return window.FlowNotes.noteName(noteById(ws, w.noteId));
+}
+/* After a terminal's title: its team, the host it runs on, or for a shell nobody has titled yet, its folder. */
+function whereOf(ws, w) {
+  const team = window.FlowTeams && window.FlowTeams.label(w);
+  if (team) return team;
+  if (w.host) return w.where || '';
+  const r = WIN.get(w.id);
+  return w.cmd === 'shell' && !w.title && !oscName(r && r.osc) && !oscName(w.osc) ? tilde(w.cwd || ws.folder) : '';
+}
+/* A page window with two or more tabs leaves its title bar empty: the tab strip names them. */
+const pageTitle = (ws, w) => (Array.isArray(w.tabs) && w.tabs.length > 1 ? '' : winTitle(ws, w));
+function titleHTML(ws, w) {
+  if (isTerm(w)) {
+    return `${lights()}<div class="title"><span class="tt">${esc(termTitle(w))}</span><span class="where">${esc(whereOf(ws, w))}</span></div><button class="act${window.FlowNotes.lit(ws, w) ? ' on' : ''}" data-act="note" title="${w.type === 'team' ? 'this team\'s note' : 'this agent\'s note'}">✎</button>`;
+  }
+  if (w.type === 'page') return `${lights()}<div class="title">${esc(pageTitle(ws, w))}</div><button class="act${window.FlowNotes.lit(ws, w) ? ' on' : ''}" data-act="note" title="this page's note">✎</button>`;
+  if (w.type === 'note') return `${lights()}<div class="title"></div><span class="act"></span>`;
+  return `${lights()}<div class="title">${esc(winTitle(ws, w))}</div><span class="act"></span>`;
+}
+function renderTitle(ws, w) {
+  const r = WIN.get(w.id);
+  if (!r) return;
+  r.tb.innerHTML = titleHTML(ws, w);
+}
+function updateNoteTitle(ws, n, except) {
+  ws.windows.filter((w) => w.noteId === n.id).forEach((w) => {
+    const r = WIN.get(w.id);
+    if (!r) return;
+    const t = w.type !== 'note' && r.tb.querySelector('.title');
+    if (t) t.textContent = w.type === 'page' ? pageTitle(ws, w) : n.title || 'untitled';
+    r.el.querySelectorAll(`.ned[data-key="title:${CSS.escape(n.id)}"]`).forEach((ed) => {
+      if (ed !== except && ed !== document.activeElement && ed.innerText.replace(/\n$/, '') !== (n.title || '')) ed.textContent = n.title || '';
+    });
+  });
+}
+
+/* ---------- windows: the frame is built once; the body (a live terminal or web page) is never rebuilt ---------- */
+function bodyHTML(w) {
+  const N = window.FlowNotes;
+  if (w.type === 'term' || w.type === 'team') return `<div class="body"><div class="termhost"></div>${N.paneHTML(w)}</div>`;
+  if (w.type === 'note') return N.noteHTML(w);
+  return `<div class="body"><div class="pn"><div class="pgc"></div></div>${N.paneHTML(w)}</div>`;
+}
+const fillEditors = (ws, w, force) => window.FlowNotes.fill(ws, w, force);
+/* A window resizes from each edge and corner (owner, after 14:03), its grips across the border (app.css). The bottom
+   right one comes first: tests and the old single grip take the first .rz. */
+const RZ = ['se', 'n', 's', 'e', 'w', 'nw', 'ne', 'sw'].map((d) => `<div class="rz" data-rz="${d}"></div>`).join('');
+function buildWin(ws, w) {
+  const el = document.createElement('div');
+  el.className = `win ${w.type}`;
+  el.dataset.id = w.id;
+  const tb = document.createElement('div');
+  tb.className = 'tb';
+  el.appendChild(tb);
+  el.insertAdjacentHTML('beforeend', bodyHTML(w) + RZ);
+  WIN.set(w.id, { el, tb, host: el.querySelector('.termhost, .pgc'), term: null, page: null, cur: null, osc: '', vis: null });
+  renderTitle(ws, w);
+  window.FlowNotes.attach(ws, w);
+  fillEditors(ws, w);
+  el.classList.toggle('noted', !!w.noted);
+  el.style.zIndex = ++z;
+  const id = w.id;
+  el.addEventListener('pointerdown', (e) => { const L = locate(id); if (L) onPointerDown(e, L.ws, L.w); });
+  el.addEventListener('click', (e) => { const L = locate(id); if (L) onClick(e, L.ws, L.w); });
+  el.addEventListener('contextmenu', (e) => {
+    const L = locate(id);
+    // text being edited gets the Mac's Cut, Copy and Paste (main's textMenu); the window's menu stays on the rest
+    if (!L || (!isTerm(L.w) && (e.target.isContentEditable || e.target.closest('input, textarea')))) return;
+    openCtx(e, L.ws, L.w);
+  });
+  el.addEventListener('dblclick', (e) => {
+    const t = e.target.closest('.tb');
+    if (!t || t.parentElement !== el || e.target.closest('[data-l], button')) return;
+    const L = locate(id);
+    if (L) toggleMax(L.ws, L.w);
+  });
+  canvasOf(ws).appendChild(el);
+  return el;
+}
+let warnedTerm = false, warnedPage = false;
+// window id -> the kill of its session while that runs (endAgent). Its terminal opens only once the kill has settled,
+// or it would attach to the session the kill then ends (installed, item 71).
+const ending = new Map();
+function ensureBody(ws, w) {
+  const r = WIN.get(w.id);
+  if (!r || !r.host || !r.el.isConnected || r.term || r.page) return;
+  if (nav.away(ws, w)) return;
+  if (isTerm(w)) {
+    if (!window.FlowTerm) { if (!warnedTerm) { warnedTerm = true; console.error('term.js did not load, so terminals cannot start'); } return; }
+    const k = ending.get(w.id);
+    if (k) {
+      if (r.ending !== k) {
+        r.ending = k;
+        const after = () => { if (ending.get(w.id) === k) ending.delete(w.id); openAfterEnd(w.id); };
+        k.then(after, after);
+      }
+      return;
+    }
+    r.term = window.FlowTerm.mount(r.host, termOpts(ws, w));
+    r.vis = null;
+  } else if (w.type === 'page') {
+    if (!window.FlowPage) { if (!warnedPage) { warnedPage = true; console.error('page.js did not load, so pages cannot open'); } return; }
+    const n = noteById(ws, w.noteId);
+    r.page = window.FlowPage.mount(r.host, pageOpts(w.id, n));
+    r.vis = null;
+    // buildWin handed this window to notes before its page existed, so the page's highlights are painted only now
+    fillEditors(ws, w);
+  }
+}
+/* A terminal held back while its session was being ended opens now, with the keys if its window is in front and
+   nothing else has them. */
+function openAfterEnd(id) {
+  const L = locate(id), r = WIN.get(id);
+  if (!L || !r) return;
+  const a = document.activeElement, keys = r.el.classList.contains('front') && (!a || a === document.body || r.el.contains(a));
+  ensureBody(L.ws, L.w);
+  syncVisible();
+  if (keys && r.term) r.term.focus();
+}
+function disposeBody(r) {
+  if (r.term) { r.term.dispose(); r.term = null; }
+  if (r.page) { r.page.dispose(); r.page = null; }
+  r.vis = null;
+}
+function termRequest(ws, w) {
+  const cmd = w.cmd === 'shell' ? 'shell' : 'claude';
+  return {
+    id: w.id, cmd, cwd: w.host ? w.cwd || '~' : expand(w.cwd || ws.folder), host: w.host || undefined, attach: w.attach || undefined,
+    sessionId: w.sessionId || undefined, resume: cmd === 'claude' && !!w.sessionId, forkFrom: w.forkFrom || undefined,
+    team: w.type === 'team', vmFolder: w.host ? ws.hostFolder || '~' : undefined,
+  };
+}
+function termOpts(ws, w) {
+  const id = w.id;
+  return {
+    ...termRequest(ws, w),
+    onTitle: (t) => onTermTitle(id, t),
+    onOpened: (res) => onTermOpened(id, res),
+    onLink: (url) => openLink(id, url),
+    onFocus: () => { const L = locate(id); if (L) bringFront(L.ws, L.w); },
+    panesFrom: 'app',
+    onExit: () => { if (window.FlowTeams) window.FlowTeams.onExit(id); },
+    onMateDragStart: (pane, e) => { if (window.FlowTeams) window.FlowTeams.startPaneDrag(id, pane, e); },
+    onCannot: (text) => toast(text, 5000),
+    onDownload: (file) => { const L = locate(id); if (L && window.FlowFiles) window.FlowFiles.downloaded(L.ws, { state: 'completed', file, url: '' }, L.w.zone); },
+  };
+}
+function onTermTitle(id, t) {
+  const r = WIN.get(id);
+  const L = locate(id);
+  if (!r || !L) return;
+  const { text } = splitTitle(t);
+  if (text && text !== r.osc) {
+    r.osc = text;
+    if (!L.w.title) renderTitle(L.ws, L.w);
+    if (L.w.osc !== text) { L.w.osc = text; save(); }
+    scheduleSidebar();
+  }
+}
+function onTermOpened(id, res) {
+  const L = locate(id);
+  if (!L || !res) return;
+  // the terminal itself says why it could not start (term.js notice); no toast repeats it
+  if (!res.ok) return;
+  if (window.FlowTeams) window.FlowTeams.onOpened(id, res);
+}
+// A drop into a page, or a drag leaving it, is seen only by the page, which says so (page.js onDragDone): the shield
+// over pages behind comes back, unless the drag goes on over this window within 150 ms.
+let fileDragTimer = 0;
+const fileDragDone = () => { clearTimeout(fileDragTimer); fileDragTimer = setTimeout(() => document.body.classList.remove('filedrag'), 150); };
+function pageOpts(id, n) {
+  const L = locate(id);
+  return {
+    id, url: (n && n.url) || '',
+    tabs: L && Array.isArray(L.w.tabs) && L.w.tabs.length ? L.w.tabs : undefined,
+    tab: L && L.w.tab,
+    onNavigate: (nav) => { onPageNav(id, nav && nav.url); const L = locate(id); if (L) window.FlowNotes.follow(L.ws, L.w); },
+    onPage: (pg) => { if (pg) window.FlowNotes.seen(pg.url, pg); },
+    onMark: (text) => window.FlowNotes.onMark(id, text),
+    onRedirect: (r) => { if (r) window.FlowNotes.moved(r.from, r.to); },
+    nameOf: (u) => window.FlowNotes.nameOf(u),
+    onClip: (text, url) => window.FlowNotes.clip(id, text, url),
+    onFocus: () => { const L = locate(id); if (L) bringFront(L.ws, L.w); },
+    onClose: () => { const L = locate(id); if (L) closeWin(L.ws, L.w); },
+    saved: window.FlowSidebar ? window.FlowSidebar.savedHooks(id) : undefined,
+    onDownload: (d) => { const L = locate(id); if (L && window.FlowFiles) window.FlowFiles.downloaded(L.ws, d, L.w.zone); },
+    onTabs: (tabs, tab) => {
+      const L = locate(id);
+      if (!L) return;
+      L.w.tabs = tabs;
+      L.w.tab = tab;
+      window.FlowNotes.follow(L.ws, L.w);
+      const t = WIN.get(id) && WIN.get(id).tb.querySelector('.title');
+      if (t && t.textContent !== pageTitle(L.ws, L.w)) t.textContent = pageTitle(L.ws, L.w);
+      scheduleSidebar();
+      save();
+    },
+    onWheel: (w) => nav.wheel({ ...w, behind: !(WIN.get(id) && WIN.get(id).el.classList.contains('front')) }),
+    onDragDone: () => fileDragDone(),
+    onPinch: (p) => nav.pinch(p),
+    // a link the page opens as a page, not a tab (shift-click, "Open Link in New Page"): a page window beside this one
+    onOpen: (url) => { const L = locate(id); if (L) openPageWin(L.ws, url, L.w); },
+    // a tab dragged off the strip or moved from its menu: a page window of its own, at the drop or beside this one
+    onTabOut: (kept, pt) => { const L = locate(id); return !!L && !!openPageWin(L.ws, kept.url, L.w, null, { tabs: [kept], tab: 0 }, pt); },
+    showMenu: (e, items) => showMenu(e, items),
+  };
+}
+function onPageNav(id, url) {
+  const L = locate(id);
+  if (!L) return;
+  const n = noteById(L.ws, L.w.noteId);
+  if (!n) return;
+  let changed = false;
+  if (url && url !== 'about:blank' && url !== n.url) { n.url = url; changed = true; }
+  if (changed) { scheduleSidebar(); save(); }
+}
+
+/* Bodies of the space on screen are visible; the rest are told they are hidden. */
+function syncVisible() {
+  WS.forEach((ws, i) => {
+    const on = SOLO ? ws.id === SOLO : i === cur;
+    ws.windows.forEach((w) => {
+      const r = WIN.get(w.id);
+      if (!r) return;
+      const vis = on && inSpace(ws, w) && !nav.away(ws, w);
+      const h = r.term || r.page;
+      if (h && r.vis !== vis) { r.vis = vis; h.setVisible(vis); }
+    });
+  });
+}
+function fitSoon(ms) {
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(() => { WIN.forEach((r) => { if (r.term && r.vis) r.term.fit(); }); }, ms == null ? 420 : ms);
+}
+
+/* ---------- geometry ---------- */
+function apply(w, pos) {
+  const r = WIN.get(w.id);
+  if (!r) return;
+  r.cur = { x: pos.x, y: pos.y, w: pos.w, h: pos.h };
+  const s = r.el.style;
+  s.left = (pos.x / 100) * VW + 'px';
+  s.top = (pos.y / 100) * VH + 'px';
+  s.width = (pos.w / 100) * VW + 'px';
+  s.height = (pos.h / 100) * VH + 'px';
+  groupsSoon();
+}
+/* A group's frame is the box around its windows: it is drawn again once whatever moved them has drawn its frame. */
+let groupsFrame = 0;
+function groupsSoon() {
+  if (groupsFrame || !groups) return;
+  groupsFrame = requestAnimationFrame(() => { groupsFrame = 0; groups.render(); });
+}
+const zoneOf = (ws, w) => (w.zone ? zoneById(ws, w.zone) || null : null);
+const membersOf = (ws, zn) => ws.windows.filter((w) => zoneOf(ws, w) === zn);
+function layout(ws) {
+  if (!canvasOf(ws)) return;
+  const here = ws.windows.filter((w) => inSpace(ws, w) && !nav.away(ws, w));
+  ws.windows.forEach((w) => { const el = elOf(w); if (el) el.style.display = here.includes(w) ? '' : 'none'; });
+  place(ws, here);
+  sizeCanvas(ws);
+  groupsSoon();
+}
+/* A space's windows where they go: their own places when the workspace floats, else its columns or grid. */
+function place(ws, here) {
+  if (ws.mode === 'float') {
+    here.forEach((w) => apply(w, w));
+  } else {
+    const main = here.filter((w) => w.x < 99);
+    const n = Math.max(1, main.length);
+    const top = 6.6, bottom = nav.bottom(), left = 1.2, right = 98.8, gap = 1.1, vgap = 1.8;
+    const cols = ws.mode === 'columns' ? n : Math.ceil(Math.sqrt(n));
+    const rows = Math.max(1, Math.ceil(n / cols));
+    const cw = (right - left - gap * (cols - 1)) / cols;
+    const rh = (bottom - top - vgap * (rows - 1)) / rows;
+    main.forEach((w, k) => apply(w, { x: left + (k % cols) * (cw + gap), y: top + Math.floor(k / cols) * (rh + vgap), w: cw, h: rh }));
+    here.filter((w) => !main.includes(w)).forEach((w) => apply(w, w));
+  }
+}
+/* nav's swipe shows the space beside this one while the fingers bring it in (nav, batch 7): peek(ws, sid) lays out and
+   shows that space's windows in ws's canvas as showSpace would and changes nothing else (ws.at, the views, the
+   sidebar, nothing saved); nav moves them with their own transform. peek(ws) puts back what layout shows. Windows in a
+   pop-out stay out. */
+function peek(ws, sid) {
+  if (sid === undefined) { layout(ws); syncVisible(); return []; }
+  const to = sid && zoneById(ws, sid) ? sid : null;
+  const list = ws.windows.filter((w) => inSpace(ws, w, to) && !nav.away(ws, w));
+  list.forEach((w) => { const el = elOf(w); if (el) el.style.display = ''; ensureBody(ws, w); });
+  place(ws, list);
+  return list.map((w) => {
+    const r = WIN.get(w.id), h = r && (r.term || r.page);
+    if (h && r.vis !== true) { r.vis = true; h.setVisible(true); }
+    return r ? { w, el: r.el } : null;
+  }).filter(Boolean);
+}
+const layoutAll = () => shown().forEach(layout);
+const contentEnd = (ws, except, sid) => nav.contentEnd(ws, except, sid);
+const contentStart = (ws, except, sid) => nav.contentStart(ws, except, sid);
+const sizeCanvas = (ws) => nav.sizeCanvas(ws);
+const setPan = (ws, p, animate) => nav.setPan(ws, p, animate);
+const edges = () => nav.edges();
+function raise(ws, w) {
+  ws.windows.forEach((o) => { const el = elOf(o); if (el) el.classList.toggle('front', o === w); });
+  const el = w && elOf(w);
+  // above every saved z of the workspace: a pop-out counts its own, so a window raised there can be ahead of this count
+  z = Math.max(z, ...ws.windows.map((o) => o.z || 0));
+  if (el) el.style.zIndex = ++z;
+}
+function bringFront(ws, w) {
+  raise(ws, w);
+  // already in front of every saved window: the order is unchanged, so a focus (one coming back with a restored
+  // terminal) saves nothing
+  if (w && ws.windows.every((o) => o === w || (o.z || 0) < (w.z || 0))) return;
+  if (w && w.z !== z) { w.z = z; save(); }
+}
+function captureFloat(ws) {
+  ws.windows.forEach((w) => { const r = WIN.get(w.id); if (r && r.cur) Object.assign(w, { x: r.cur.x, y: r.cur.y, w: r.cur.w, h: r.cur.h }); });
+}
+function setMode(ws, m) {
+  if (!['float', 'columns', 'grid'].includes(m) || ws.mode === m) return;
+  if (ws.mode === 'float') captureFloat(ws);
+  ws.mode = m;
+  layout(ws);
+  renderModes();
+  fitSoon();
+  save();
+}
+/* The float, columns and grid buttons left with the arrange control (batch 8): a workspace's mode changes no control. */
+function renderModes() {}
+function whereIs(ws, w) {
+  const zn = zoneOf(ws, w);
+  if (zn) return `in ${zn.name}`;
+  const r = WIN.get(w.id);
+  if (!r || !r.cur || ws !== WS[cur]) return '';
+  const v = nav.visible(ws);
+  if (r.cur.x >= v.x + v.w - 0.3) return 'off to the right';
+  if (r.cur.x + r.cur.w <= v.x + 0.3) return 'off to the left';
+  return '';
+}
+function focusWin(ws, w) {
+  if (!w) return;
+  if (nav.away(ws, w)) { nav.focusAway(ws, w); return; }
+  const r = WIN.get(w.id);
+  if (!r) return;
+  if (!inSpace(ws, w)) showSpace(ws, w.zone || null);
+  if (ws === WS[cur] && r.cur) nav.reveal(ws, r.cur);
+  bringFront(ws, w);
+  flash(r.el);
+  keysTo(ws, w, r);
+}
+/* The keys to w's window, as focusWin gives them, without revealing or flashing it (a title-bar click or drag). */
+function keysTo(ws, w, r = WIN.get(w.id)) {
+  if (!r) return;
+  if (r.term) r.term.focus();
+  else if (r.page) r.page.focus();
+  else if (w.type === 'note') window.FlowNotes.focus(ws, w);
+}
+const collides = (ws, x, y, w, h, sid) => nav.collides(ws, x, y, w, h, sid);
+const fitStartingLayout = () => nav.fitStart(WS);
+const freeSpot = (ws, w, h, sid, clear) => nav.freeSpot(ws, w, h, sid, clear);
+/* Moves windows of a space by dx, dy % for room opened in the space: at once (not with their own slide), or with it
+   when slide is set, so windows that make way in view are seen to move; columns or a grid float first, as a drag does. */
+function moveWindows(ws, wins, dx, dy, slide) {
+  if (ws.mode !== 'float') { captureFloat(ws); ws.mode = 'float'; renderModes(); }
+  wins.forEach((w) => { w.x += dx; w.y += dy; if (w.max) { w.max.x += dx; w.max.y += dy; } });
+  if (!slide) track.classList.add('noanim');
+  layout(ws);
+  if (!slide) requestAnimationFrame(() => requestAnimationFrame(() => track.classList.remove('noanim')));
+  save();
+}
+/* Window geometry stays nonnegative, but an edge drag may carry the camera past the old origin. Shift this space and
+   its camera together only when the held item is finally left there. Nothing on screen moves. */
+function keepSpaceOrigin(ws, sid = curSpace(ws)) {
+  const here = [...ws.windows, ...ws.closed].filter((w) => inSpace(ws, w, sid));
+  const xs = here.map((w) => w.x).filter(Number.isFinite), ys = here.map((w) => w.y).filter(Number.isFinite);
+  const left = Math.min(0, ...xs), top = Math.min(4.5, ...ys);
+  if (left >= 0 && top >= 4.5) return;
+  const dx = -left, dy = 4.5 - top, canvas = canvasOf(ws), onScreen = sid === curSpace(ws);
+  track.classList.add('noanim');
+  if (canvas) canvas.classList.remove('anim');
+  void track.offsetWidth;
+  here.forEach((w) => {
+    if (Number.isFinite(w.x)) w.x += dx;
