@@ -1,0 +1,33 @@
+/* FlowTerm: the mockup's Claude Code window body (.cc), around a real xterm. */
+.fterm{position:relative;flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;background:#0c0c0c;color:#e8e8e8;font:11.4px/1.55 "SF Mono",ui-monospace,Menlo,Monaco,Consolas,monospace;padding:8px 12px 6px;overflow:hidden;-webkit-font-smoothing:antialiased}
+.fterm-box{position:relative;flex:1;min-width:0;min-height:0;overflow:hidden}
+.fterm .xterm{cursor:text}
+.fterm .xterm .xterm-viewport{background-color:#0c0c0c;overflow-y:hidden}
+.fterm .xterm .xterm-viewport::-webkit-scrollbar{display:none}
+.fterm .xterm .composition-view{background:#262626;color:#e8e8e8}
+
+.fterm.fterm-drop::after{content:"";position:absolute;inset:4px;border:1px dashed rgba(255,255,255,.2);border-radius:6px;pointer-events:none;z-index:3}
+
+.fterm-mates{position:absolute;inset:0;pointer-events:none;z-index:2}
+.fterm-mate{position:absolute;display:flex;align-items:center;pointer-events:auto;cursor:grab;border-radius:4px;transition:background .15s}
+.fterm-mate:hover{background:rgba(255,255,255,.07)}
+.fterm-mate:active{cursor:grabbing}
+.fterm-mate i{flex:none;display:flex;align-items:center;justify-content:center;width:calc(var(--cw, 7px) * 2);height:100%;background:#0c0c0c;border-radius:4px 0 0 4px;pointer-events:none}
+.fterm-mate i::before{content:"";width:6px;height:9px;background:radial-gradient(circle, #6c6c72 .8px, transparent 1px) 0 0/3px 3px}
+.fterm-mate:hover i{background:#1e1e1e}
+.fterm-mate:hover i::before,.fterm-mate.active i::before{background-image:radial-gradient(circle, #b9b9be .8px, transparent 1px)}
+
+.fterm-find{position:absolute;top:6px;right:10px;z-index:3;display:flex;align-items:center;gap:3px;padding:4px 5px 4px 6px;border-radius:8px;background:rgba(30,30,34,.94);border:1px solid #34343a;box-shadow:0 12px 30px rgba(0,0,0,.5);font:12px -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif;color:#e6e6ea;cursor:default}
+.fterm-find[hidden]{display:none}
+.fterm-find input{width:150px;height:22px;border-radius:6px;border:1px solid #2c2c30;background:#1d1d20;color:#e9e9ec;padding:0 7px;font:inherit;outline:none}
+.fterm-find input:focus{border-color:#44444b}
+.fterm-find input::placeholder{color:#5d5d63}
+.fterm-n{min-width:56px;padding:0 4px;text-align:right;font-size:11px;color:#8d8d93;white-space:nowrap}
+.fterm-n.none{color:#5d5d63}
+.fterm-n:empty{display:none}
+.fterm-find button{width:20px;height:20px;border:0;border-radius:5px;padding:0;background:none;color:#8d8d93;font:13px/20px -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;text-align:center;cursor:pointer}
+.fterm-find button:hover{background:rgba(255,255,255,.08);color:#fff}
+
+
+
+
