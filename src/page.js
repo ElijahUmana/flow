@@ -906,3 +906,457 @@
       const t = st();
       const q = t.ask;
       if (!q) return;
+      t.ask = null;
+      renderAsk();
+      q.answer(yes);
+    }
+
+    const ifShown = (t, fn2) => { if (t === st() && !disposed) fn2(); };
+
+    /* ---------- one tab's page ---------- */
+    function setLoading(t, v) {
+      if (t.loading === v) return;
+      t.loading = v;
+      ifShown(t, () => renderLoading(true));
+    }
+    function showError(t, title, detail, retry, recover = false) {
+      t.err = { t: title, d: detail, retry, recover };
+      ifShown(t, renderError);
+    }
+    function clearError(t) {
+      t.err = null;
+      stopRetry(t);
+      ifShown(t, renderError);
+    }
+    function stopRetry(t) {
+      clearTimeout(t.retryTimer);
+      t.retryTimer = 0;
+      t.retryWait = 0;
+    }
+    function retry() {
+      const t = st();
+      const f = t.err && t.err.retry;
+      if (f) f();
+      else clearError(t);
+    }
+
+    /* getWebContentsId() throws until the guest is attached, which is certain by the first commit, failure or dom-ready. */
+    /* Puts the keyboard in a tab's page. A webview that has not attached yet would take the focus whenever it attaches,
+       and that focus brings its window to the front: so the focus waits for the attach and is dropped if the keys go
+       somewhere else first (the owner presses or types outside this page, or Flow puts them in another field). */
+    let pendingFocus = null;
+    function away(e) {
+      if (!container.contains(e.target)) dropPendingFocus();
+    }
+    function dropPendingFocus() {
+      if (!pendingFocus) return;
+      pendingFocus = null;
+      document.removeEventListener('pointerdown', away, true);
+      document.removeEventListener('keydown', away, true);
+      document.removeEventListener('focusin', away, true);
+    }
+    /* Electron lands a webview's focus in two steps, the second up to tens of ms later (far more on a busy machine).
+       When the owner went elsewhere before it landed (the keys to the address, a name field, ⌘K, or a press on another
+       window's title bar, which takes no keys), it gives them back there, and the page's window is not brought forward
+       for it; nor for a tab no longer shown. It waits for the landing, at most 5 s. */
+    function handBack(t) {
+      // a newer focus asked for this tab replaces the one still on its way
+      if (t.handing) t.handing.stop();
+      const wv = t.wv;
+      // the owner's last move counts: the keys to something else (to), or a press outside this page (away)
+      const h = { to: null, away: false, stop: null };
+      const moved = (e) => {
+        if (e.target === wv) return;
+        h.to = e.target;
+        h.away = false;
+      };
+      const pressed = (e) => {
+        if (container.contains(e.target)) return;
+        h.away = true;
+        h.to = null;
+      };
+      let timer = 0;
+      const stop = () => {
+        clearTimeout(timer);
+        document.removeEventListener('focusin', moved, true);
+        document.removeEventListener('pointerdown', pressed, true);
+        wv.removeEventListener('focus', landed);
+        if (t.handing === h) t.handing = null;
+      };
+      h.stop = stop;
+      // each step of the landing (the second can fire focus again a moment after the first)
+      const landed = () => {
+        if (h.to && h.to.isConnected) h.to.focus({ preventScroll: true });
+        else if (h.away || t !== st()) wv.blur();
+        clearTimeout(timer);
+        timer = setTimeout(stop, 150);
+      };
+      timer = setTimeout(stop, 5000);
+      t.handing = h;
+      document.addEventListener('focusin', moved, true);
+      document.addEventListener('pointerdown', pressed, true);
+      wv.addEventListener('focus', landed);
+    }
+    function focusTab(t) {
+      dropPendingFocus();
+      if (disposed || !t.url) return;
+      if (t.guestId != null) {
+        // Only a webview that did not have the keys gets the late focus; one that had them gets none, and a later
+        // focus (the owner's click into the page) must keep the keys there.
+        const had = document.activeElement === t.wv;
+        t.wv.focus();
+        if (!had) handBack(t);
+        return;
+      }
+      pendingFocus = t;
+      document.addEventListener('pointerdown', away, true);
+      document.addEventListener('keydown', away, true);
+      document.addEventListener('focusin', away, true);
+    }
+
+    /* A webview's id once Electron has attached its guest. The guest's first events can come before that (a first
+       address that is a download from a server this close), and getWebContentsId then throws: bind tries again shortly,
+       and does what that event could not (a download-only load leaves no later event to bind on). */
+    function guestIdOf(wv) {
+      try {
+        return wv.getWebContentsId();
+      } catch (e) {
+        if (/must be attached to the DOM/.test(String(e && e.message))) return null;
+        throw e;
+      }
+    }
+    function bind(t) {
+      if (t.guestId != null || !t.wv) return;
+      const id = guestIdOf(t.wv);
+      if (id == null) {
+        if ((t.bindTries = (t.bindTries || 0) + 1) > 100) {
+          if (t.bindTries === 101) console.warn('flow page: a webview was not attached within 5 s', t.url);
+          return;
+        }
+        if (!t.bindRetry) {
+          t.bindRetry = setTimeout(() => {
+            t.bindRetry = 0;
+            if (disposed || !tabs.includes(t)) return;
+            bind(t);
+            if (t.guestId != null && t.inflight && !t.wv.isLoading()) dropped(t);
+          }, 50);
+        }
+        return;
+      }
+      t.guestId = id;
+      byGuest.set(t.guestId, t);
+      // After the event that bound it has done its part (a load that became a download is dropped first).
+      queueMicrotask(() => deliver(id, t));
+      if (t.steps && t.steps.length) queueMicrotask(() => nextStep(t));
+      if (pendingFocus === t) {
+        dropPendingFocus();
+        if (t === st()) {
+          t.wv.focus();
+          handBack(t);
+        }
+      }
+      if (t.zoom && typeof window.flow.setPageZoom === 'function') {
+        window.flow.setPageZoom(t.guestId, t.zoom).catch((e) => console.warn('flow page: could not set the page zoom', e));
+      }
+      if (t.pending) {
+        const u = t.pending;
+        t.pending = null;
+        load(t, u);
+      }
+    }
+
+    function load(t, u) {
+      t.inflight = true;
+      t.wv.loadURL(u).catch((e) => {
+        if (disposed || !t.wv) return;
+        // Network failures also arrive as did-fail-load, which draws the error state. -3 (a newer navigation, a
+        // download or an external app took over) and -2 (loading stopped without a page) are not page failures.
+        if (/\((-?\d+)\) loading '/.test(String(e && e.message))) return;
+        console.error('flow page: loadURL failed', u, e);
+        showError(t, 'this page could not be loaded', String((e && e.message) || e), () => load(t, u));
+      });
+    }
+
+    /* Only web addresses load in the page; mail links go to the mail app. Anything else keeps the page as it is. */
+    function refuse(r) {
+      if (/^mailto:/i.test(r.url)) {
+        window.flow.openExternal(r.url);
+        dirty = false;
+        showAddress();
+        if (document.activeElement === input) input.select();
+        return true;
+      }
+      if (LOADABLE_RE.test(r.url)) return false;
+      flashHint(CANNOT_OPEN);
+      return true;
+    }
+
+    function setIcon(t, u) {
+      if (u === t.icon) return;
+      t.icon = u;
+      rememberGood(t);
+      renderStrip();
+      emitTabs();
+    }
+    /* ‹ and ›. One pressed before the tab knows its page (its webview not bound yet, as right after a page of
+       another kind took its place) is held and runs at the bind, in order; never dropped (lead, Nov 2). */
+    function step(t, dir) {
+      if (disposed || !t) return;
+      t.reloadRequest += 1;
+      t.recovering = false;
+      t.reloading = false;
+      clearRecoveryHistory(t);
+      clearError(t);
+      if (t.guestId == null) {
+        if (t.wv || t.restoring) (t.steps || (t.steps = [])).push(dir);
+        return;
+      }
+      if (dir < 0) {
+        if (!t.wv.canGoBack()) {
+          if (t.before.length) cross(t, t.after, () => t.before.pop());
+          return;
+        }
+        t.wv.goBack();
+        return;
+      }
+      if (!t.wv.canGoForward()) {
+        if (t.after.length) cross(t, t.before, () => t.after.pop());
+        return;
+      }
+      t.wv.goForward();
+    }
+    // the next held step, once the tab knows its page (at the bind, and after each step lands)
+    function nextStep(t) {
+      if (!t.steps || !t.steps.length || t.guestId == null || disposed || !tabs.includes(t)) return;
+      step(t, t.steps.shift());
+    }
+
+    function go(t, r) {
+      t.reloadRequest += 1;
+      t.recovering = false;
+      t.reloading = false;
+      clearRecoveryHistory(t);
+      clearError(t);
+      // an address the owner gave supersedes ‹ and › still held for this tab
+      if (t.steps) t.steps.length = 0;
+      if (t.wv && REPORT_RE.test(r.url) !== t.report) {
+        cross(t, t.before, () => {
+          t.after.length = 0;
+          return { url: r.url };
+        });
+        return;
+      }
+      t.typed = r.kind === 'host' ? r : null;
+      t.url = r.url;
+      if (t === st()) {
+        dirty = false;
+        showAddress();
+        renderStar();
+        renderNew();
+      }
+      emitTabs();
+      if (!t.wv) {
+        createWebview(t);
+        return;
+      }
+      if (t.guestId == null) {
+        t.pending = r.url;
+        return;
+      }
+      load(t, r.url);
+    }
+
+    /* A tab going between a report and any other page gets a new webview (REPORT_RE), once the page it leaves has let
+       it go. Where it was is kept on that side (keep), so back or forward across the line loads that page again. */
+    function cross(t, keep, next) {
+      const keys = container.contains(document.activeElement);
+      Promise.all([guarded(t), refreshHistory(t), scrollNow(t)]).then(([unsaved, , at]) => {
+        const to = disposed || !tabs.includes(t) ? null : next();
+        if (!to) return;
+        keep.push({ url: t.url, title: t.title, history: t.history, scroll: at || t.place || null });
+        if (unsaved) park(t);
+        dropTab(t);
+        clearError(t);
+        if (t.login) {
+          t.login = null;
+          ifShown(t, renderLogin);
+        }
+        setLoading(t, false);
+        Object.assign(t, { url: to.url, title: to.title || '', history: to.history || null, historyJSON: to.history ? JSON.stringify(to.history) : '', navAt: null, scroll: to.scroll || null,
+          place: null, restored: false, committed: '', inflight: false, typed: null, selection: false });
+        ifShown(t, render);
+        createWebview(t);
+        emitTabs();
+        if (keys && t === st()) focusTab(t);
+      });
+    }
+
+    function failed(t, code, failedURL) {
+      const ty = t.typed;
+      t.typed = null;
+      if (ty && sameURL(failedURL, ty.url)) {
+        if (NOT_FOUND.has(code) && ty.bare) {
+          go(t, search(ty.text));
+          return;
+        }
+        if (ty.url.startsWith('https://') && (HTTP_FALLBACK.has(code) || (code <= -200 && code > -300))) {
+          go(t, { url: `http://${ty.url.slice(8)}`, kind: 'url', text: ty.text });
+          return;
+        }
+      }
+      const good = t.good;
+      const keep = !!good && (!!(t.err && t.err.recover) || t.recovering || t.reloading);
+      t.inflight = false;
+      t.reloading = false;
+      t.recovering = false;
+      if (keep) {
+        Object.assign(t, {
+          url: good.url,
+          title: good.title,
+          icon: good.icon,
+          history: validHistory(good.history),
+          historyJSON: good.history ? JSON.stringify(good.history) : '',
+          navAt: good.history ? { index: good.history.index, length: good.history.entries.length } : t.navAt,
+          scroll: scrollOf(good.scroll),
+          zoom: good.zoom,
+        });
+      } else {
+        if (failedURL) t.url = failedURL;
+        if (!t.titleSince) t.title = '';
+      }
+      ifShown(t, () => {
+        showAddress();
+        updateNav();
+        renderStar();
+      });
+      showError(t, plainError(code), display(t.url), () => {
+        if (keep) recoverFailed(t);
+        else {
+          clearError(t);
+          load(t, t.url);
+        }
+      }, keep);
+      if (keep && NETWORK_DOWN.has(code)) retryLater(t);
+      emitTabs();
+      ifShown(t, () => onNavigate({ url: tidy(t.url), title: t.title }));
+    }
+
+    /* A navigation that stops without a commit or a failure (a download, a 204, a link to another app, a page that
+       would not unload) leaves the page where it was: the address goes back to it. */
+    function blankTab(t) {
+      t.url = '';
+      t.title = '';
+      t.typed = null;
+      ifShown(t, () => {
+        render();
+        onTitle('');
+      });
+      emitTabs();
+    }
+    function dropped(t) {
+      t.inflight = false;
+      t.typed = null;
+      const was = t.wv.getURL();
+      if (!was || was === 'about:blank' || was === t.url) return;
+      t.url = was;
+      ifShown(t, () => {
+        showAddress();
+        renderStar();
+      });
+      emitTabs();
+    }
+
+    function mergeRecoveredHistory(current, saved) {
+      if (!saved || current.index !== saved.index || current.entries.length !== saved.entries.length) return null;
+      return {
+        index: current.index,
+        entries: current.entries.map((e, i) => samePath(e.url, saved.entries[i].url) ? { ...e, url: saved.entries[i].url } : e),
+      };
+    }
+    /* A tab's back/forward history with Chromium's page state (scroll, form values), as main reads it. */
+    function refreshHistory(t, recovery) {
+      clearTimeout(t.histTimer);
+      t.histTimer = 0;
+      if (disposed || t.guestId == null || typeof window.flow.pageHistory !== 'function') return Promise.resolve();
+      const docs = t.docs;
+      const wv = t.wv;
+      return window.flow.pageHistory(t.guestId).then(async (h) => {
+        if (disposed || !tabs.includes(t) || t.docs !== docs || t.wv !== wv || (recovery && t.recoverHistory !== recovery)) return;
+        // where the tab is, for ‹ and ›, on any page; only an http(s) history is kept for a restart (validHistory)
+        const at = h && Number.isInteger(h.index) && Array.isArray(h.entries) ? { index: h.index, length: h.entries.length } : null;
+        if (JSON.stringify(at) !== JSON.stringify(t.navAt || null)) {
+          t.navAt = at;
+          ifShown(t, updateNav);
+        }
+        let v = validHistory(h);
+        if (!v) return;
+        let recovered = recovery && recovery.history;
+        if (recovered) {
+          const merged = mergeRecoveredHistory(v, recovered);
+          if (merged) v = merged;
+          else {
+            clearRecoveryHistory(t);
+            recovered = null;
+            t.scroll = null;
+            t.place = null;
+            const active = v.entries[v.index];
+            if (active) {
+              t.url = active.url;
+              t.committed = active.url;
+              ifShown(t, () => {
+                showAddress();
+                renderStar();
+                onNavigate({ url: tidy(t.url), title: t.title });
+              });
+            }
+          }
+        }
+        const active = recovered && v.entries[v.index];
+        const currentURL = wv.getURL();
+        if (active && samePath(currentURL, active.url) && !sameURL(currentURL, active.url)) {
+          const replaced = await wv.executeJavaScript(`(() => { if (location.href !== ${JSON.stringify(currentURL)}) return false; history.replaceState(history.state, '', ${JSON.stringify(active.url)}); return true; })()`);
+          if (!replaced || disposed || !tabs.includes(t) || t.docs !== docs || t.wv !== wv || t.recoverHistory !== recovery) return;
+          t.url = active.url;
+          t.committed = active.url;
+          ifShown(t, showAddress);
+        }
+        const json = JSON.stringify(v);
+        if (json !== t.historyJSON) {
+          t.history = v;
+          t.historyJSON = json;
+          ifShown(t, updateNav);
+          emitTabs();
+        }
+        rememberGood(t);
+      }).catch((e) => {
+        if (stillThere(t, docs)) console.warn('flow page: could not read the page history', e);
+      });
+    }
+    /* Where a tab's page is scrolled right now, from its preload: Chromium records a scroll in the page's history only
+       about a second after it ends. null when it does not answer within 300 ms. */
+    function scrollNow(t) {
+      if (!t.wv || t.guestId == null) return Promise.resolve(null);
+      const id = ++scrollAskId;
+      return new Promise((resolve) => {
+        const end = (at) => {
+          clearTimeout(timer);
+          scrollAsks.delete(id);
+          resolve(at);
+        };
+        const timer = setTimeout(() => end(null), 300);
+        scrollAsks.set(id, end);
+        t.wv.send('flow:scroll-now', id);
+      });
+    }
+    // Where a tab's PDF is: Chromium's viewer keeps it in a frame only main can read; null for any other page.
+    function pdfPlace(t) {
+      if (typeof window.flow.pdfPlace !== 'function') return Promise.resolve(null);
+      const docs = t.docs;
+      return window.flow.pdfPlace(t.guestId).then((at) => at || null, (e) => {
+        if (stillThere(t, docs)) console.warn('flow page: could not read where the PDF is', e);
+        return null;
+      });
+    }
+    // A PDF's page has loaded: main closes its viewer's thumbnails pane and puts one kept from before a restart back.
+    function pdfShown(t) {
+      if (t.guestId == null || typeof window.flow.pdfShown !== 'function') return;
