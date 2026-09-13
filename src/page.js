@@ -1814,3 +1814,457 @@
         // Chromium updates the page state about a second after a scroll stops (smooth scrolling runs on a bit).
         refreshSoon(t, 2500);
       });
+      pgv.insertBefore(wv, fresh);
+      layout();
+      renderView();
+      updateNav();
+    }
+
+    function dropTab(t) {
+      if (pendingFocus === t) dropPendingFocus();
+      clearTimeout(t.histTimer);
+      t.histTimer = 0;
+      clearTimeout(t.bindRetry);
+      t.bindRetry = 0;
+      clearRecoveryHistory(t);
+      if (t.ask) {
+        const q = t.ask;
+        t.ask = null;
+        q.answer(false);
+      }
+      if (t.wv) {
+        for (const [type, f] of t.mine) t.wv.removeEventListener(type, f);
+        t.mine.length = 0;
+        t.wv.remove();
+      }
+      if (t.guestId != null) byGuest.delete(t.guestId);
+      t.wv = null;
+      t.guestId = null;
+      t.playing = false;
+    }
+
+    /* ---------- tab actions ---------- */
+    function newTab(u, { show = true, after } = {}) {
+      if (disposed) return -1;
+      const t = makeTab(u, '');
+      const at = Number.isInteger(after) && after >= 0 ? after + 1 : tabs.length;
+      tabs.splice(at, 0, t);
+      if (at <= cur && tabs.length > 1 && !show) cur += 1;
+      if (show) selectTab(at, true);
+      else renderStrip();
+      emitTabs();
+      return at;
+    }
+
+    function selectTab(i, force) {
+      if (disposed || i < 0 || i >= tabs.length || (i === cur && !force)) return;
+      stampSeen();
+      if (st() && st() !== tabs[i]) refreshHistory(st());
+      if (findTab && findTab !== tabs[i]) closeFind(false);
+      cur = i;
+      dirty = false;
+      dropPendingFocus();
+      hideMark();
+      render();
+      const t = st();
+      createWebview(t);
+      layout();
+      if (!t.url) {
+        input.focus();
+        input.select();
+      } else {
+        if (document.activeElement === input) input.blur();
+        focusTab(t);
+      }
+      onTitle(t.title);
+      // The window shows another page now: its address goes to the app as a navigation does (app.js keeps it).
+      if (t.url) onNavigate({ url: tidy(t.url), title: t.title });
+      emitTabs();
+    }
+
+    /* ⌘W, × and a middle click: the tab goes at once, never with a question (owner, Nov 1 20:47). false: it is the
+       last tab, which goes with its window. */
+    function closeTab(i) {
+      const k = Number.isInteger(i) ? i : cur;
+      if (disposed || k < 0 || k >= tabs.length) return true;
+      if (tabs.length === 1) return false;
+      removeTab(k);
+      return true;
+    }
+
+    // The tabs closed here, the last first (⇧⌘T): where each was, and its page as a kept tab. how: 'moved' (to another
+    // window: not kept), 'self' (the page closed itself: kept, nothing left to hold), else closed by the owner.
+    const closedTabs = [];
+    function removeTab(k, how) {
+      const t = tabs[k];
+      let c = null;
+      if (t.url && how !== 'moved') {
+        c = { at: k, kept: { id: t.id, url: tidy(t.url), title: t.title, history: t.history, zoom: t.zoom, scroll: t.place || t.scroll, before: t.before, after: t.after, icon: t.icon }, live: null, timer: 0 };
+        closedTabs.push(c);
+        if (closedTabs.length > 10) letGo(closedTabs.shift());
+      }
+      if (findTab === t) closeFind(false);
+      if (c && how !== 'self') hold(t, c);
+      else dropTab(t);
+      tabs.splice(k, 1);
+      if (k === cur) {
+        // The tab to its right takes its place, or the one to its left when it was the last.
+        cur = Math.min(k, tabs.length - 1);
+        selectTab(cur, true);
+        return;
+      }
+      if (k < cur) cur -= 1;
+      renderStrip();
+      emitTabs();
+    }
+
+    /* A page that closed itself: its tab goes. The last tab becomes a new tab, and the app may close the window. */
+    function closeSelf(t) {
+      const k = tabs.indexOf(t);
+      if (disposed || k < 0) return;
+      if (tabs.length > 1) {
+        removeTab(k, 'self');
+        return;
+      }
+      if (findTab === t) closeFind(false);
+      dropTab(t);
+      Object.assign(t, { id: newTabId(), url: '', title: '', err: null, loading: false, inflight: false, typed: null, committed: '', history: null, historyJSON: '', navAt: null, zoom: 0, before: [], after: [] });
+      render();
+      onTitle('');
+      emitTabs();
+      onClose();
+    }
+
+    /* Whether a tab's site guards typing it has not saved yet (its beforeunload, as Chromium counts it). */
+    function guarded(t) {
+      if (t.guestId == null || typeof window.flow.pageHasUnsavedChanges !== 'function') return Promise.resolve(false);
+      return window.flow.pageHasUnsavedChanges(t.guestId).catch((e) => {
+        console.error('flow page: could not ask the page about unsaved typing', e);
+        return false;
+      });
+    }
+    /* A closed tab's page goes with it, unless its site guards unsaved typing (Docs, Gmail): then it lives on out of
+       sight for HOLD_MS, so the site can finish saving, and ⇧⌘T in that time brings back the same page, typing and
+       all. A webview dies when it leaves the document, so it waits hidden where it is. */
+    function hold(t, c) {
+      if (t.guestId == null || t.err || typeof window.flow.pageHasUnsavedChanges !== 'function') {
+        dropTab(t);
+        return;
+      }
+      if (pendingFocus === t) dropPendingFocus();
+      if (t.ask) {
+        const q = t.ask;
+        t.ask = null;
+        q.answer(false);
+      }
+      t.wv.classList.add('off');
+      c.live = t;
+      // ⇧⌘T later reopens the page where it is now: its history and place are read before it goes (a close right
+      // after a navigation would otherwise keep the history from before it)
+      const history = typeof window.flow.pageHistory === 'function'
+        ? window.flow.pageHistory(t.guestId).then(validHistory, (e) => {
+          console.warn('flow page: could not read a closed tab\'s history', e);
+          return null;
+        })
+        : Promise.resolve(null);
+      Promise.all([guarded(t), history, scrollNow(t)]).then(([yes, h, at]) => {
+        if (c.live !== t) return;
+        if (h) c.kept.history = h;
+        if (at) c.kept.scroll = at;
+        if (!yes || disposed) letGo(c);
+        else c.timer = setTimeout(() => letGo(c), HOLD_MS);
+      });
+    }
+    function letGo(c) {
+      clearTimeout(c.timer);
+      const t = c.live;
+      c.live = null;
+      if (t && !tabs.includes(t)) dropTab(t);
+    }
+    /* Where a live tab is, kept on the tab as a quit keeps it: its history as Chromium has it and where its page is
+       scrolled now (or where the page last said it came to rest). A tab without its page comes back from these. */
+    async function keepPlace(t) {
+      const [now, , pdf] = await Promise.all([scrollNow(t), refreshHistory(t), pdfPlace(t)]);
+      // A place kept from before that the page has not put back yet (it has not come to rest anywhere since it
+      // loaded, as when Flow quits while it still loads) stays the place: the page there now is not where it was left.
+      if (t.putting) {
+        t.scroll = t.putting;
+        return;
+      }
+      // A PDF's place is its viewer's: kept even when its page, which never scrolls, did not answer in time.
+      const at = now || t.place || (pdf && { x: 0, y: 0 });
+      if (at) t.scroll = pdf ? { ...at, pdf } : at;
+    }
+    /* A tab nobody has looked at for unloadAfter gives up its page to keep the Mac light (lead, item 57). It keeps its
+       address, history, place and zoom (its note and highlights go by its address) and comes back where it was when
+       it shows again. Never the tab on screen, one holding typing its site guards, one playing sound or video, or a
+       tab in a pop-out space on screen. */
+    const seen = (t) => t === st() && visible && document.visibilityState === 'visible';
+    function stampSeen() {
+      const now = Date.now();
+      for (const t of tabs) if (seen(t)) t.seenAt = now;
+    }
+    const mayRest = (t) => tabs.includes(t) && t.wv && t.guestId != null && !seen(t) && !t.playing && !t.ask && !t.login &&
+      findTab !== t && !(popout && document.visibilityState === 'visible');
+    async function sleepTab(t) {
+      if (disposed || !mayRest(t) || (await guarded(t)) || !mayRest(t)) return false;
+      await keepPlace(t);
+      if (disposed || !mayRest(t)) return false;
+      dropTab(t);
+      t.restored = false;
+      emitTabs();
+      return true;
+    }
+    function sleepIdle(after) {
+      const now = Date.now();
+      return Promise.all(tabs.filter((t) => t.wv && now - t.seenAt >= after).map(sleepTab)).then((r) => r.filter(Boolean).length);
+    }
+    /* A guarded page its tab leaves for good (a crossing to a page of another kind): its webview lives on out of
+       sight for HOLD_MS, deaf to the page, and the tab goes on without it (dropTab then finds no webview). */
+    function park(t) {
+      const wv = t.wv;
+      for (const [type, f] of t.mine) wv.removeEventListener(type, f);
+      t.mine.length = 0;
+      if (t.guestId != null) byGuest.delete(t.guestId);
+      t.wv = null;
+      t.guestId = null;
+      wv.classList.add('off');
+      setTimeout(() => wv.remove(), HOLD_MS);
+    }
+
+    /* A tab going to another window, as it is now: its history and place read first. */
+    function tabOut(t, at) {
+      if (disposed || !onTabOut || tabs.length < 2 || !tabs.includes(t)) return;
+      Promise.all([refreshHistory(t), scrollNow(t)]).then(([, place]) => {
+        const k = tabs.indexOf(t);
+        if (disposed || k < 0 || tabs.length < 2) return;
+        const kept = { id: t.id, url: tidy(t.url), title: t.title, history: t.history, zoom: t.zoom, scroll: place || t.place || t.scroll, before: t.before, after: t.after, icon: t.icon };
+        if (onTabOut(kept, at)) removeTab(tabs.indexOf(t), 'moved');
+      });
+    }
+    function moveTab(from, to) {
+      if (disposed || from === to || from < 0 || to < 0 || from >= tabs.length || to >= tabs.length) return;
+      const shownTab = st();
+      const [t] = tabs.splice(from, 1);
+      tabs.splice(to, 0, t);
+      cur = tabs.indexOf(shownTab);
+      renderStrip();
+      emitTabs();
+    }
+
+    /* ---------- find in page ---------- */
+    function runFind(forward) {
+      const t = st();
+      const q = fq.value;
+      if (!q) {
+        stopFind('clearSelection');
+        return;
+      }
+      if (t.guestId == null) return;
+      const again = q === findText && findTab === t;
+      findText = q;
+      findTab = t;
+      t.wv.send('flow:stop-restore');
+      findReq = t.wv.findInPage(q, { forward, findNext: !again });
+    }
+    function stopFind(action) {
+      if (findTab && findTab.guestId != null && findText) findTab.wv.stopFindInPage(action);
+      findText = '';
+      findTab = null;
+      fn.textContent = '';
+    }
+    function openFind() {
+      if (st().guestId == null) return;
+      find.classList.add('on');
+      fq.focus();
+      fq.select();
+      if (fq.value && (fq.value !== findText || findTab !== st())) runFind(true);
+    }
+    function closeFind(focusPage) {
+      find.classList.remove('on');
+      stopFind('keepSelection');
+      if (focusPage !== false) focusTab(st());
+    }
+
+    /* ---------- clip and save ---------- */
+    function flashHint(msg, ms = 1800) {
+      hint.textContent = msg;
+      hint.classList.add('on');
+      clearTimeout(hintTimer);
+      hintTimer = setTimeout(() => hint.classList.remove('on'), ms);
+    }
+    function clipped(t, text) {
+      onClip(text, tidy(t.url), t.id);
+      return text;
+    }
+    function clip() {
+      const t = st();
+      if (t.guestId == null || disposed) return Promise.resolve('');
+      return t.wv.executeJavaScript(SELECTION_JS).then((r) => {
+        if (disposed) return '';
+        const text = String((r && r.text) || '').trim();
+        if (text) return clipped(t, text);
+        if (r && r.framed) flashHint('flow cannot read a selection in this part of the page');
+        else flashHint('select text on the page first');
+        return '';
+      }, (e) => {
+        console.error('flow page: could not read the selection', e);
+        flashHint('could not read the selection');
+        return '';
+      });
+    }
+
+    // What a tab's page says it is about ('' when it says nothing), or null when it has no live page, the read fails or
+    // it cannot say within 1.5 s.
+    // Whether a read of a tab's page that started at document `docs` failed while that page was still there: a tab
+    // closed or gone to another page in the meantime leaves nothing to say.
+    const stillThere = (t, docs) => !disposed && tabs.includes(t) && t.guestId != null && t.docs === docs;
+
+    function aboutOf(t) {
+      if (t.guestId == null) return Promise.resolve(null);
+      const docs = t.docs;
+      return Promise.race([
+        t.wv.executeJavaScript(ABOUT_JS).then((a) => String(a || ''), (e) => {
+          if (stillThere(t, docs)) console.warn('flow page: could not read what the page is about', e);
+          return null;
+        }),
+        new Promise((r) => setTimeout(() => r(null), 1500)),
+      ]);
+    }
+
+    /* The star (and ⌘D): saves the shown page into this workspace, or takes it out again. */
+    async function save() {
+      const t = st();
+      if (disposed || !saved) return null;
+      if (!t.url || !LOADABLE_RE.test(t.url)) {
+        flashHint('open a page to save it');
+        return null;
+      }
+      const u = tidy(t.url);
+      const have = saved.find(u);
+      if (have) {
+        saved.remove(have.id);
+        renderStar();
+        return null;
+      }
+      const about = await aboutOf(t);
+      if (disposed) return null;
+      const entry = saved.save({ url: u, title: t.title || display(u), about: about || '' });
+      renderStar();
+      return entry;
+    }
+
+    /* ---------- the camera and microphone control ---------- */
+    let mediaMenu = null;
+    function closeMediaMenu() {
+      if (mediaMenu) { mediaMenu.remove(); mediaMenu = null; }
+    }
+    let mediaStateNow = null;
+    const macBox = el('div', 'pmacbox');
+    macBox.hidden = true;
+    function paintMedia(m) {
+      mediaStateNow = m;
+      const t = st();
+      if (m && m.live) t.using = { camera: (t.using && t.using.camera) || m.live.camera, microphone: (t.using && t.using.microphone) || m.live.microphone };
+      const held = t.using || {};
+      // The shield stays: while the site holds a device, while a device is refused (off, so the owner can lift it), while
+      // this page has been answered at all (an answer is the owner's standing decision, not something to hunt for again),
+      // and while its panel is open. It only goes once nothing was ever answered and nothing is held.
+      const answered = m && (m.camera !== 'ask' || m.microphone !== 'ask');
+      media.hidden = !(m && (held.camera || held.microphone || answered || mediaMenu));
+      shield.classList.toggle('on', !!(held.camera || held.microphone));
+      const macOff = m && m.mac && Object.entries(m.mac).filter(([, v]) => v === 'off').map(([d]) => d);
+      shield.title = macOff && macOff.length ? `camera and microphone (macOS has Flow's ${macOff.join(' and ')} off)` : 'camera and microphone';
+      if (mediaMenu) fillMediaMenu();
+      if (window.__mediaDebug) media.dataset.why = JSON.stringify({ held, answered: !!(m && (m.camera !== 'ask' || m.microphone !== 'ask')), menu: !!mediaMenu, m: !!m });
+    }
+    async function refreshMedia() {
+      const t = st();
+      if (disposed || t.guestId == null || typeof window.flow.pageMedia !== 'function') { paintMedia(null); return; }
+      if (t.wv && typeof t.wv.send === 'function') t.wv.send('flow:using-ask');
+      try { paintMedia(await window.flow.pageMedia(t.guestId)); } catch { await new Promise((r) => setTimeout(r, 400)); try { paintMedia(await window.flow.pageMedia(t.guestId)); } catch { paintMedia(null); } }
+    }
+    function fillMediaMenu() {
+      if (!mediaMenu) return;
+      const m = mediaStateNow;
+      for (const [device, label] of [['camera', 'Camera'], ['microphone', 'Microphone']]) {
+        const row = mediaMenu.querySelector(`[data-dev="${device}"]`);
+        if (!row) continue;
+        const state = (m && m[device]) || 'ask';
+        const on = state !== 'off';
+        const t2 = st();
+        const using = !!(t2 && t2.using && t2.using[device]);
+        row.querySelector('.pmstate').textContent = !on ? 'Off' : using ? 'Using now' : 'Allowed';
+        const sw = row.querySelector('.psw');
+        sw.classList.toggle('on', on);
+        sw.dataset.state = state;
+      }
+      const macOff = m && m.mac && Object.entries(m.mac).filter(([, v]) => v === 'off').map(([d]) => d[0].toUpperCase() + d.slice(1));
+      macBox.hidden = !macOff || !macOff.length;
+      macBox.textContent = macOff && macOff.length ? `macOS has Flow's ${macOff.join(' and ').toLowerCase()} off. Turn it on in System Settings > Privacy & Security, then here again.` : '';
+    }
+    function openMediaMenu() {
+      const t = st();
+      if (t.guestId == null) return;
+      if (mediaMenu) { closeMediaMenu(); return; }
+      const menu = el('div', 'pmenu');
+      menu.onmousedown = (e) => e.stopPropagation();
+      const head = el('div', 'pmhead');
+      let host = '';
+      try { host = new URL(t.url).hostname.replace(/^www\./, ''); } catch { host = t.url || ''; }
+      head.append(el('span', 'pmhost', host));
+      const x = el('button', 'pmx', '\u00d7');
+      x.type = 'button';
+      x.pick = () => closeMediaMenu();
+      head.append(x);
+      menu.append(head);
+      menu.append(el('div', 'pmconn', '\u{1F512} Connection is secure'));
+      for (const [device, label] of [['camera', 'Camera'], ['microphone', 'Microphone']]) {
+        const row = el('div', 'pmrow');
+        row.dataset.dev = device;
+        const name = el('div', 'pmname', label);
+        const state = el('div', 'pmstate', '');
+        const sw = el('span', 'psw');
+        sw.pick = async () => {
+          const next = sw.dataset.state === 'off' ? 'on' : 'off';
+          // Off cuts what the site already holds right now (the camera light goes out), then refuses its next ask.
+          // On lets it ask again; a site only gets the device back when it asks, as in Chrome.
+          sw.dataset.state = next;
+          sw.classList.toggle('on', next !== 'off');
+          // On must be answered before the device is reopened, or the site's request is still refused.
+          if (next === 'off' && t.wv && typeof t.wv.send === 'function') t.wv.send('flow:media-stop', device);
+          try { paintMedia(await window.flow.setPageMedia(t.guestId, device, next)); } catch (er) { console.warn('flow page: could not set the', device, er); }
+          if (next !== 'off' && t.wv && typeof t.wv.send === 'function') t.wv.send('flow:media-resume', device);
+        };
+        name.append(state);
+        row.append(name, sw);
+        menu.append(row);
+      }
+      const reset = el('button', 'pmreset', 'Reset permissions');
+      reset.type = 'button';
+      reset.pick = async () => {
+        try { await window.flow.setPageMedia(t.guestId, 'camera', 'ask'); paintMedia(await window.flow.setPageMedia(t.guestId, 'microphone', 'ask')); } catch (er) { console.warn('flow page: could not reset', er); }
+      };
+      menu.append(reset, macBox);
+      // Anchored to the bar, under the shield.
+      const a = addr.getBoundingClientRect();
+      menu.style.left = `${Math.max(6, Math.min(shield.getBoundingClientRect().left - a.left - 12, a.width - 260))}px`;
+      menu.style.top = `${a.height - 2}px`;
+      addr.append(menu);
+      mediaMenu = menu;
+      void fillMediaMenu();
+    }
+    // The menu is measured in window pixels, not the bar's; capture on the bar would take the row clicks first.
+    const onCaptured = (fn) => { document.addEventListener('mousedown', fn, true); listeners.push([document, 'mousedown', fn]); };
+    onCaptured((e) => {
+      if (!mediaMenu) return;
+      const hit = e.target.closest && e.target.closest('.pmx, .psw, .pmreset');
+      if (hit && mediaMenu.contains(hit)) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (hit.pick) hit.pick();
+        return;
+      }
+      if (!media.contains(e.target) && !(mediaMenu && mediaMenu.contains(e.target))) closeMediaMenu();
+    });
+
