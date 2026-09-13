@@ -452,3 +452,457 @@
 
     /* ---------- tabs ---------- */
     const tabs = [];
+    const unboundTab = (guestId) => tabs.find((t) => t.guestId == null && t.wv && guestIdOf(t.wv) === guestId) || null;
+    unboundTabs.add(unboundTab);
+    let cur = 0;
+    const st = () => tabs[cur];
+
+    // Where a tab's page was scrolled, as its preload says: the page's own offset, and the boxes it scrolls inside
+    // (each found again by a selector and its place among the matches, the main one with the text at its top edge).
+    function scrollOf(a) {
+      if (!a || !Number.isFinite(a.x) || !Number.isFinite(a.y)) return null;
+      const at = { x: a.x, y: a.y };
+      const boxes = (Array.isArray(a.boxes) ? a.boxes : []).filter((b) => b && typeof b.sel === 'string' && b.sel.length <= 300 && Number.isInteger(b.nth) && b.nth >= 0 && Number.isFinite(b.top) && Number.isFinite(b.left)).slice(0, 4)
+        .map((b) => (typeof b.text === 'string' && b.text ? { sel: b.sel, nth: b.nth, top: b.top, left: b.left, text: b.text.slice(0, 80), off: Number.isFinite(b.off) ? b.off : 0 } : { sel: b.sel, nth: b.nth, top: b.top, left: b.left }));
+      if (boxes.length) at.boxes = boxes;
+      if (a.pdf && Number.isFinite(a.pdf.x) && Number.isFinite(a.pdf.y)) at.pdf = { x: a.pdf.x, y: a.pdf.y };
+      return at;
+    }
+
+    function rememberGood(t, at) {
+      if (!t || t.err || !t.url || ERROR_PAGE_RE.test(t.url) || !LOADABLE_RE.test(t.url)) return;
+      const history = validHistory(t.history);
+      const active = history && history.entries[history.index];
+      if (active && !sameURL(active.url, t.url)) return;
+      const scroll = scrollOf(at) || scrollOf(t.place) || scrollOf(t.scroll);
+      t.good = {
+        url: t.url,
+        title: t.title,
+        icon: t.icon,
+        history,
+        scroll,
+        zoom: t.zoom,
+      };
+    }
+
+    // Where a tab was on the other side of a report line: its address, title, web history and place.
+    function sideOf(a) {
+      if (!a || typeof a.url !== 'string' || !LOADABLE_RE.test(a.url)) return null;
+      return { url: a.url, title: String(a.title || ''), history: validHistory(a.history), scroll: scrollOf(a.scroll) };
+    }
+    const sidesOf = (list) => (Array.isArray(list) ? list.map(sideOf).filter(Boolean).slice(-10) : []);
+    function makeTab(u, t, kept) {
+      const r = resolve(u);
+      const k = kept || {};
+      const history = validHistory(k.history);
+      const tab = {
+        id: typeof k.id === 'string' && /^t-[a-z0-9]+$/.test(k.id) ? k.id : newTabId(),
+        url: r ? r.url : '', title: String(t || ''), wv: null, guestId: null, pending: null, committed: '',
+        inflight: false, typed: null, loading: false, titleSince: true, err: null, mine: [],
+        history, historyJSON: history ? JSON.stringify(history) : '', histTimer: 0, restoring: false,
+        zoom: Number.isFinite(k.zoom) ? k.zoom : 0, ask: null, login: null, restored: false, scrollBack: null, pdfBack: null, putting: null,
+        good: null, recovering: false, reloading: false, reloadRequest: 0, recoverHistory: null, recoverTimer: 0,
+        scroll: scrollOf(k.scroll),
+        marks: null, marksPage: '', reported: '', docs: 0, nav: null, selfMove: null, restoredFrom: '', selection: false,
+        report: false, before: sidesOf(k.before), after: sidesOf(k.after),
+        icon: typeof k.icon === 'string' && ICON_RE.test(k.icon) ? k.icon : '',
+        seenAt: Date.now(), playing: false,
+      };
+      if (history && tab.url) rememberGood(tab, tab.scroll);
+      tab.popup = (url, disposition) => {
+        if (disposed) return;
+        if (!url || /^(?:about:blank|javascript:)/i.test(url)) {
+          console.warn(`flow page: ignored a popup without an address (${url})`);
+          return;
+        }
+        // A link or form of the page that would cross between a report and the web, which main stopped: the page goes
+        // there in its own tab, in a new webview (REPORT_RE).
+        if (disposition === 'current-tab') {
+          const r = resolve(url);
+          if (r && !refuse(r)) go(tab, r);
+          return;
+        }
+        // A bare page has no tabs to open: the app opens the link beside it (onOpen), or it goes there itself.
+        if (bare) {
+          if (onOpen) onOpen(url);
+          else go(tab, resolve(url));
+          return;
+        }
+        // A new page the owner asks for (a shift-click, "Open Link in New Page") is a page window of its own beside
+        // this one; a tab comes from ⌘-click, a middle click, target=_blank and a page's window.open after a click.
+        if (onOpen && (disposition === 'new-window' || disposition === 'new-page')) {
+          onOpen(url);
+          return;
+        }
+        newTab(url, { show: disposition !== 'background-tab', after: tabs.indexOf(tab) });
+      };
+      // From the menu's "Clip to Note", which read the selection in main: widen it to whole words where the page can
+      // read its own selection (it cannot in a PDF or another site's frame, where main's text is used as it is).
+      tab.clipText = (text) => {
+        const s = String(text || '').trim();
+        if (disposed || !s) return;
+        const flat = (x) => x.replace(/\s+/g, ' ').trim();
+        const read = tab.guestId == null ? Promise.resolve('') : tab.wv.executeJavaScript(SELECTION_JS).then((r) => String((r && r.text) || '').trim(), (e) => {
+          console.warn('flow page: could not read the selection to widen it to whole words', e);
+          return '';
+        });
+        read.then((words) => {
+          if (!disposed && tabs.includes(tab)) clipped(tab, words && flat(words).includes(flat(s)) ? words : s);
+        });
+      };
+      // A download from this tab: the app records it with its workspace. Only one that failed says so here, since the
+      // owner's click then did nothing.
+      tab.downloaded = (d) => {
+        if (disposed || !d) return;
+        onDownload({ url: d.url, file: d.file, state: d.state, bytes: d.bytes, page: tidy(tab.url) });
+        // A tab that never showed a page, opened for what became this download, has nothing to show. Once the file is
+        // with the downloads it closes, and its window with it when it was the only tab; it waits for this end, which
+        // main sends through the tab's page. One whose download failed goes back to a new tab, to say so.
+        const forDownload = !tab.committed && !tab.inflight && tab.url;
+        if (forDownload && d.state === 'completed') {
+          closeSelf(tab);
+          return;
+        }
+        if (forDownload) blankTab(tab);
+        if (d.state === 'completed') return;
+        const name = String(d.file || '').split(/[\\/]/).pop() || 'the file';
+        flashHint(`could not download ${name.length > 40 ? `${name.slice(0, 39)}…` : name}`, 4000);
+      };
+      tab.openExternal = (url, requestId) => {
+        askTab(tab, { text: `open in another app? ${url}`, yes: 'open', no: 'cancel', answer: (open) => window.flow.answerExternal(requestId, open) });
+      };
+      // The site asks for a name and password (again: the last ones did not work); a newer ask answers an older one
+      // with nothing.
+      tab.signIn = (q) => {
+        if (tab.login) window.flow.answerPageLogin(tab.login.requestId, null);
+        tab.login = q;
+        ifShown(tab, renderLogin);
+      };
+      return tab;
+    }
+
+    function validHistory(h) {
+      if (!h || typeof h !== 'object' || !Array.isArray(h.entries) || !h.entries.length || h.entries.length > 50) return null;
+      if (!Number.isInteger(h.index) || h.index < 0 || h.index >= h.entries.length) return null;
+      const ok = h.entries.every((e) => e && typeof e.url === 'string' && /^https?:/i.test(e.url) && (e.pageState == null || typeof e.pageState === 'string'));
+      return ok ? { index: h.index, entries: h.entries.map((e) => (e.pageState ? { url: e.url, title: String(e.title || ''), pageState: e.pageState } : { url: e.url, title: String(e.title || '') })) } : null;
+    }
+
+    const snapshot = () => tabs.map((t) => {
+      const e = { id: t.id, url: tidy(t.url), title: t.title };
+      if (t.history) e.history = t.history;
+      if (t.zoom) e.zoom = t.zoom;
+      if (t.scroll) e.scroll = t.scroll;
+      if (t.before.length) e.before = t.before;
+      if (t.after.length) e.after = t.after;
+      if (t.icon) e.icon = t.icon;
+      return e;
+    });
+    function emitTabs() {
+      if (tabsQueued || disposed) return;
+      tabsQueued = true;
+      queueMicrotask(() => {
+        tabsQueued = false;
+        if (!disposed) onTabs(snapshot(), cur);
+      });
+    }
+
+    const label = (t) => (t.url && pageName(tidy(t.url))) || t.title || (t.url ? nameOf(t.url) : 'new tab');
+    // Each tab keeps its element and a render changes only text and classes: a press on a tab or its × must not lose
+    // its click to another tab's title changing (Chromium drops a click whose pressed element left the page). Elements
+    // move only when the order changed, and not while a tab is dragged, since the drag places it.
+    let dragged = null;
+    function tabEl(t) {
+      if (!t.stripEl) {
+        const x = el('button', 'pt-x', '×');
+        x.type = 'button';
+        x.title = 'close tab';
+        t.stripEl = el('div', 'ptab');
+        // drawn before the title (page.css order), after it here so the title stays the first child
+        t.stripIcon = el('img', 'pt-i');
+        t.stripIcon.alt = '';
+        t.stripIcon.hidden = true;
+        t.stripIcon.addEventListener('error', () => { t.stripIcon.hidden = true; });
+        t.stripEl.append(el('span', 'pt-t', ''), x, t.stripIcon);
+      }
+      return t.stripEl;
+    }
+    function renderStrip() {
+      strip.classList.toggle('on', tabs.length > 1);
+      if (tabs.length < 2) {
+        strip.replaceChildren();
+        return;
+      }
+      const els = tabs.map((t, i) => {
+        const e = tabEl(t);
+        const name = label(t);
+        const title = t.url ? `${name}\n${display(t.url)}` : 'new tab';
+        e.classList.toggle('on', i === cur);
+        if (e.title !== title) e.title = title;
+        if (e.firstChild.textContent !== name) e.firstChild.textContent = name;
+        if (t.stripIcon.dataset.src !== t.icon) {
+          t.stripIcon.dataset.src = t.icon;
+          t.stripIcon.hidden = !t.icon;
+          if (t.icon) t.stripIcon.src = t.icon;
+          else t.stripIcon.removeAttribute('src');
+        }
+        return e;
+      });
+      if (dragged) return;
+      const want = els;
+      for (const c of [...strip.children]) if (!want.includes(c)) c.remove();
+      want.forEach((e, i) => {
+        if (strip.children[i] !== e) strip.insertBefore(e, strip.children[i] || null);
+      });
+      // More tabs than fit: the strip scrolls sideways, keeping the shown tab in view.
+      const on = els[cur];
+      if (on) {
+        const l = on.offsetLeft, r = l + on.offsetWidth;
+        if (l < strip.scrollLeft) strip.scrollLeft = l;
+        else if (r > strip.scrollLeft + strip.clientWidth) strip.scrollLeft = r - strip.clientWidth;
+      }
+    }
+
+    /* ---------- layout: each webview at desktop width, scaled to fit ---------- */
+    function layout() {
+      const w = pgv.clientWidth, h = pgv.clientHeight;
+      if (!w || !h) return;
+      const rw = Math.max(w, DESKTOP_WIDTH), s = w / rw;
+      for (const t of tabs) {
+        if (!t.wv) continue;
+        // A workspace file (files.js) reads at the window's own width; a site gets the desktop width it was made for.
+        const own = /^flow-file:/i.test(t.url), tw = own ? w : rw, ts = own ? 1 : s;
+        t.wv.style.width = `${tw}px`;
+        t.wv.style.height = `${h / ts}px`;
+        t.wv.style.transform = ts < 1 ? `scale(${ts})` : '';
+      }
+    }
+    sizers.set(pgv, layout);
+    ro.observe(pgv);
+
+    /* ---------- what the shown tab looks like ---------- */
+    function showAddress() {
+      const t = st();
+      void refreshMedia();
+      const f = fileOf(t.url);
+      where.textContent = (f && f.where) || '';
+      where.classList.toggle('on', !!(f && f.where));
+      if (document.activeElement === input) {
+        if (!dirty) input.value = editable(t.url);
+        return;
+      }
+      input.value = display(t.url);
+    }
+
+    function updateNav() {
+      const t = st();
+      const ready = t.guestId != null;
+      // ‹ and › from where the tab is in its history as main last gave it, whatever its pages are (a file, a PDF), until
+      // then from the history kept for a restart (never the webview's canGoBack: a blocking call into main on every
+      // render); a page of another kind to go back to shows ‹ even before the tab knows its new page
+      const h = ready && (t.navAt || (t.history && { index: t.history.index, length: t.history.entries.length }));
+      back.classList.toggle('off', !(t.before.length || (h && h.index > 0)));
+      fwd.classList.toggle('off', !(t.after.length || (h && h.index < h.length - 1)));
+      rel.classList.toggle('off', !t.wv);
+      clipBtn.classList.toggle('off', !ready);
+      // ✂ shows only while the page has a selection (its preload says when that changes).
+      clipBtn.classList.toggle('nosel', !ready || !t.selection);
+    }
+
+    function renderLoading(restart) {
+      if (st().loading) {
+        if (restart || !bar.classList.contains('on')) {
+          bar.classList.remove('end');
+          void bar.offsetWidth;
+          bar.classList.add('on');
+        }
+      } else if (bar.classList.contains('on')) {
+        bar.classList.remove('on');
+        bar.classList.add('end');
+      }
+    }
+
+    function renderError() {
+      const e = st().err;
+      err.classList.toggle('on', !!e);
+      if (!e) return;
+      errT.textContent = e.t;
+      errD.textContent = e.d;
+      errD.title = e.d;
+    }
+
+    function renderStar() {
+      if (!saved) return;
+      const t = st();
+      const can = !!t.url && LOADABLE_RE.test(t.url);
+      const e = can ? saved.find(tidy(t.url)) : null;
+      star.textContent = e ? '★' : '☆';
+      star.classList.toggle('on', !!e);
+      star.classList.toggle('off', !can);
+      star.title = e ? `saved in ${e.section}, click to remove it` : 'save this page';
+    }
+
+    /* A new tab lists this workspace's saved pages, by section. */
+    function renderNew() {
+      const t = st();
+      const blank = !t.url || !LOADABLE_RE.test(t.url);
+      fresh.classList.toggle('on', blank);
+      hideCard();
+      if (!blank) return;
+      if (t.url) {
+        fresh.replaceChildren(el('div', 'pn-empty', CANNOT_OPEN));
+        return;
+      }
+      if (bare) {
+        fresh.replaceChildren();
+        return;
+      }
+      const all = saved ? saved.all().filter((s) => s.here) : [];
+      if (!all.length) {
+        fresh.replaceChildren();
+        return;
+      }
+      const groups = new Map();
+      for (const s of all) {
+        if (!groups.has(s.section)) groups.set(s.section, { name: s.section, list: [] });
+        groups.get(s.section).list.push(s);
+      }
+      const order = [...groups.values()].sort((a, b) => Math.max(...b.list.map((x) => x.at || 0)) - Math.max(...a.list.map((x) => x.at || 0)));
+      const list = el('div', 'pn-list');
+      for (const g of order) {
+        list.append(el('div', 'pn-sec', g.name));
+        for (const s of g.list.sort((a, b) => (b.at || 0) - (a.at || 0))) {
+          const row = el('div', 'pn-row');
+          row.dataset.url = s.url;
+          row.append(el('span', 'pn-t', pageName(s.url) || s.title || display(s.url)), el('span', 'pn-h', hostOf(s.url)));
+          row.savedEntry = s;
+          list.append(row);
+        }
+      }
+      fresh.replaceChildren(list);
+    }
+
+    function showCard(row) {
+      const s = row.savedEntry;
+      card.replaceChildren(el('div', 'pc-t', pageName(s.url) || s.title || display(s.url)), el('div', 'pc-u', display(s.url)));
+      if (s.about) card.append(el('div', 'pc-a', s.about));
+      const r = row.getBoundingClientRect(), v = pgv.getBoundingClientRect();
+      card.classList.add('on');
+      const top = Math.min(r.bottom - v.top + 4, pgv.clientHeight - card.offsetHeight - 6);
+      card.style.top = `${Math.max(6, top)}px`;
+      card.style.left = `${Math.max(6, Math.min(r.left - v.left + 24, pgv.clientWidth - card.offsetWidth - 6))}px`;
+    }
+    function hideCard() {
+      card.classList.remove('on');
+    }
+
+    /* Marks (notes.js): quoted sentences painted in the page by its preload. They belong to the page they were set on:
+       a reload or an in-page navigation paints them again, another page drops them until setMarks is called again. */
+    // The page marks belong to: its address without the hash, and a file's without its signature (a file is the same
+    // page under a fresh one).
+    const pageOf = (u) => tidy(u).replace(/#.*$/, '').replace(/^(flow-file:\/\/(?:mac|vm)\/)[^/?#]+\//i, '$1');
+    function sendMarks(t) {
+      if (!t.wv || t.guestId == null || !t.marks || pageOf(t.url) !== t.marksPage) return;
+      t.wv.send('flow:marks', t.marks.map((m) => ({ text: m.text })));
+    }
+    function showMark(t, a) {
+      const m = a && t === st() && t.wv && (t.marks || []).find((x) => x.text === a.text);
+      if (!m || !m.note.trim()) {
+        hideMark();
+        return;
+      }
+      markCard.textContent = m.note;
+      markCard.classList.add('on');
+      const r = t.wv.getBoundingClientRect(), v = pgv.getBoundingClientRect();
+      const s = t.wv.offsetWidth ? r.width / t.wv.offsetWidth : 1;
+      const left = r.left - v.left + a.x * s, top = r.top - v.top + a.y * s, bottom = top + a.h * s;
+      const below = bottom + 6 + markCard.offsetHeight <= pgv.clientHeight;
+      markCard.style.top = `${Math.max(6, below ? bottom + 6 : top - 6 - markCard.offsetHeight)}px`;
+      markCard.style.left = `${Math.max(6, Math.min(left, pgv.clientWidth - markCard.offsetWidth - 6))}px`;
+    }
+    function hideMark() {
+      markCard.classList.remove('on');
+    }
+    /* onRedirect: a tab's page went on to another address by itself, through a server redirect or by moving before the
+       owner did anything in it (the page's preload says which), so what notes keeps under the old address can follow. */
+    function redirected(from, to, how) {
+      const a = tidy(from);
+      const b = tidy(to);
+      if (a !== b && LOADABLE_RE.test(a) && LOADABLE_RE.test(b)) onRedirect({ from: a, to: b, how });
+    }
+    // onPage: once a tab's page has loaded, what notes keeps for it. A read that failed or ran out of time says no
+    // about (notes keeps the one it has), and the page's next load in the tab reads it again.
+    function reportPage(t) {
+      const u = tidy(t.url);
+      if (!LOADABLE_RE.test(u) || u === 'about:blank' || t.err || t.reported === u) return;
+      t.reported = u;
+      aboutOf(t).then((about) => {
+        if (disposed || !tabs.includes(t) || t.reported !== u) return;
+        if (about === null) t.reported = '';
+        onPage({ url: u, title: t.title, about: about || '' });
+      });
+    }
+
+    function renderView() {
+      const t = st();
+      for (const x of tabs) if (x.wv) x.wv.classList.toggle('off', x !== t);
+      pgv.classList.toggle('live', !!t.wv && !!t.url && LOADABLE_RE.test(t.url));
+      // A workspace file's page draws its own background, which no white may show around.
+      pgv.classList.toggle('file', !!fileOf(t.url));
+    }
+
+    function renderAsk() {
+      const q = st().ask;
+      ask.classList.toggle('on', !!q);
+      if (!q) return;
+      askT.textContent = q.text;
+      askT.title = q.text;
+      askYes.textContent = q.yes;
+      askNo.textContent = q.no;
+    }
+
+    function renderLogin() {
+      const q = st().login;
+      const was = login.classList.contains('on');
+      login.classList.toggle('on', !!q);
+      if (!q) return;
+      loginT.textContent = q.again ? 'that name and password did not work' : q.host;
+      if (was) return;
+      if (!q.again) loginName.value = '';
+      loginPass.value = '';
+      if (container.contains(document.activeElement) || document.activeElement === document.body) (q.again ? loginPass : loginName).focus();
+    }
+    function answerLogin(answer) {
+      const t = st();
+      const q = t.login;
+      if (!q) return;
+      t.login = null;
+      loginPass.value = '';
+      renderLogin();
+      window.flow.answerPageLogin(q.requestId, answer);
+    }
+
+    function render() {
+      renderStrip();
+      renderView();
+      showAddress();
+      updateNav();
+      renderLoading(false);
+      renderError();
+      renderStar();
+      renderNew();
+      renderAsk();
+      renderLogin();
+    }
+
+    /* A question shows on its tab until answered; a newer one on the same tab answers the older one with no. */
+    function askTab(t, q) {
+      const old = t.ask;
+      t.ask = q;
+      if (old) old.answer(false);
+      ifShown(t, renderAsk);
+    }
+    function answerAsk(yes) {
+      const t = st();
+      const q = t.ask;
+      if (!q) return;
