@@ -1360,3 +1360,457 @@
     // A PDF's page has loaded: main closes its viewer's thumbnails pane and puts one kept from before a restart back.
     function pdfShown(t) {
       if (t.guestId == null || typeof window.flow.pdfShown !== 'function') return;
+      const at = t.pdfBack;
+      t.pdfBack = null;
+      const docs = t.docs;
+      window.flow.pdfShown(t.guestId, at).catch((e) => {
+        if (stillThere(t, docs)) console.warn('flow page: could not set up the PDF viewer', e);
+      }).then(() => {
+        if (t.docs === docs) t.putting = null;
+      });
+    }
+    function refreshSoon(t, ms) {
+      clearTimeout(t.histTimer);
+      t.histTimer = setTimeout(() => refreshHistory(t), ms);
+    }
+    function clearRecoveryHistory(t) {
+      const recovery = t.recoverHistory;
+      clearTimeout(t.recoverTimer);
+      if (recovery) clearTimeout(recovery.maxTimer);
+      t.recoverTimer = 0;
+      t.recoverHistory = null;
+    }
+    function stabilizeRecoveryHistory(t, recovery) {
+      if (t.recoverHistory !== recovery) return;
+      const left = recovery.deadline - Date.now();
+      if (left <= 0) { clearRecoveryHistory(t); return; }
+      clearTimeout(t.recoverTimer);
+      t.recoverTimer = setTimeout(() => {
+        if (t.recoverHistory === recovery) clearRecoveryHistory(t);
+      }, Math.min(RECOVER_STABILIZE_MS, left));
+    }
+    function repairRecoveryHistory(t) {
+      const recovery = t.recoverHistory;
+      if (!recovery || !recovery.stopped) return;
+      if (Date.now() >= recovery.deadline) { clearRecoveryHistory(t); return; }
+      if (recovery.busy) { recovery.again = true; return; }
+      recovery.busy = true;
+      recovery.again = false;
+      clearTimeout(t.recoverTimer);
+      t.recoverTimer = 0;
+      refreshHistory(t, recovery).finally(() => {
+        if (t.recoverHistory !== recovery) return;
+        recovery.busy = false;
+        if (Date.now() >= recovery.deadline) { clearRecoveryHistory(t); return; }
+        if (recovery.again) repairRecoveryHistory(t);
+        else stabilizeRecoveryHistory(t, recovery);
+      });
+    }
+    function recoverFailed(t) {
+      const good = t && t.good;
+      if (!good || !t.err || !t.err.recover || t.recovering || disposed || !tabs.includes(t)) return;
+      t.recovering = true;
+      dropTab(t);
+      Object.assign(t, {
+        url: good.url,
+        title: good.title,
+        icon: good.icon,
+        history: validHistory(good.history),
+        historyJSON: good.history ? JSON.stringify(good.history) : '',
+        navAt: good.history ? { index: good.history.index, length: good.history.entries.length } : null,
+        scroll: scrollOf(good.scroll),
+        zoom: good.zoom,
+        restored: false,
+        restoredFrom: '',
+        scrollBack: null,
+        pdfBack: null,
+        putting: null,
+        committed: '',
+        inflight: false,
+        typed: null,
+        recoverHistory: { history: validHistory(good.history), stopped: false, deadline: 0, maxTimer: 0, busy: false, again: false },
+        recoverTimer: 0,
+      });
+      ifShown(t, () => {
+        render();
+        onTitle(t.title);
+      });
+      emitTabs();
+      createWebview(t);
+    }
+    function online() {
+      for (const t of tabs) {
+        if (t.err && t.err.recover) recoverFailed(t);
+        else if (t.wentOffline) reloadAfterOffline(t);
+      }
+    }
+    on(window, 'online', online);
+    /* A page that was loaded when the connection went can go white on its own (Notion does when its sync fails), with no
+       failed load for Flow to see. Its place is kept now; when the connection is back a page that shows nothing reloads
+       there. One that still shows something is left alone: it reconnects by itself, and a reload would lose its state. */
+    function offline() {
+      for (const t of tabs) if (t.wv && t.guestId != null && !t.err && LOADABLE_RE.test(t.url)) t.wentOffline = { place: scrollOf(t.place) || scrollOf(t.scroll) };
+    }
+    on(window, 'offline', offline);
+    async function reloadAfterOffline(t) {
+      const was = t.wentOffline;
+      t.wentOffline = null;
+      const wv = t.wv;
+      if (!was || disposed || !wv || t.guestId == null || t.err) return;
+      if (!(await wv.executeJavaScript(BLANK_JS).catch(() => false))) return;
+      if (disposed || !tabs.includes(t) || t.wv !== wv || t.err) return;
+      t.reloadRequest += 1;
+      t.reloading = true;
+      if (was.place) {
+        t.restoredFrom = t.url;
+        t.scrollBack = was.place;
+        t.putting = was.place;
+      }
+      wv.reload();
+    }
+    /* A load that failed for want of the network tries again by itself, sooner first, as Chrome's error page does: a
+       loose connection, or a site that comes back, sends Flow no online event. */
+    function retryLater(t) {
+      clearTimeout(t.retryTimer);
+      t.retryWait = Math.min(RETRY_MAX_MS, t.retryWait ? t.retryWait * 2 : RETRY_FIRST_MS);
+      t.retryTimer = setTimeout(() => {
+        t.retryTimer = 0;
+        if (!disposed && tabs.includes(t) && t.err && t.err.recover) recoverFailed(t);
+      }, t.retryWait);
+    }
+
+    function createWebview(t) {
+      if (t.wv || t.restoring || disposed || !shown || t !== st() || !t.url || !LOADABLE_RE.test(t.url)) return;
+      // A tab kept from before a restart gets its back/forward history and scroll back: main restores them into the
+      // new webview instead of loading its address (Chromium restores only into a page that has loaded nothing).
+      if (t.history && !t.restored && typeof window.flow.restorePageNext === 'function') {
+        t.restoring = true;
+        t.restored = true;
+        // Main starts the restored load as the guest attaches, before this webview hears of it: its start and any
+        // redirect go unseen, so a first page that lands elsewhere than this address was redirected.
+        t.restoredFrom = t.url;
+        t.scrollBack = t.scroll;
+        t.pdfBack = t.scroll && t.scroll.pdf;
+        t.putting = t.scroll;
+        window.flow.restorePageNext(t.url, t.history).catch((e) => console.warn('flow page: main could not take the history to restore', e)).then(() => {
+          t.restoring = false;
+          if (tabs.includes(t)) createWebview(t);
+        });
+        return;
+      }
+      // One kept without a history Chromium can restore (a file's page: history holds web pages only) still gets the
+      // scroll read at the quit, once its page has loaded.
+      if (t.scroll && !t.restored) {
+        t.restored = true;
+        t.restoredFrom = t.url;
+        t.scrollBack = t.scroll;
+        t.pdfBack = t.scroll.pdf;
+        t.putting = t.scroll;
+      }
+      const wv = document.createElement('webview');
+      t.wv = wv;
+      wv.setAttribute('partition', 'persist:flow');
+      wv.setAttribute('allowpopups', '');
+      wv.setAttribute('src', t.url);
+      t.report = REPORT_RE.test(t.url);
+      t.inflight = true;
+      const tOn = (type, f) => {
+        wv.addEventListener(type, f);
+        t.mine.push([type, f]);
+      };
+      tOn('did-start-loading', () => setLoading(t, true));
+      tOn('media-started-playing', () => { t.playing = true; });
+      tOn('media-paused', () => { t.playing = false; });
+      tOn('did-stop-loading', () => {
+        void refreshMedia();
+        setLoading(t, false);
+        bind(t);
+        reportPage(t);
+        if (t.inflight && t.guestId != null && !wv.isLoading()) dropped(t);
+        if (t.recoverHistory && !t.err) {
+          if (!t.recoverHistory.stopped) {
+            const recovery = t.recoverHistory;
+            recovery.stopped = true;
+            recovery.deadline = Date.now() + RECOVER_MAX_MS;
+            recovery.maxTimer = setTimeout(() => {
+              if (t.recoverHistory === recovery) clearRecoveryHistory(t);
+            }, RECOVER_MAX_MS);
+          }
+          repairRecoveryHistory(t);
+        }
+        ifShown(t, updateNav);
+      });
+      tOn('dom-ready', () => {
+        bind(t);
+        sendMarks(t);
+        ifShown(t, updateNav);
+      });
+      tOn('did-start-navigation', (e) => {
+        if (!e.isMainFrame || e.isInPlace) return;
+        const recovery = t.recoverHistory;
+        const recovered = recovery && recovery.history;
+        const saved = recovered && recovered.entries[recovered.index];
+        if (saved && !samePath(e.url, saved.url)) clearRecoveryHistory(t);
+        t.reloading = !!t.good && sameURL(e.url, t.good.url);
+        // Main drops a sign-in the page leaves unanswered.
+        if (t.login) {
+          t.login = null;
+          ifShown(t, renderLogin);
+        }
+        t.titleSince = false;
+        t.nav = { url: e.url, redirected: false };
+        if (t.selfMove && tidy(t.selfMove.to) !== tidy(e.url)) t.selfMove = null;
+      });
+      tOn('did-redirect-navigation', (e) => {
+        if (e.isMainFrame && !e.isInPlace && t.nav) t.nav.redirected = true;
+      });
+      tOn('did-navigate', (e) => {
+        bind(t);
+        if (t.recovering && e.url === 'about:blank' && t.good && !sameURL(t.good.url, e.url)) return;
+        if (ERROR_PAGE_RE.test(e.url)) {
+          failed(t, -106, t.good ? t.good.url : t.url);
+          return;
+        }
+        const recovering = t.recovering;
+        const recovery = recovering ? t.recoverHistory : null;
+        let recovered = recovery && recovery.history;
+        const recoveredAt = recovered && recovered.entries[recovered.index];
+        if (recoveredAt && !samePath(e.url, recoveredAt.url)) {
+          clearRecoveryHistory(t);
+          recovered = null;
+        }
+        const exactURL = recoveredAt && recovered && samePath(e.url, recoveredAt.url) ? recoveredAt.url : '';
+        const moved = t.selfMove || (t.nav && t.nav.redirected ? { from: t.nav.url, how: 'server' } : null) ||
+          (!t.nav && t.restoredFrom ? { from: t.restoredFrom, how: 'server' } : null);
+        // The scroll kept at quit, for the page the tab came back to (not where a redirect took it). A recovered page
+        // may strip a query while it loads; it is still the page whose exact address and place Flow is putting back.
+        const restored = t.restoredFrom && (tidy(e.url) === tidy(t.restoredFrom) || (recovering && samePath(e.url, t.restoredFrom)));
+        if (t.scrollBack && restored) t.wv.send('flow:restore-scroll', t.scrollBack);
+        else t.putting = null;
+        if (t.pdfBack && !restored) t.pdfBack = null;
+        t.scrollBack = null;
+        t.scroll = null;
+        t.place = null;
+        t.selfMove = null;
+        t.nav = null;
+        t.restoredFrom = '';
+        if (moved) redirected(moved.from, e.url, moved.how);
+        const reload = recovering || e.url === t.committed;
+        // A reload keeps its history entry, and Chromium only reports a title that differs from the entry's, so an
+        // unchanged title never arrives again: keep it.
+        if (!t.titleSince && !reload) t.title = '';
+        t.committed = exactURL || e.url;
+        t.docs += 1;
+        const docs = t.docs;
+        t.selection = false;
+        t.url = exactURL || e.url;
+        t.inflight = false;
+        t.typed = null;
+        t.recovering = false;
+        t.reloading = false;
+        if (t.marks && pageOf(e.url) !== t.marksPage) t.marks = null;
+        ifShown(t, hideMark);
+        clearError(t);
+        // As in Chrome, another page closes the find bar; a reload keeps it, with a fresh count. Results of the old
+        // page's search can still arrive after this: the request id no longer matches.
+        if (findTab === t || (t === st() && find.classList.contains('on'))) {
+          if (reload) {
+            findText = '';
+            findReq = -1;
+            fn.textContent = '';
+          } else closeFind(false);
+        }
+        ifShown(t, () => {
+          showAddress();
+          updateNav();
+          renderStar();
+          renderView();
+          onNavigate({ url: tidy(t.url), title: t.title });
+        });
+        emitTabs();
+        if (!recovered) {
+          refreshHistory(t);
+          refreshSoon(t, 500);
+        }
+        nextStep(t);
+      });
+      tOn('did-navigate-in-page', (e) => {
+        if (!e.isMainFrame) return;
+        const recovery = t.recoverHistory;
+        const recovered = recovery && recovery.history;
+        const saved = recovered && recovered.entries[recovered.index];
+        const stabilizing = saved && samePath(e.url, saved.url);
+        if (!stabilizing) {
+          t.scroll = null;
+          t.place = null;
+          if (recovery) clearRecoveryHistory(t);
+        }
+        t.url = stabilizing ? saved.url : e.url;
+        t.inflight = false;
+        if (t.marks && pageOf(e.url) !== t.marksPage) {
+          t.marks = null;
+          t.wv.send('flow:marks', []);
+        } else sendMarks(t);
+        ifShown(t, hideMark);
+        ifShown(t, () => {
+          showAddress();
+          updateNav();
+          renderStar();
+          onNavigate({ url: tidy(t.url), title: t.title });
+        });
+        emitTabs();
+        if (stabilizing) {
+          if (recovery.stopped) repairRecoveryHistory(t);
+        } else {
+          refreshHistory(t);
+          refreshSoon(t, 500);
+        }
+      });
+      tOn('page-title-updated', (e) => {
+        if (t.err || t.recovering) return;
+        t.titleSince = true;
+        t.title = e.title || '';
+        rememberGood(t);
+        if (t.title) ifShown(t, () => onTitle(t.title));
+        renderStrip();
+        emitTabs();
+      });
+      tOn('did-fail-load', (e) => {
+        if (!e.isMainFrame || e.errorCode === ERR_ABORTED) return;
+        bind(t);
+        t.inflight = false;
+        failed(t, e.errorCode, e.validatedURL);
+      });
+      tOn('render-process-gone', (e) => {
+        const reason = (e.details && e.details.reason) || '';
+        t.inflight = false;
+        t.selection = false;
+        ifShown(t, updateNav);
+        setLoading(t, false);
+        showError(t, GONE[reason] || 'this page stopped working', display(t.url), () => wv.reload());
+      });
+      tOn('found-in-page', (e) => {
+        const r = e.result;
+        if (findTab !== t || !r || r.requestId !== findReq || r.matches == null) return;
+        fn.textContent = r.matches ? `${r.activeMatchOrdinal} of ${r.matches}` : 'no matches';
+      });
+      // a focus the owner already left (handBack gives the keys back): the window is not brought forward for it
+      tOn('focus', () => { if (t === st() && !(t.handing && (t.handing.to || t.handing.away))) onFocus(); });
+      tOn('page-favicon-updated', (e) => {
+        if (t.err || t.recovering) return;
+        const list = (e.favicons || []).filter((x) => typeof x === 'string');
+        const inline = list.find((x) => ICON_RE.test(x));
+        const at = list.find((x) => /^https?:/i.test(x));
+        if (inline || !at || t.guestId == null || typeof window.flow.pageIcon !== 'function') {
+          setIcon(t, inline || '');
+          return;
+        }
+        // an icon by address comes through the page's own session, inline: Flow's document never fetches from a site
+        const page = t.url;
+        window.flow.pageIcon(t.guestId, at).then((data) => {
+          if (!disposed && t.url === page) setIcon(t, typeof data === 'string' && ICON_RE.test(data) ? data : '');
+        }, (err) => console.warn('flow page: main could not get a page\'s icon', err));
+      });
+      // Flow's document only gets a click on the page when Chromium sent it to Flow instead (a webview just attached in
+      // a new window misses its first clicks), and the keys then stay out of the page. It goes on to the page.
+      let passing = false;
+      const passClick = (e) => {
+        if (!e.isTrusted || e.pointerType !== 'mouse' || t.guestId == null || (e.type === 'pointerup' && !passing)) return;
+        passing = e.type === 'pointerdown';
+        // Flow's own focus for the press would take the keys back out of the page.
+        e.preventDefault();
+        if (passing) wv.focus();
+        const r = wv.getBoundingClientRect();
+        const s = wv.offsetWidth ? r.width / wv.offsetWidth : 1;
+        wv.sendInputEvent({
+          type: passing ? 'mouseDown' : 'mouseUp', x: Math.round((e.clientX - r.left) / s), y: Math.round((e.clientY - r.top) / s),
+          button: ['left', 'middle', 'right'][e.button] || 'left', clickCount: 1,
+          modifiers: [e.shiftKey && 'shift', e.ctrlKey && 'control', e.altKey && 'alt', e.metaKey && 'meta'].filter(Boolean),
+        }).catch((err) => console.error('flow page: a click could not be passed on to its page', err));
+      };
+      tOn('pointerdown', passClick);
+      tOn('pointerup', passClick);
+      // window.close() from the page (OAuth and "you can close this tab" pages): Electron destroys the guest.
+      tOn('close', () => closeSelf(t));
+      // The page's own preload reports pinches and wheels (it never sees a pinch). The pinch point is mapped into
+      // Flow's pixels; wheel deltas already match Flow's, since Chromium does not scale them for the transform.
+      tOn('ipc-message', (e) => {
+        const a = e.args && e.args[0];
+        if (e.channel === 'flow:mark-hover') {
+          showMark(t, a);
+          return;
+        }
+        if (e.channel === 'flow:probe-world') { media.dataset.probe = JSON.stringify(a); return; }
+        if (e.channel === 'flow:boot') { media.dataset.boot = String(a); window.__booted = (window.__booted || 0) + 1; return; }
+        if (e.channel === 'flow:using') {
+          t.using = { camera: !!(a && a.camera), microphone: !!(a && a.microphone) };
+          // Not refreshMedia() here: the guest reports twice a second and every report asked it again, so the page looped.
+          paintMedia(mediaStateNow || { camera: 'ask', microphone: 'ask', mac: {} });
+          return;
+        }
+        if (e.channel === 'flow:moved-self') {
+          if (!a || typeof a.from !== 'string' || typeof a.to !== 'string') return;
+          if (a.same) redirected(a.from, a.to, 'page');
+          // Under load this message can come after the tab committed the new address: it is reported now, and the page
+          // again if it was already reported there before notes knew it had moved.
+          else if (tidy(t.committed) === tidy(a.to)) {
+            redirected(a.from, a.to, 'page');
+            if (t.reported === tidy(t.url)) {
+              t.reported = '';
+              reportPage(t);
+            }
+          } else t.selfMove = { from: a.from, to: a.to, how: 'page' };
+          return;
+        }
+        if (e.channel === 'flow:selection') {
+          t.selection = a === true;
+          ifShown(t, updateNav);
+          return;
+        }
+        if (e.channel === 'flow:mark-click') {
+          if (a && typeof a.text === 'string') onMark(a.text);
+          return;
+        }
+        if (e.channel === 'flow:pdf') {
+          pdfShown(t);
+          return;
+        }
+        if (e.channel === 'flow:drag-done') {
+          onDragDone();
+          return;
+        }
+        if (e.channel === 'flow:scroll-now') {
+          const done = a && scrollAsks.get(a.id);
+          if (done) done(scrollOf(a));
+          return;
+        }
+        if (e.channel === 'flow:scrolled') {
+          const at = scrollOf(a);
+          if (at) {
+            t.place = at;
+            t.putting = null;
+            if (t.good) t.good.scroll = at;
+          }
+          return;
+        }
+        if (e.channel === 'flow:marks-found') {
+          if (t === st() && t.onFound && Array.isArray(a) && pageOf(t.url) === t.marksPage) t.onFound(a.filter((x) => typeof x === 'string'));
+          return;
+        }
+        if (e.channel === 'flow:find-quote') {
+          const done = a && quoteWaits.get(a.id);
+          if (done) done(!!a.found);
+          return;
+        }
+        if (e.channel === 'flow:pinch') {
+          // nav decides by the fingers down (pinchKind): a pinch of the space's it has already zoomed, and this window
+          // does nothing; the window's own the page zooms itself, as Chrome does
+          if (!a || onPinch({ ...a, used: false, t: performance.timeOrigin + e.timeStamp })) return;
+          window.flow.pinchPage(t.guestId, a).catch((err) => console.warn('flow page: a pinch could not zoom the page', err));
+          return;
+        }
+        if (!a || e.channel !== 'flow:wheel') return;
+        onWheel({ dx: a.dx, dy: a.dy, t: a.t, used: !!a.used });
+        // Chromium updates the page state about a second after a scroll stops (smooth scrolling runs on a bit).
+        refreshSoon(t, 2500);
+      });
