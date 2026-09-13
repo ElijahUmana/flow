@@ -2778,3 +2778,555 @@ function applyRemote(s, force = false) {
       ...d,
       // a doc saved before any window built this workspace has no mode: it keeps the one it has (layout, a pop-out
       // restored at start came up tiled)
+      mode: d.mode || (old && old.mode) || 'float',
+      windows: reuse(d.windows, localWin, winKeep),
+      closed: reuse(d.closed, localWin, () => []),
+      notes: reuse(d.notes, localNote, noteKeep),
+      zones: (d.zones || []).map((zn) => (zoneMap.has(zn.id) ? patchObj(zoneMap.get(zn.id), zn, zoneKeep) : zn)),
+    };
+    if (!old) return merged;
+    const views = FlowNav.viewOf(old);
+    patchObj(old, merged, wsKeep);
+    if (SEC.has(old.id)) Object.assign(old, views);
+    if (SOLO && old.id === SOLO) soloBase = FlowNav.viewOf(d);
+    return old;
+  });
+  ui.hinted = ui.hinted || !!(s.ui && s.ui.hinted);
+  // which workspace the main window shows, and its sidebar, are the main window's: a pop-out carries them on as the
+  // main window last saved them, so a pop-out's save never puts back what the main window showed when it opened
+  if (SOLO && s.ui) { if (s.ui.at) ui.at = s.ui.at; ui.sbHidden = !!s.ui.sbHidden; }
+  if (!SOLO) cur = Math.max(0, idx(atId));
+  else if (idx(SOLO) < 0 || (SOLO_ZONE && !zoneById(WS[idx(SOLO)], SOLO_ZONE))) { window.close(); return; }
+  else cur = idx(SOLO);
+
+  const keepWs = new Set(shown().map((ws) => ws.id));
+  SEC.forEach((sx, id) => {
+    if (keepWs.has(id)) return;
+    sx.sec.remove();
+    SEC.delete(id);
+  });
+  shown().forEach((ws) => {
+    if (!SEC.has(ws.id)) track.appendChild(buildWS(ws));
+    const sx = SEC.get(ws.id);
+    if (sx.sec.style.background !== ws.bg) sx.sec.style.background = ws.bg;
+    ws.windows.forEach((w) => {
+      const r = WIN.get(w.id);
+      if (!r) {
+        buildWin(ws, w);
+        ensureBody(ws, w);
+        return;
+      }
+      if (r.el.parentElement !== sx.canvas) {
+        sx.canvas.appendChild(r.el);
+        if (r.page) { r.page.dispose(); r.page = null; r.vis = null; }
+      }
+      ensureBody(ws, w);
+      renderTitle(ws, w);
+      fillEditors(ws, w);
+      r.el.classList.toggle('noted', !!w.noted);
+    });
+  });
+  const live = new Set();
+  shown().forEach((ws) => ws.windows.forEach((w) => live.add(w.id)));
+  [...WIN.keys()].forEach((id) => {
+    if (live.has(id)) return;
+    const r = WIN.get(id);
+    disposeBody(r);
+    r.el.remove();
+    WIN.delete(id);
+  });
+  layoutAll();
+  jumpTo(cur);
+  syncVisible();
+  renderNav();
+  renderModes();
+  renderSidebar();
+  edges();
+}
+
+/* ---------- start ---------- */
+let resolveReady;
+const ready = new Promise((r) => { resolveReady = r; });
+window.__flow = {
+  ready,
+  nav: () => nav,
+  state: () => snapshot(),
+  go: (i) => go(i),
+  spawn: (kind) => { const w = spawn(kind); return w ? w.id : null; },
+  openPage: (url) => { const w = openPageWin(WS[cur], url); return w ? w.id : null; },
+  peek: (sid) => peek(WS[cur], sid).map((x) => x.w.id),
+  space: (sid, still) => showSpace(WS[cur], sid, still ? { still: true } : undefined),
+  closeWorkspace: (id) => closeWorkspace(WS.find((ws) => ws.id === id)),
+  undoWorkspaceClose: () => undoWorkspaceClose(),
+  workspaceUndo: () => { const u = workspaceUndos().at(-1); return u ? JSON.parse(JSON.stringify(u.ws)) : null; },
+  windows: () => WS.flatMap((ws) => ws.windows.map((w) => {
+    const n = w.noteId ? noteById(ws, w.noteId) : null;
+    const r = WIN.get(w.id);
+    return { id: w.id, type: w.type, ws: ws.id, title: winTitle(ws, w), url: n && n.kind === 'page' ? n.url : undefined, noteId: w.noteId, sessionId: w.sessionId, built: !!r, visible: !!(r && r.vis) };
+  })),
+  term: (id) => { const r = WIN.get(id); return (r && r.term) || null; },
+  page: (id) => { const r = WIN.get(id); return (r && r.page) || null; },
+  /* The first-run workspaces as seed() makes them (fresh session ids each call), without opening any of them. */
+  seed: () => JSON.parse(JSON.stringify(seed())),
+  /* Runs a native menu action as main would send it ('new-agent', 'next-ws', ...); false if there is no such action. */
+  menu: (action) => { const f = MENU[action]; if (f) f(); return !!f; },
+};
+
+/* Before Nov 1 19:50 UTC a sub-workspace was a region of the main desktop (zone x, y, w, h). Each becomes a space of
+   its own: the windows inside it, open or closed, move into it and keep their place relative to its left edge. */
+function legacyZoneOf(ws, w) {
+  if (w.x == null) return null;
+  const cx = w.x + (w.w || 0) / 2, cy = w.y + (w.h || 0) / 2;
+  return (ws.zones || []).find((zn) => zn.x != null && cx >= zn.x && cx <= zn.x + zn.w && cy >= zn.y && cy <= zn.y + zn.h) || null;
+}
+function migrateZones(ws) {
+  const old = (ws.zones || []).filter((zn) => zn.x != null);
+  if (!old.length) return false;
+  [...ws.windows, ...(ws.closed || [])].forEach((w) => {
+    const zn = !w.zone && legacyZoneOf(ws, w);
+    if (zn) { w.zone = zn.id; w.x = w.x - zn.x + 1.2; }
+  });
+  old.forEach((zn) => { delete zn.x; delete zn.y; delete zn.w; delete zn.h; zn.pan = 0; });
+  ws.at = null;
+  return true;
+}
+/* The first-run demo about the old September codebase (zone z-sept with its windows, note n-sept), which the owner did
+   not want. Its terminals go to the closed list with their sessions still running; its note stays unless untouched. */
+function dropSeptember(ws) {
+  const zn = (ws.zones || []).find((z) => z.id === 'z-sept');
+  const seeded = new Set(['w-sport', 'w-tests', 'w-snote']);
+  const out = ws.windows.filter((w) => seeded.has(w.id) || (zn && legacyZoneOf(ws, w) === zn));
+  if (!zn && !out.length) return false;
+  ws.windows = ws.windows.filter((w) => !out.includes(w));
+  out.filter(isTerm).forEach((w) => { w.max = null; ws.closed.push(w); });
+  ws.zones = (ws.zones || []).filter((z) => z !== zn);
+  ws.notes = ws.notes.filter((n) => !(n.id === 'n-sept' && n.title === 'september line' && n.body === 'never installed. port the oct 29 search fix first.'));
+  return true;
+}
+/* What src/sidebar.js needs from the model and the window actions (FlowSidebar.mount). */
+function sidebarHooks() {
+  return {
+    get WS() { return WS; }, get cur() { return cur; }, get ui() { return ui; }, get dragging() { return dragging; }, get renaming() { return renaming; },
+    WIN, SOLO, SOLO_ZONE, els: { sb, sblist, q, spacesEl, viewport },
+    esc, hostOf, prettyTitle, tilde, newId, ago, termTitle, isTerm, noteById, zoneById, findWin, locate, zoneOf, curSpace, inSpace,
+    save, go, toast, closeWorkspace, focusWin, openNote, openPageWin, closeWin, addWindow, reopen, endAgent, popOut, showSpace, moveToSpace,
+    moveWindow, frontWin, freeSpot, renameInline, renameAgent, renameZone, showMenu, agentItems, forkSession, copyResume,
+    copyText, openSessionIds, setDragSession: (id) => { dragSession = id; },
+    members: (w) => (window.FlowTeams ? window.FlowTeams.members(w) : []), paneName: (p) => window.FlowTeams.paneName(p),
+    removeZone: (ws, zid) => nav.removeZone(ws, zid),
+    addZone, spaces: (ws) => spaceOrder(ws),
+  };
+}
+async function init() {
+  if (!flow) {
+    document.body.innerHTML = '<p style="padding:30px;color:#8d8d93">flow could not reach its backend (the preload script did not load).</p>';
+    console.error('window.flow is missing: the preload script did not load');
+    return;
+  }
+  window.FlowNotes.mount({
+    locate, win: (id) => WIN.get(id), findWin, noteById, save, scheduleSidebar, renderSidebar, focusWin, addWindow, freeSpot, newId,
+    removeWindow, updateNoteTitle, fitSoon, workspaces: () => WS,
+    clear: (ws, w) => nav.clear(ws, w),
+    openLink: (id, url) => openLink(id, url),
+    page: (id) => { const r = WIN.get(id); return (r && r.page) || null; },
+    renderTitle, toast,
+    renamed: () => { WS.forEach((ws) => ws.windows.forEach((w) => { if (w.type !== 'page') return; renderTitle(ws, w); const r = WIN.get(w.id); if (r && r.page && r.page.namesChanged) r.page.namesChanged(); })); renderSidebar(); },
+  });
+  if (window.FlowSidebar) window.FlowSidebar.mount(sidebarHooks());
+  else console.error('sidebar.js did not load, so the sidebar cannot draw');
+  if (window.FlowFiles) {
+    window.FlowFiles.mount({
+      get WS() { return WS; }, get cur() { return cur; }, els: { sb, sblist, q }, save, renderSidebar, toast, expand, tilde,
+      openUrl: (ws, url, at) => window.FlowSidebar.openUrl(ws, url, at),
+    });
+  } else {
+    console.error('files.js did not load, so the sidebar shows no files');
+  }
+  const saved = await flow.loadState();
+  stateBase = saved && typeof saved === 'object' ? JSON.parse(JSON.stringify(saved)) : null;
+  let restored = false;
+  if (saved && saved.v === 11 && Array.isArray(saved.ws) && saved.ws.length) {
+    WS = saved.ws;
+    const dropped = WS.map(dropSeptember), moved = WS.map(migrateZones);
+    if ([...dropped, ...moved].some(Boolean)) save();
+    ui = Object.assign(ui, saved.ui || {});
+    restored = true;
+  } else {
+    if (saved) console.error(`the saved state is version ${saved.v}, not 11; starting from the first-run workspaces`);
+    WS = seed();
+    WS.forEach(migrateZones);
+  }
+  ui.workspaceUndos = Array.isArray(ui.workspaceUndos) ? ui.workspaceUndos.filter((u) => u && u.ws && Array.isArray(u.afterIds) && Array.isArray(u.killed)).slice(-1) : [];
+  if (window.FlowSidebar && WS.map(window.FlowSidebar.migrate).some(Boolean)) save();
+  if (window.FlowNotes.load(saved && saved.pages)) save();
+  if (SOLO && idx(SOLO) < 0) { document.body.innerHTML = '<p style="padding:30px;color:#8d8d93">that workspace no longer exists.</p>'; resolveReady(); return; }
+  if (innerWidth < 900) setSbHidden(true);
+  sb.style.transition = 'none';
+  sb.classList.toggle('hide', sbHidden());
+  void sb.offsetWidth;
+  requestAnimationFrame(() => { sb.style.transition = ''; });
+  measure();
+  nav = window.FlowNav.mount({
+    viewport, edgeL, edgeR,
+    solo: SOLO ? (SOLO_ZONE ? 'zone' : 'ws') : '',
+    current: () => WS[cur],
+    workspaces: () => WS,
+    space: (ws) => curSpace(ws),
+    spaces: (ws) => spaceOrder(ws),
+    /* a removed sub-workspace's sections go to the space it was in (notes keeps a section's space); returns the undo */
+    moveSections: (ws, from, to) => {
+      const N = window.FlowNotes, moved = typeof N.moveSection === 'function' ? N.sections(ws).filter((f) => f.zone === from) : [];
+      moved.forEach((f) => N.moveSection(ws, f.id, to || ''));
+      return () => moved.forEach((f) => N.moveSection(ws, f.id, from));
+    },
+    title: (ws, w) => winTitle(ws, w),
+    showSpace: (ws, zid, opts) => showSpace(ws, zid, opts),
+    track: () => track,
+    goWs: (i, o) => goWs(i, o),
+    peek: (ws, sid) => peek(ws, sid),
+    canvas: (ws) => canvasOf(ws),
+    geo: (w) => geo(w),
+    size: () => ({ vw: VW, vh: VH }),
+    busy: (on) => setDragging(on),
+    changed: () => { renderSidebar(); save(); groupsSoon(); },
+    unused: (ws, w) => window.FlowNotes.unused(ws, w),
+    toast: (msg, ms, action) => toast(msg, ms, action),
+    removeWindow: (ws, w) => removeWindow(ws, w),
+    addWindow: (ws, w) => addWindow(ws, w),
+    closeWorkspace,
+    detachWorkspace,
+    attachWorkspace,
+    // a page live here goes to its pop-out: a save drops it from this window's pages, or this window's last claim on
+    // it stands and the store keeps this window's old tabs over the pop-out's
+    release: (w) => { const r = WIN.get(w.id); if (!r) return; const live = livePage(r); disposeBody(r); if (live) save(); },
+    refresh: (ws) => { ws.windows.forEach((w) => ensureBody(ws, w)); layout(ws); syncVisible(); },
+    // a removed sub-workspace's undo opens its pop-out again where it was (nav removeZone)
+    popOut: (wsId, zid, frame) => popOut(wsId, zid, frame),
+    moveWindows,
+  });
+  // After FlowNav.mount, which converts pans saved in px: no view copied here, or written back by snapshot(), is in px.
+  if (SOLO) {
+    const ws = WS[idx(SOLO)], sid = curSpace(ws), zn = sid && zoneById(ws, sid), at = SOLO_ZONE ? zn : zn || ws;
+    soloBase = FlowNav.viewOf(ws);
+    if (at && at.popView) Object.assign(ws, FlowNav.viewOf(at.popView));
+    else if (SOLO_ZONE && (ws.at || null) !== SOLO_ZONE) Object.assign(ws, FlowNav.viewOf(zn));
+  }
+  await nav.ready;
+  if (window.FlowGroups) {
+    groups = window.FlowGroups.mount({
+      current: () => WS[cur], space: (ws) => curSpace(ws), inSpace: (ws, w) => inSpace(ws, w), nav, canvas: canvasOf, geo,
+      size: () => ({ vw: VW, vh: VH }), elOf, apply: (w) => apply(w, w), newId, busy: (on) => setDragging(on),
+      windows: (ws) => ws.windows.filter((w) => inSpace(ws, w) && !nav.away(ws, w)),
+      front: () => { const f = frontWin(); return f ? f.w : null; }, editing: (el) => isEditingTarget(el),
+      settle: (ws) => { keepSpaceOrigin(ws); sizeCanvas(ws); }, changed: () => { renderSidebar(); save(); },
+      fills: (ws, b) => { const v = nav.visible(ws); return !!b && b.x >= v.x - 0.5 && b.x + b.w <= v.x + v.w + 0.5 && b.y >= v.y - 0.5 && b.y + b.h <= v.y + v.h + 0.5 && (Math.abs(v.w - b.w) < 0.12 * v.w || Math.abs(v.h - b.h) < 0.12 * v.h || v.z >= 0.999); },
+      frame: (ws, b) => { if (nav.frameTo) nav.frameTo(ws, b); },
+    });
+  } else {
+    console.error('groups.js did not load, so windows cannot be grouped');
+  }
+  if (nav.recover(WS)) save();
+  if (!restored) fitStartingLayout();
+  cur = SOLO ? idx(SOLO) : Math.max(0, idx(ui.at));
+  z = Math.max(z, ...WS.flatMap((ws) => ws.windows.map((w) => w.z || 0)));
+  buildAll();
+  jumpTo(cur);
+  // the keys go back to the terminal that had them: the front window of the space on screen
+  const top = WS[cur] && WS[cur].windows.find((w) => inSpace(WS[cur], w) && elOf(w) && elOf(w).classList.contains('front'));
+  if (top && WIN.get(top.id) && WIN.get(top.id).term) WIN.get(top.id).term.focus();
+  renderNav();
+  renderModes();
+  renderSidebar();
+  edges();
+  if (window.FlowDock) window.FlowDock.attach($('dock'));
+  if (window.FlowArrange) {
+    arrangeCtl = window.FlowArrange.attach({
+      current: () => { const ws = WS[cur]; return ws && !SOLO ? { ws, key: `${ws.id}:${curSpace(ws) || ''}` } : null; },
+      windows: (ws) => ws.windows.filter((w) => inSpace(ws, w) && !nav.away(ws, w)).map((w) => ({ id: w.id, x: w.x, y: w.y, w: w.w, h: w.h })),
+      front: (ws) => { const f = frontWin(); return f && f.ws === ws ? f.w : null; },
+      arrange: (ws, way, front, base) => nav.arrange(ws, way, front, base),
+      size: () => ({ vw: VW, vh: VH }),
+      visible: (ws) => nav.visible(ws),
+      bottom: () => nav.bottom(),
+      view: (ws) => FlowNav.viewOf(ws),
+      apply: (ws, rects, view) => board(() => {
+        // Grid and columns no longer have controls; a stale saved mode would ignore these rectangles in layout().
+        ws.mode = 'float';
+        ws.windows.forEach((w) => { const a = rects[w.id]; if (!a) return; Object.assign(w, a); w.max = null; const o = WIN.get(w.id); if (o) o.cur = null; });
+        layout(ws);
+        if (view) { Object.assign(ws, view); sizeCanvas(ws); }
+        fitSoon();
+        save();
+      }),
+    });
+    // the dock's arrange button opens the arrange menu just above it; its other buttons make things (the dock's own
+    // click handler, which this one keeps from seeing it)
+    $('dock').addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-k="arrange"]');
+      if (!b || dragging || dockCarried) return;
+      e.stopImmediatePropagation();
+      const r = b.getBoundingClientRect();
+      showMenu({ preventDefault() {}, clientX: r.left, clientY: r.top - 6 }, arrangeCtl.menu().map((m) => ({ label: m.label, hint: m.hint, run: () => arrangeCtl.pick(m.way) })));
+      if (ctxEl) ctxEl.style.top = Math.max(6, r.top - 6 - ctxEl.getBoundingClientRect().height) + 'px';
+    }, true);
+  }
+  if (window.FlowBeside) {
+    besideKeys = window.FlowBeside.attach({
+      viewport,
+      front: () => { const f = frontWin(); const el = f && elOf(f.w); return el ? { ...f, el } : null; },
+      canOpen: (w) => w.type === 'page' || w.type === 'note' || (w.type === 'term' && (w.cmd === 'claude' || w.cmd === 'shell')),
+      zoom: (ws) => nav.zoom(ws),
+      toScreen: (ws, r) => { const v = nav.visible(ws), k = v.z; return { left: ((r.x - v.x) / 100) * VW * k, top: ((r.y - v.y) / 100) * VH * k, width: (r.w / 100) * VW * k, height: (r.h / 100) * VH * k }; },
+      beside: (ws, w, side, split, dry) => (ws.mode === 'float' ? nav.beside(ws, w, side, split, dry) : null),
+      open: (ws, w, side, split) => openBeside(ws, w, side, split),
+      busy: (on) => setDragging(on),
+      isBusy: () => document.body.classList.contains('busy'),
+      avoid: () => [$('dock'), document.querySelector('.ov')].filter(Boolean).map((e) => e.getBoundingClientRect()),
+    });
+  }
+  if (window.FlowOverview) {
+    window.FlowOverview.mount({
+      stage: $('stage'), dock: $('dock'), nav, geo, canvas: canvasOf, size: () => ({ vw: VW, vh: VH }),
+      current: () => WS[cur], space: (ws) => curSpace(ws), windows: (ws) => ws.windows.filter((w) => inSpace(ws, w) && !nav.away(ws, w)),
+      go: (ws, w) => focusWin(ws, w), busy: (on) => setDragging(on), changed: () => { renderSidebar(); save(); },
+    });
+  } else {
+    console.error('overview.js did not load, so the bottom right shows no overview');
+  }
+  if (window.FlowTeams) {
+    window.FlowTeams.mount({
+      get WS() { return WS; }, get cur() { return cur; }, get VW() { return VW; }, get VH() { return VH; },
+      locate, save, toast, addWindow, removeWindow, apply, sizeCanvas, focusWin, bringFront, besideSpot, toSpace: (ws, x, y) => nav.toSpace(ws, x, y), bottom: () => nav.bottom(),
+      geo, elOf, termTitle, splitTitle, renderTitle, onTermTitle, scheduleSidebar, renderSidebar, remoteOpts, newId,
+      tilde, setDragging, edgePan: (ws, x, y, moved) => x == null ? stopEdgePan(ws) : feedEdgePan(ws, x, y, moved), keepSpaceOrigin, rectHas, inSpace, WIN, els: { viewport },
+    });
+  } else {
+    console.error('teams.js did not load, so teammates stay as panes of their team');
+  }
+
+  spacesEl.addEventListener('click', (e) => {
+    if (renaming && renaming.el.contains(e.target)) return;
+    const close = e.target.closest('[data-close-ws]');
+    if (close) {
+      e.preventDefault();
+      e.stopPropagation();
+      const ws = WS[+close.dataset.closeWs];
+      if (ws) closeWorkspace(ws);
+      return;
+    }
+    if (e.target.closest('#addws')) { newWorkspace(); return; }
+    if (e.detail > 1 && e.timeStamp - szxAt < 500) return;
+    const szx = e.target.closest('[data-szx]');
+    if (szx) { e.stopPropagation(); szxAt = e.timeStamp; showSpace(WS[+szx.dataset.szx], null); return; }
+    const pop = e.target.closest('[data-pop]');
+    if (pop) { e.stopPropagation(); popOut(WS[+pop.dataset.pop].id); return; }
+    const t = e.target.closest('.sp');
+    if (t && t.dataset.i != null) { const i = +t.dataset.i; if (i === cur && curSpace(WS[i])) { if (!e.target.closest('.sz')) showSpace(WS[i], null); } else go(i); }
+  });
+  spacesEl.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('[data-close-ws]')) { e.preventDefault(); e.stopPropagation(); return; }
+    navPressed = true;
+  }, true);
+  const navRelease = () => {
+    if (!navPressed) return;
+    navPressed = false;
+    if (navHeld) { navHeld = false; setTimeout(renderNav, 0); }
+  };
+  document.addEventListener('pointerup', navRelease, true);
+  document.addEventListener('pointercancel', navRelease, true);
+  document.addEventListener('pointermove', (e) => { if (navPressed && !e.buttons) navRelease(); }, true);
+  window.addEventListener('blur', navRelease);
+  /* Right-click a workspace's name: its background (preset gradients, previewed as you point), folder, rename. */
+  spacesEl.addEventListener('contextmenu', (e) => {
+    const t = e.target.closest('.sp[data-i]');
+    if (!t || !window.FlowWsMenu) return;
+    const i = +t.dataset.i, ws = WS[i], s = SEC.get(ws.id);
+    window.FlowWsMenu.open(e, {
+      el: s ? s.sec : null, bg: ws.bg,
+      onBg: (css) => { ws.bg = css; if (s) s.sec.style.background = css; save(); },
+      ...window.FlowTeams.runsOnMenu(ws, () => pickFolder(ws)),
+      onRename: () => renamePill(i),
+      ...(WS.length > 1 ? { onDelete: () => closeWorkspace(ws) } : {}),
+    });
+  });
+  spacesEl.addEventListener('dblclick', (e) => {
+    if (e.target.closest('[data-pop]') || e.timeStamp - szxAt < 500) return;
+    const t = e.target.closest('.sp');
+    if (!t || t.dataset.i == null) return;
+    const i = +t.dataset.i, sz = e.target.closest('.sz');
+    if (sz) renameZone(WS[i], curSpace(WS[i]), sz);
+    else renamePill(i);
+  });
+  spacesEl.addEventListener('dragstart', (e) => {
+    const t = e.target.closest('.sp');
+    if (!t) return;
+    e.dataTransfer.setData('text/plain', 'workspace:' + t.dataset.i);
+    e.dataTransfer.effectAllowed = 'move';
+  });
+  spacesEl.addEventListener('dragend', (e) => {
+    const t = e.target.closest('.sp');
+    if (!t) return;
+    const outside = e.screenX < window.screenX || e.screenX > window.screenX + window.outerWidth || e.screenY < window.screenY || e.screenY > window.screenY + window.outerHeight;
+    if (outside) popOut(WS[+t.dataset.i].id);
+  });
+  $('dock').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b && !dragging && !dockCarried) spawn(b.dataset.k); });
+  $('dock').addEventListener('pointerdown', (e) => { const b = e.target.closest('button'); if (b) carryFromDock(e, b); });
+
+  q.addEventListener('focus', () => loadSessions());
+  $('collapse').addEventListener('click', () => toggleSidebar());
+  $('expand').addEventListener('click', () => toggleSidebar(false));
+
+  viewport.addEventListener('contextmenu', desktopCtx);
+  document.addEventListener('wheel', backPageWheel, { capture: true, passive: false });
+  window.addEventListener('keydown', (e) => {
+    if (!document.body.classList.contains('workspace-committing')) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, true);
+  window.addEventListener('keydown', boardKey, true);
+  // typing anywhere in this window is newer than the board's last step: ⌘Z is the text's then
+  document.addEventListener('beforeinput', (e) => { if (e.inputType !== 'historyUndo' && e.inputType !== 'historyRedo') editAt = performance.now(); }, true);
+  document.addEventListener('keydown', (e) => { if (!e.metaKey && !e.ctrlKey && e.target.closest && e.target.closest('.xterm') && (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Enter')) editAt = performance.now(); }, true);
+  document.addEventListener('keydown', (e) => {
+    if (document.body.classList.contains('workspace-committing')) { e.preventDefault(); e.stopPropagation(); return; }
+    if (e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k') { e.preventDefault(); openSearch(); return; }
+    if (e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'z' && !isEditingTarget(e.target)) {
+      if (spaceUndoFirst()) { e.preventDefault(); e.stopPropagation(); undoSpace(); }
+      else if (workspaceUndoReady()) { e.preventDefault(); e.stopPropagation(); undoWorkspaceClose(); }
+      return;
+    }
+    if (e.metaKey && e.key === '\\') { e.preventDefault(); toggleSidebar(); return; }
+    if (e.key === 'Escape') { if (e.target === q) { q.value = ''; renderSidebar(); q.blur(); } return; }
+    if (isEditingTarget(e.target)) return;
+    if (e.key === '/') { e.preventDefault(); openSearch(); return; }
+    if ((e.ctrlKey || e.altKey) && !e.metaKey && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
+      e.preventDefault();
+      step(e.key === 'ArrowRight' ? 1 : -1);
+    }
+  });
+
+  let nativeDrag = false, nativeEdgeWs = null;
+  const stopNativeEdge = () => {
+    stopEdgePan(nativeEdgeWs);
+    nativeEdgeWs = null;
+    if (nativeDrag) { nativeDrag = false; setDragging(false); }
+  };
+  const moveNativeEdge = (e) => {
+    if (!nativeDrag) return;
+    const ws = WS[cur];
+    if (nativeEdgeWs && nativeEdgeWs !== ws) stopEdgePan(nativeEdgeWs);
+    nativeEdgeWs = ws;
+    feedEdgePan(ws, e.clientX, e.clientY);
+  };
+  const endNativeDrag = () => {
+    stopNativeEdge();
+    if (window.FlowSidebar && window.FlowSidebar.nativeDragEnd) window.FlowSidebar.nativeDragEnd();
+  };
+  document.addEventListener('dragstart', (e) => {
+    if (dragging) { e.preventDefault(); return; }
+    nativeDrag = true;
+    setDragging(true);
+  }, true);
+  document.addEventListener('drag', moveNativeEdge, true);
+  document.addEventListener('dragover', moveNativeEdge, true);
+  document.addEventListener('dragleave', (e) => {
+    if (!nativeDrag || e.relatedTarget) return;
+    const r = viewport.getBoundingClientRect();
+    if (e.clientX <= r.left || e.clientX >= r.right || e.clientY <= r.top || e.clientY >= r.bottom) stopEdgePan(nativeEdgeWs);
+  }, true);
+  document.addEventListener('dragend', endNativeDrag, true);
+  document.addEventListener('drop', () => setTimeout(endNativeDrag, 0), true);
+  window.addEventListener('blur', endNativeDrag);
+
+  const carriedFile = () => window.FlowFiles && window.FlowFiles.dragging && window.FlowFiles.dragging();
+  viewport.addEventListener('dragover', (e) => {
+    const file = carriedFile();
+    if (!dragSession && !file) return;
+    const ws = WS[cur];
+    if (!ws) return;
+    /* A window body owns its file drop (a terminal copies across machines; a note takes the path as text). */
+    if (file && e.target.closest && e.target.closest('.win')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'copy';
+    viewport.classList.add('drop');
+  }, true);
+  viewport.addEventListener('dragleave', (e) => { if (!viewport.contains(e.relatedTarget)) viewport.classList.remove('drop'); });
+  viewport.addEventListener('drop', (e) => {
+    const file = carriedFile();
+    if (!dragSession && !file) return;
+    if (file && e.target.closest && e.target.closest('.win')) { stopNativeEdge(); return; }
+    e.preventDefault();
+    e.stopPropagation();
+    const ws = WS[cur];
+    stopNativeEdge();
+    viewport.classList.remove('drop');
+    /* The world point is taken after the last edge-pan frame. Opening a file is async, so pass that point through. */
+    const hand = nav.toSpace(ws, e.clientX, e.clientY);
+    if (file) {
+      window.FlowFiles.dropOnBoard(ws, { world: true, hand });
+      return;
+    }
+    const sid = dragSession;
+    dragSession = null;
+    focusWin(ws, openSession(sid, { x: Math.max(0, hand.x - 12), y: Math.max(5.4, hand.y - 4), hand }));
+  }, true);
+  /* A file dropped anywhere but a terminal must never replace the app with that file. */
+  document.addEventListener('dragover', (e) => { if (!e.defaultPrevented) { e.preventDefault(); e.dataTransfer.dropEffect = 'none'; } });
+  document.addEventListener('drop', (e) => e.preventDefault());
+  /* A file dragged in from outside drops on any page in view, in front or not, as on the Mac: while the drag is over
+     this window, the shield that keeps a first click out of a page behind steps aside (app.css body.filedrag). It ends
+     when the drag leaves the window, drops here, after a drop into a page or the drag leaving one (fileDragDone), or at
+     the first move after a drop into a page. */
+  const fileDrag = (on) => { clearTimeout(fileDragTimer); document.body.classList.toggle('filedrag', on); };
+  document.addEventListener('dragenter', (e) => { if (e.dataTransfer && e.dataTransfer.types.includes('Files')) fileDrag(true); }, true);
+  document.addEventListener('dragover', () => clearTimeout(fileDragTimer), true);
+  document.addEventListener('dragleave', (e) => { if (!e.relatedTarget && (e.clientX <= 0 || e.clientY <= 0 || e.clientX >= innerWidth || e.clientY >= innerHeight)) fileDrag(false); }, true);
+  document.addEventListener('drop', () => fileDrag(false), true);
+  document.addEventListener('pointermove', () => { if (document.body.classList.contains('filedrag')) fileDrag(false); }, true);
+
+  flow.onStateChanged((s) => applyRemote(s));
+  flow.onFlushPages(() => flushPages());
+  // a page's download belongs to the page's workspace from its start, so it lands there however its tab or window ends
+  flow.onDownloadStarted(({ id, guestId }) => {
+    const hit = [...WIN.entries()].find(([, r]) => r.page && r.page.guests().includes(guestId));
+    const L = hit && locate(hit[0]);
+    if (L) flow.downloadIn(id, L.ws.id);
+  });
+  flow.onDownloadDone((d) => {
+    const ws = WS.find((x) => x.id === d.wsId);
+    if (ws && window.FlowFiles) window.FlowFiles.downloaded(ws, d);
+  });
+  // a crash or a power cut skips the flush: the main window keeps the shells' folders a minute fresh
+  if (!SOLO) setInterval(() => keepShellFolders().then((moved) => { if (moved) save(); }, (err) => console.error('could not read where the shells are', err)), 60000);
+  flow.onUnsavedPages(onUnsavedPages);
+  flow.onMenu((action) => {
+    if (document.body.classList.contains('workspace-committing')) return;
+    const f = MENU[action];
+    if (f) f(); else console.warn(`unknown menu action: ${action}`);
+  });
+  // the trackpad's touches (macOS, main's touch.js): three fingers move the workspaces under them (MAC_NOTES 25)
+  if (flow.onFingers) flow.onFingers((f) => nav.fingers(f));
+  window.addEventListener('beforeunload', () => { flushNow(); });
+
+  new ResizeObserver(() => {
+    track.classList.add('noanim');
+    measure();
+    layoutAll();
+    edges();
+    requestAnimationFrame(() => requestAnimationFrame(() => track.classList.remove('noanim')));
+  }).observe(viewport);
+
+  if (!restored) save();
+  resolveReady();
+}
+
+init().catch((err) => {
+  console.error('flow failed to start', err);
+  toast(`flow failed to start: ${(err && err.message) || err}`, 10000);
+});
+})();
+
+
+
+
