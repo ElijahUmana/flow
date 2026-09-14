@@ -2268,3 +2268,452 @@
       if (!media.contains(e.target) && !(mediaMenu && mediaMenu.contains(e.target))) closeMediaMenu();
     });
 
+    // A slow poll while a page is shown keeps "in use" honest: a device the site dropped disappears within a few seconds,
+    // and one it took between requests shows up. Only the shown tab is asked.
+    setInterval(() => { if (!disposed && !document.hidden && st().guestId != null) void refreshMedia(); }, 2500);
+    const offMedia = watchMedia(() => { void refreshMedia(); });
+
+    /* ---------- input ---------- */
+    [back, fwd, rel, star, clipBtn, plus, fPrev, fNext, fClose].forEach((b) => on(b, 'mousedown', (e) => e.preventDefault()));
+    on(back, 'click', () => api.back());
+    on(fwd, 'click', () => api.forward());
+    on(rel, 'click', () => api.reload());
+    on(star, 'click', () => { save(); });
+    on(clipBtn, 'click', () => { clip(); });
+    on(errR, 'click', retry);
+    on(askYes, 'click', () => answerAsk(true));
+    on(askNo, 'click', () => answerAsk(false));
+    on(login, 'submit', (e) => {
+      e.preventDefault();
+      answerLogin({ user: loginName.value, password: loginPass.value });
+    });
+    on(login, 'keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      answerLogin(null);
+    });
+    on(addr, 'focusin', () => onFocus());
+    on(find, 'focusin', () => onFocus());
+    on(strip, 'focusin', () => onFocus());
+
+    on(input, 'mousedown', () => { clickFocus = document.activeElement !== input; });
+    on(input, 'focus', () => {
+      dirty = false;
+      input.value = editable(st().url);
+      if (!clickFocus) input.select();
+    });
+    on(input, 'mouseup', () => {
+      if (clickFocus && input.selectionStart === input.selectionEnd) input.select();
+      clickFocus = false;
+    });
+    on(input, 'blur', () => {
+      dirty = false;
+      clickFocus = false;
+      input.value = display(st().url);
+    });
+    on(input, 'input', () => { dirty = true; });
+    on(input, 'keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) {
+        e.preventDefault();
+        // A file tab's unchanged path is where it already is (a path would otherwise go to search).
+        if (!dirty && fileOf(st().url)) {
+          input.blur();
+          focusTab(st());
+          return;
+        }
+        const r = resolve(input.value);
+        if (!r || refuse(r)) return;
+        // ⌘- and ⌥-Enter put the address in a tab behind this one, ⇧-Enter in a page window of its own beside it.
+        if (e.metaKey || e.altKey || (e.shiftKey && onOpen)) {
+          dirty = false;
+          input.value = editable(st().url);
+          input.select();
+          if (e.metaKey || e.altKey) newTab(r.url, { show: false, after: cur });
+          else onOpen(r.url);
+          return;
+        }
+        go(st(), r);
+        input.blur();
+        focusTab(st());
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        if (dirty) {
+          dirty = false;
+          input.value = editable(st().url);
+          input.select();
+        } else {
+          input.blur();
+          focusTab(st());
+        }
+      }
+    });
+
+    on(fq, 'input', () => runFind(true));
+    on(fq, 'keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) {
+        e.preventDefault();
+        runFind(!e.shiftKey);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeFind();
+      } else if (e.metaKey && e.key.toLowerCase() === 'g') {
+        e.preventDefault();
+        runFind(!e.shiftKey);
+      }
+    });
+    on(fPrev, 'click', () => runFind(false));
+    on(fNext, 'click', () => runFind(true));
+    on(fClose, 'click', () => closeFind());
+
+    /* The saved pages on a new tab: a click opens one here (⌘-click or a middle click in a new tab); hovering one
+       shows what it is about. */
+    on(fresh, 'click', (e) => {
+      const row = e.target.closest('.pn-row');
+      if (!row) return;
+      const r = resolve(row.dataset.url);
+      if (!r) return;
+      if (e.metaKey || e.ctrlKey) newTab(r.url, { show: false, after: cur });
+      else go(st(), r);
+    });
+    on(fresh, 'auxclick', (e) => {
+      const row = e.button === 1 && e.target.closest('.pn-row');
+      if (row) newTab(row.dataset.url, { show: false, after: cur });
+    });
+    on(fresh, 'mouseover', (e) => {
+      const row = e.target.closest('.pn-row');
+      if (row) showCard(row);
+    });
+    on(fresh, 'mouseleave', hideCard);
+    on(fresh, 'scroll', hideCard);
+
+    /* The strip: a press shows a tab, dragging it sideways moves it, × or a middle click closes it. */
+    on(strip, 'mousedown', (e) => {
+      if (e.target.closest('button')) e.preventDefault();
+    });
+    on(plus, 'click', () => newTab(''));
+    on(strip, 'click', (e) => {
+      const x = e.target.closest('.pt-x');
+      if (x) closeTab([...strip.querySelectorAll('.ptab')].indexOf(x.parentElement));
+    });
+    on(strip, 'auxclick', (e) => {
+      const t = e.button === 1 && e.target.closest('.ptab');
+      if (t) closeTab([...strip.querySelectorAll('.ptab')].indexOf(t));
+    });
+    on(strip, 'contextmenu', (e) => {
+      const el1 = e.target.closest('.ptab');
+      const t = el1 && tabs.find((x) => x.stripEl === el1);
+      if (!t || !showMenu) return;
+      e.preventDefault();
+      // the tab's menu, not the window's: the app opens the window's own menu for a right-click anywhere in it
+      e.stopPropagation();
+      const items = [{ label: 'close', hint: '', run: () => closeTab(tabs.indexOf(t)) }];
+      if (onTabOut && t.url) items.unshift({ label: 'move to new window', hint: '', run: () => tabOut(t, null) });
+      showMenu(e, items);
+    });
+    on(strip, 'pointerdown', (e) => {
+      const t = e.target.closest('.ptab');
+      if (!t || e.button !== 0 || e.target.closest('.pt-x')) return;
+      const from = [...strip.querySelectorAll('.ptab')].indexOf(t);
+      selectTab(from);
+      const el0 = strip.querySelectorAll('.ptab')[from];
+      const tab = tabs[from];
+      const sx = e.clientX;
+      let moving = false;
+      let ghost = null;
+      const move = (ev) => {
+        if (!moving && Math.abs(ev.clientX - sx) < 5 && Math.abs(ev.clientY - e.clientY) < 5) return;
+        moving = true;
+        dragged = el0;
+        el0.classList.add('drag');
+        // pages would take the pointer from a tab dragged over them (as app.js's own drags keep them out of it)
+        document.body.classList.add('ptabdrag');
+        // Well above or below the strip, the tab follows the pointer on its way to a window of its own.
+        const r = strip.getBoundingClientRect();
+        const off = !!onTabOut && tab.url && (ev.clientY < r.top - 24 || ev.clientY > r.bottom + 24);
+        if (off && !ghost) {
+          ghost = el('div', 'ptghost', label(tab));
+          document.body.appendChild(ghost);
+        } else if (!off && ghost) {
+          ghost.remove();
+          ghost = null;
+        }
+        if (ghost) {
+          ghost.style.left = `${ev.clientX + 8}px`;
+          ghost.style.top = `${ev.clientY + 8}px`;
+          return;
+        }
+        for (const other of strip.querySelectorAll('.ptab')) {
+          if (other === el0) continue;
+          const r = other.getBoundingClientRect();
+          if (ev.clientX > r.left && ev.clientX < r.right) {
+            if (ev.clientX < r.left + r.width / 2) strip.insertBefore(el0, other);
+            else strip.insertBefore(el0, other.nextSibling);
+            break;
+          }
+        }
+      };
+      const up = (ev) => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        window.removeEventListener('pointercancel', up);
+        el0.classList.remove('drag');
+        document.body.classList.remove('ptabdrag');
+        dragged = null;
+        if (ghost) {
+          ghost.remove();
+          ghost = null;
+          renderStrip();
+          if (ev.type === 'pointerup') tabOut(tab, { x: ev.clientX, y: ev.clientY });
+          return;
+        }
+        if (moving) moveTab(tabs.findIndex((x) => x.stripEl === el0), [...strip.querySelectorAll('.ptab')].indexOf(el0));
+        renderStrip();
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+      window.addEventListener('pointercancel', up);
+    });
+
+    /* ---------- start: the tabs from the saved state, else one tab ---------- */
+    const given = Array.isArray(o.tabs) && o.tabs.length ? o.tabs : [{ url: o.url || '', title: '' }];
+    for (const g of given) tabs.push(makeTab(g && g.url, g && g.title, g));
+    cur = Math.max(0, Math.min(tabs.length - 1, Number.isInteger(o.tab) ? o.tab : 0));
+    render();
+    // While the page shows, its tab's history and scroll are read every 10 s (and soon after a scroll or a
+    // navigation), so a quit or a crash loses at most that much.
+    const histTick = setInterval(() => {
+      if (visible && !disposed) refreshHistory(st());
+    }, 10000);
+    const idleTick = setInterval(() => {
+      stampSeen();
+      sleepIdle(unloadAfter);
+    }, Math.max(1000, Math.min(60000, unloadAfter / 4)));
+
+    const api = {
+      navigate(text) {
+        if (disposed) return;
+        const r = resolve(text);
+        if (r && !refuse(r)) go(st(), r);
+      },
+      back() {
+        step(st(), -1);
+      },
+      forward() {
+        step(st(), 1);
+      },
+      reload() {
+        const t = st();
+        if (disposed || !t.wv) return;
+        clearRecoveryHistory(t);
+        if (t.err && t.err.retry) {
+          retry();
+          return;
+        }
+        const wv = t.wv;
+        const request = ++t.reloadRequest;
+        if (t.guestId != null) keepPlace(t).then(() => {
+          if (disposed || !tabs.includes(t) || t.wv !== wv || t.reloadRequest !== request) return;
+          rememberGood(t, t.scroll);
+          t.reloading = true;
+          wv.reload();
+        });
+      },
+      /* ⌘+ ⌘- ⌘0 (menu actions page-zoom-in/out/reset): step 1, -1 or 0 for the shown tab, in Chrome's steps. */
+      zoom(step) {
+        const t = st();
+        if (disposed || t.guestId == null || typeof window.flow.zoomPage !== 'function') return Promise.resolve(null);
+        const dir = Math.sign(Number(step) || 0);
+        return window.flow.zoomPage(t.guestId, dir).then((level) => {
+          if (disposed) return level;
+          const was = t.zoom;
+          t.zoom = Math.abs(level) < 1e-9 ? 0 : level;
+          emitTabs();
+          // The page itself shows the new size; only a step that changed nothing says why.
+          if (dir && Math.abs(t.zoom - was) < 1e-9) ifShown(t, () => flashHint(dir > 0 ? 'the page is as large as it gets' : 'the page is as small as it gets'));
+          return level;
+        }, (e) => {
+          console.error('flow page: could not zoom the page', e);
+          return null;
+        });
+      },
+      /* Before the window closes (red light, ⌘W on the last tab): always yes, nothing is asked (owner, Nov 1 20:47). */
+      async confirmClose() {
+        return true;
+      },
+      /* Whether a page here guards unsaved typing: a window closing with one stays in the document, hidden, for
+         HOLD_MS, so its site can finish saving (a webview dies when it leaves the document). */
+      async guarded() {
+        if (disposed) return false;
+        return (await Promise.all(tabs.map((t) => guarded(t)))).some(Boolean);
+      },
+      focusAddress() {
+        if (disposed) return;
+        input.focus();
+        input.select();
+      },
+      find() {
+        if (!disposed) openFind();
+      },
+      clip,
+      save,
+      about(i) {
+        const t = tabs[Number.isInteger(i) ? i : cur];
+        return disposed || !t ? Promise.resolve('') : aboutOf(t).then((a) => a || '');
+      },
+      /* At quit: every live tab's back/forward history as Chromium has it, and where its page is scrolled right now
+         (kept with the tab and given back after a restart), so a scroll just made comes back. The tabs then go to the
+         app once more, changed or not, so its copy is page.js's own when it saves after this resolves. */
+      async flushHistory() {
+        if (disposed) return;
+        await Promise.all(tabs.filter((t) => t.guestId != null).map(keepPlace));
+        if (!disposed) emitTabs();
+      },
+      /* notes.js: the sentences quoted in the shown page's note, [{ text, note }]; [] clears them. */
+      setMarks(list, onFound) {
+        if (disposed) return;
+        const t = st();
+        t.onFound = typeof onFound === 'function' ? onFound : null;
+        t.marks = (Array.isArray(list) ? list : []).filter((m) => m && typeof m.text === 'string' && m.text.trim()).map((m) => ({ text: m.text, note: String(m.note || '') }));
+        t.marksPage = pageOf(t.url);
+        hideMark();
+        sendMarks(t);
+      },
+      /* Scrolls the shown page to a quoted sentence and flashes it: false when the page does not have it. */
+      findQuote(text) {
+        const t = st();
+        if (disposed || t.guestId == null) return Promise.resolve(false);
+        const id = ++quoteReq;
+        return new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            quoteWaits.delete(id);
+            console.warn('flow page: the page did not answer findQuote within 3 s');
+            resolve(false);
+          }, 3000);
+          quoteWaits.set(id, (found) => {
+            clearTimeout(timer);
+            quoteWaits.delete(id);
+            resolve(found);
+          });
+          t.wv.send('flow:find-quote', { id, text: String(text == null ? '' : text) });
+        });
+      },
+      /* After the owner renames a page (notes): the strip and the new-tab list show the new name. */
+      namesChanged() {
+        if (disposed) return;
+        renderStrip();
+        renderNew();
+      },
+      savedChanged() {
+        if (disposed) return;
+        renderStar();
+        renderNew();
+      },
+      newTab: (u = '', o2) => newTab(u, o2 || {}),
+      /* ⇧⌘] ⇧⌘[ and ⌃Tab ⌃⇧Tab: the next or previous tab, round the ends. */
+      stepTab(dir) {
+        if (!disposed && tabs.length > 1) selectTab((cur + (dir < 0 ? -1 : 1) + tabs.length) % tabs.length);
+      },
+      /* ⌘1-⌘8: that tab; ⌘9: the last. */
+      showTab(n) {
+        const i = n >= 9 ? tabs.length - 1 : n - 1;
+        if (!disposed && i >= 0 && i < tabs.length) selectTab(i);
+      },
+      /* A tab from another page window (dropped on this strip): it goes in at index, or last, and shows. */
+      adoptTab(kept, index) {
+        if (disposed || !kept || typeof kept.url !== 'string') return false;
+        const t = makeTab(kept.url, kept.title, kept);
+        const at = Number.isInteger(index) ? Math.max(0, Math.min(index, tabs.length)) : tabs.length;
+        tabs.splice(at, 0, t);
+        if (at <= cur) cur += 1;
+        selectTab(at, true);
+        return true;
+      },
+      /* The tabs unseen for at least after ms give up their pages now, as the idle check does after unloadAfter (the
+         app may ask sooner, under memory pressure): how many did. */
+      sleepTabs(after = 0) {
+        return disposed ? Promise.resolve(0) : sleepIdle(Math.max(0, Number(after) || 0));
+      },
+      /* ⇧⌘T: the last tab closed here comes back where it was, with its history and place. */
+      reopenTab() {
+        const c = closedTabs.pop();
+        if (disposed || !c) return false;
+        // still alive out of sight (hold): the same page, typing and all
+        const t = c.live || makeTab(c.kept.url, c.kept.title, c.kept);
+        clearTimeout(c.timer);
+        c.live = null;
+        const at = Math.min(c.at, tabs.length);
+        tabs.splice(at, 0, t);
+        if (at <= cur) cur += 1;
+        selectTab(at, true);
+        return true;
+      },
+      /* ⌘P: the shown page, or its PDF, through Chromium's own print. */
+      print() {
+        const t = st();
+        if (disposed || t.guestId == null) return;
+        t.wv.print().catch((e) => console.error('flow page: could not print the page', e));
+      },
+      closeTab,
+      selectTab: (i) => selectTab(i),
+      moveTab,
+      tabs: () => ({ tabs: snapshot(), tab: cur }),
+      /* The webContents ids of the tabs whose page is live, in strip order (main names pages by them, e.g. the quit
+         guard's list of pages with unsaved changes). */
+      guests: () => tabs.filter((t) => t.guestId != null).map((t) => t.guestId),
+      getURL: () => tidy(st().url),
+      getTitle: () => st().title,
+      isLoading: () => st().loading,
+      /* The app went to this page's window (its row, ⌘K, a link): the keys go to the shown tab's page, now or once its
+         webview is there (dropped if the owner presses or types elsewhere first); a new tab's go to its address line. */
+      focus() {
+        if (disposed) return;
+        const t = st();
+        if (!t.url) {
+          input.focus();
+          return;
+        }
+        focusTab(t);
+      },
+      setVisible(v) {
+        if (disposed) return;
+        if (!v) {
+          hideMark();
+          stampSeen();
+          if (visible) refreshHistory(st());
+          visible = false;
+          return;
+        }
+        visible = true;
+        shown = true;
+        createWebview(st());
+        layout();
+      },
+      dispose() {
+        if (disposed) return;
+        disposed = true;
+        unboundTabs.delete(unboundTab);
+        clearTimeout(hintTimer);
+        clearInterval(histTick);
+        clearInterval(idleTick);
+        dropPendingFocus();
+        ro.unobserve(pgv);
+        sizers.delete(pgv);
+        for (const t of tabs) dropTab(t);
+        for (const c of closedTabs) letGo(c);
+        listeners.forEach(([target, type, f]) => target.removeEventListener(type, f));
+        listeners.length = 0;
+        offMedia();
+        strip.remove();
+        addr.remove();
+        pgv.remove();
+      },
+    };
+    return api;
+  }
+
+  window.FlowPage = { mount };
+})();
+
+
+
+
