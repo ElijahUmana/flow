@@ -185,3 +185,189 @@ void OnTouches(NSEvent* event) {
   if (n) s /= n;
   if (n == lastN && (n < 3 || (dx == 0 && dy == 0 && s == lastS))) return;
   lastN = n;
+  lastS = s;
+  Emit(win, n, dx, dy, s, w, EpochMs(event));
+}
+#endif
+
+void StopWatching() {
+#ifndef FLOW_TOUCH_FAKE
+  if (monitor != nil) [NSEvent removeMonitor:monitor];
+  monitor = nil;
+  lastAt = nil;
+#endif
+}
+
+// The environment is going away (a quit): Node has already finalized the threadsafe function, so it is not released.
+void Cleanup(void*) {
+  StopWatching();
+  tsfn = nullptr;
+}
+
+napi_value Start(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_valuetype type = napi_undefined;
+  if (argc >= 1) napi_typeof(env, argv[0], &type);
+  if (type != napi_function) {
+    napi_throw_type_error(env, nullptr, "start(cb): cb must be a function");
+    return nullptr;
+  }
+  if (started) {
+    napi_throw_error(env, nullptr, "start(cb): already started");
+    return nullptr;
+  }
+  napi_value name;
+  napi_create_string_utf8(env, "flow-touch", NAPI_AUTO_LENGTH, &name);
+  if (napi_create_threadsafe_function(env, argv[0], nullptr, name, 0, 1, nullptr, Finalized, nullptr, CallJs, &tsfn) != napi_ok) {
+    napi_throw_error(env, nullptr, "start(cb): could not make the threadsafe function");
+    return nullptr;
+  }
+  napi_unref_threadsafe_function(env, tsfn);
+  started = true;
+  napi_valuetype optsType = napi_undefined;
+  if (argc == 2) napi_typeof(env, argv[1], &optsType);
+  if (optsType == napi_object) {
+    napi_value v;
+    bool on = false;
+    if (napi_get_named_property(env, argv[1], "trace", &v) == napi_ok) napi_get_value_bool(env, v, &on);
+    tracing = on;
+  }
+#ifndef FLOW_TOUCH_FAKE
+  lastAt = [NSMutableDictionary dictionary];
+  lastN = 0;
+  lastS = 0;
+  monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskGesture
+                                                 handler:^NSEvent*(NSEvent* event) {
+                                                   @try {
+                                                     OnTouches(event);
+                                                   } @catch (NSException* e) {
+                                                     (void)e;
+                                                     if (!refused) Emit(0, -1, 0, 0, 0, 0, 0);
+                                                     refused = true;
+                                                   }
+                                                   return event;
+                                                 }];
+  if (monitor == nil) {
+    napi_throw_error(env, nullptr, "start(cb): AppKit gave no event monitor");
+    return nullptr;
+  }
+#endif
+  return Undefined(env);
+}
+
+napi_value Stop(napi_env env, napi_callback_info) {
+  StopWatching();
+  if (tsfn != nullptr) {
+    napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
+    tsfn = nullptr;
+  }
+  return Undefined(env);
+}
+
+napi_value Watch(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  bool isBuffer = false;
+  if (argc == 1) napi_is_buffer(env, argv[0], &isBuffer);
+  void* data = nullptr;
+  size_t length = 0;
+  if (isBuffer) napi_get_buffer_info(env, argv[0], &data, &length);
+#ifdef FLOW_TOUCH_FAKE
+  const size_t handleSize = length == 4 ? 4 : sizeof(void*);  // an X11 window id on the VM
+#else
+  const size_t handleSize = sizeof(void*);
+#endif
+  if (!isBuffer || length != handleSize) {
+    napi_throw_type_error(env, nullptr, "watch(handle): handle must be a window's getNativeWindowHandle()");
+    return nullptr;
+  }
+  void* view = nullptr;
+  memcpy(&view, data, handleSize);
+#ifndef FLOW_TOUCH_FAKE
+  NSView* v = (__bridge NSView*)view;
+  if (v == nil || ![v isKindOfClass:[NSView class]]) {
+    napi_throw_type_error(env, nullptr, "watch(handle): the handle is not a view");
+    return nullptr;
+  }
+  AllowTouches(v);
+#endif
+  int32_t id = 0;
+  for (const auto& p : watched)
+    if (p.second == view) id = p.first;
+  if (id == 0) {
+    id = ++lastId;
+    watched.emplace_back(id, view);
+  }
+  napi_value out;
+  napi_create_int32(env, id, &out);
+  return out;
+}
+
+napi_value Unwatch(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  int32_t id = 0;
+  if (argc != 1 || napi_get_value_int32(env, argv[0], &id) != napi_ok) {
+    napi_throw_type_error(env, nullptr, "unwatch(id): id must be a number");
+    return nullptr;
+  }
+  for (auto it = watched.begin(); it != watched.end(); ++it) {
+    if (it->first == id) {
+      watched.erase(it);
+      break;
+    }
+  }
+  return Undefined(env);
+}
+
+#ifdef FLOW_TOUCH_FAKE
+napi_value InjectTrace(napi_env env, napi_callback_info info) {
+  size_t argc = 8;
+  napi_value argv[8];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  double v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (size_t i = 0; i < argc && i < 8; i++) napi_get_value_double(env, argv[i], &v[i]);
+  int32_t phases[6];
+  for (int i = 0; i < 6; i++) phases[i] = static_cast<int32_t>(v[i + 1]);
+  EmitTrace(static_cast<int32_t>(v[0]), phases, v[7]);
+  return Undefined(env);
+}
+
+napi_value Inject(napi_env env, napi_callback_info info) {
+  size_t argc = 7;
+  napi_value argv[7];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  double v[7] = {0, 0, 0, 0, 0, 0, 0};
+  for (size_t i = 0; i < argc && i < 7; i++) napi_get_value_double(env, argv[i], &v[i]);
+  Emit(static_cast<int32_t>(v[0]), static_cast<int32_t>(v[1]), v[2], v[3], v[6], v[4], v[5]);
+  return Undefined(env);
+}
+#endif
+
+napi_value Init(napi_env env, napi_value exports) {
+  napi_property_descriptor props[] = {
+    {"start", nullptr, Start, nullptr, nullptr, nullptr, napi_enumerable, nullptr},
+    {"stop", nullptr, Stop, nullptr, nullptr, nullptr, napi_enumerable, nullptr},
+    {"watch", nullptr, Watch, nullptr, nullptr, nullptr, napi_enumerable, nullptr},
+    {"unwatch", nullptr, Unwatch, nullptr, nullptr, nullptr, napi_enumerable, nullptr},
+#ifdef FLOW_TOUCH_FAKE
+    {"_inject", nullptr, Inject, nullptr, nullptr, nullptr, napi_enumerable, nullptr},
+    {"_injectTrace", nullptr, InjectTrace, nullptr, nullptr, nullptr, napi_enumerable, nullptr},
+#endif
+  };
+  napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);
+  napi_add_env_cleanup_hook(env, Cleanup, nullptr);
+  return exports;
+}
+
+}  // namespace
+
+NAPI_MODULE(flow_touch, Init)
+
+
+
+
