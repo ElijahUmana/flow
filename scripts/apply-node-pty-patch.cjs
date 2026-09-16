@@ -21,3 +21,25 @@ if (version !== '1.1.0') throw new Error(`node-pty patch: expected node-pty 1.1.
 if (!fs.existsSync(target)) throw new Error(`missing ${target}`);
 if (!fs.existsSync(patch)) throw new Error(`missing ${patch}`);
 if (hash(patch) !== patchHash) throw new Error('node-pty patch: patch content differs from the pinned patch');
+let got = hash(target);
+if (got === after) {
+  console.log(`node-pty patch: already applied (${after.slice(0, 12)})`);
+  process.exit(0);
+}
+if (got !== before) throw new Error(`node-pty patch: ${target} is ${got}, expected baseline ${before} or patched ${after}`);
+const result = spawnSync('/usr/bin/patch', ['--batch', '--forward', '-p1', '-i', patch], {
+  cwd: root,
+  encoding: 'utf8'
+});
+if (result.status !== 0) {
+  process.stderr.write(result.stdout || '');
+  process.stderr.write(result.stderr || '');
+  throw new Error(`node-pty patch: patch exited ${result.status}`);
+}
+got = hash(target);
+if (got !== after) throw new Error(`node-pty patch: result is ${got}, expected ${after}`);
+console.log(`node-pty patch: applied (${after.slice(0, 12)})`);
+
+
+
+
