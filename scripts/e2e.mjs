@@ -1386,3 +1386,350 @@ function backgroundFindings(needPopOut) {
         shown.push(m[1]);
         if (m[2] === 'true') bad.push(`launch ${a.label}: ${m[1]} was shown with isFocused=true`);
         continue;
+      }
+      m = line.match(/\[flow\] background: (\S+) (got focus|(?:focus|show|moveTop|restore)\(\) called)/);
+      if (m) {
+        bad.push(`launch ${a.label}: ${oneLine(line.slice(line.indexOf(m[1])), 400)}`);
+        continue;
+      }
+      m = line.match(/\[flow\] background: (\S+) out of sight per macOS \(Flow did not hide it\)/);
+      if (m) {
+        unseen.push(m[1]);
+        continue;
+      }
+      m = line.match(/\[flow\] background: (\S+) hidden/);
+      if (m) {
+        const expected = (a.quitOffset != null && at >= a.quitOffset) || (m[1] !== 'main' && popOutClose && popOutClose.app === a && at >= popOutClose.offset);
+        if (!expected) bad.push(`launch ${a.label}: ${m[1]} was hidden while the test still used it`);
+      }
+    }
+    if (!shown.includes('main')) bad.push(`launch ${a.label}: no "[flow] background: main shown inactive, isFocused=false" line`);
+    seen.push(`${a.label}: ${shown.join(' + ') || 'none'}${unseen.length ? `, out of sight per macOS ${unseen.length}x (${[...new Set(unseen)].join(', ')})` : ''}`);
+  }
+  if (!seen.length) bad.push('no launch had a main log to check');
+  if (needPopOut && !apps.some((a) => a.logPath && fs.existsSync(a.logPath) && /\[flow\] background: \S*solo=\S* shown inactive, isFocused=false/.test(fs.readFileSync(a.logPath, 'utf8')))) {
+    bad.push('no "[flow] background: solo=... shown inactive, isFocused=false" line for the pop-out');
+  }
+  return { bad, summary: `main logs: shown inactive with isFocused=false (${seen.join('; ')}); no "got focus", "() called" or "hidden" (a hide() of Flow's) line in any launch` };
+}
+
+// Item 11: every quit must be clean. A Napi::Error thrown while Electron frees Node aborts the app (SIGABRT).
+const ABORT_RE = /Napi::Error|libc\+\+abi|terminating due to|terminate called|Abort trap|SIGABRT|\bFATAL\b|Check failed/;
+function quitFindings() {
+  const bad = [];
+  const seen = [];
+  for (const a of apps) {
+    if (!a.proc) continue;
+    if (!a.exit) bad.push(`launch ${a.label}: still running`);
+    else if (a.exit.signal || a.exit.code !== 0) bad.push(`launch ${a.label}: ${a.describeExit()}`);
+    const text = a.logPath && fs.existsSync(a.logPath) ? fs.readFileSync(a.logPath, 'utf8') : '';
+    const hits = text.split('\n').filter((l) => ABORT_RE.test(l));
+    if (hits.length) bad.push(`launch ${a.label}: main log has ${hits.slice(0, 3).map((l) => q(oneLine(l, 140))).join(', ')}`);
+    seen.push(`${a.label} exit ${a.exit ? (a.exit.signal || a.exit.code) : '?'}`);
+  }
+  if (!seen.length) bad.push('no launch to check');
+  return { bad, summary: `${seen.join(', ')}; no Napi::Error, terminating or abort line in any main log` };
+}
+
+/* ---------- the run ---------- */
+
+async function smoke(userData, stamp) {
+  let seed;
+  try {
+    ({ seed } = await readSeed(stamp));
+  } catch (e) {
+    notRun('starts and answers over CDP', `could not read the seed without opening it: ${e.message}`);
+    return;
+  }
+  fs.mkdirSync(userData, { recursive: true });
+  fs.writeFileSync(path.join(userData, 'flow-state.json'), JSON.stringify(withoutHosts(seed).doc));
+  let s;
+  try {
+    s = await launch('smoke', userData, 'smoke');
+  } catch (e) {
+    notRun('starts and answers over CDP', e.message);
+    return;
+  }
+  shotCdp = s.cdp;
+  results.push({ name: 'starts', ok: true });
+  console.log(`ok   starts and answers over CDP: window.__flow.ready after ${s.readyMs}ms`);
+  await sleep(2500);
+  await check('no console errors at startup', async () => {
+    const errs = consoleErrors.filter((e) => e.phase === 'smoke');
+    if (errs.length) throw new Error(describeErrors(errs, 6));
+    return 'none';
+  });
+  await check('5 workspace pills', async () => {
+    const pills = await s.cdp.eval(`[...document.querySelectorAll('#spaces .sp')].map((p) => (p.querySelector('.sn') || p).textContent.replace('⤢', '').trim())`);
+    if (pills.length !== 5) throw new Error(`${pills.length} pills: ${pills.join(', ')}`);
+    return pills.join(' / ');
+  });
+  await shot(s.cdp, 'smoke').catch(() => {});
+  await check('quits on SIGTERM', async () => {
+    const exit = await s.app.quit(20000);
+    if (!exit) throw new Error('still running 20s after SIGTERM');
+    if (exit.signal || exit.code !== 0) throw new Error(s.app.describeExit());
+    return 'exit code 0';
+  });
+  await check('FLOW_BACKGROUND=1: the window opened inactive and never had focus', async () => {
+    const f = backgroundFindings(false);
+    if (f.bad.length) throw new Error(f.bad.join('; '));
+    return f.summary;
+  });
+  await check('every quit exits with code 0 and no abort in the main log', async () => {
+    const f = quitFindings();
+    if (f.bad.length) throw new Error(f.bad.join('; '));
+    return f.summary;
+  });
+  await check('never ran ssh to claude-agents (the seed was written without its VM windows)', async () => {
+    const f = sshFindings(path.join(userData, 'flow-state.json'));
+    if (f.bad.length) throw new Error(f.bad.join('; '));
+    return f.summary;
+  });
+}
+
+async function full(userData, stamp) {
+  const C0 = '0. the seed, read with __flow.seed() from a probe app that opens nothing, has the 5 workspaces, the BRIEF 3.1 pages and the two VM windows';
+  const C1 = '1a. window loads: 5 workspace pills, sidebar tree, dock';
+  const C1B = '1b. no console errors at startup';
+  const C2 = '2. a new agent window runs real Claude Code in tmux session flow_<id>';
+  const C3A = `3a. a page window loads ${ALPHAXIV} for real`;
+  const C3B = '3b. the McKinsey judgment bottleneck page loads for real (not Access Denied)';
+  const C4A = '4a. typing in a note is saved to flow-state.json';
+  const C4B = '4b. a full quit exits cleanly and leaves the agent tmux session running with no client';
+  const C4C = '4c. the note edit is there after relaunching with the same FLOW_USER_DATA';
+  const C4D = '4d. an edit typed right before quitting is saved by the quit';
+  const C4E = '4e. after relaunch the agent window reattaches to the same tmux session (buffer not empty)';
+  const C5 = '5. ⌘K sidebar search finds a real old session from ~/.claude/history.jsonl';
+  const C6A = '6a. __flow.go(i) switches workspace';
+  const C6B = '6b. a ⤢ pop-out opens a second Flow window';
+  const C7 = '7. no console errors for the rest of the run (both launches and the pop-out)';
+  const C8 = '8. the e2e app never ran ssh to claude-agents and its state never had a window with a host';
+  const C9 = '9. FLOW_BACKGROUND=1: every Flow window opened inactive, none got focus, and Flow hid none (main logs, all launches and the pop-out)';
+  const C10 = '10. every quit (probe, launch 1, relaunch) exits with code 0 and no Napi::Error, terminating or abort line in its main log';
+  const C11 = '11. fork: right-click an agent opened from a session of the e2e\'s own, fork: a new window beside it with a new session id runs claude --resume <parent> --fork-session --session-id <new>';
+  const C12A = '12a. an image dropped on a Claude Code terminal shows up as [Image #N] in its input (nothing is sent)';
+  const C12B = '12b. ⌘V of an image on the clipboard in a Claude Code terminal shows up as [Image #N] and main saves the image under userData';
+  const C13 = '13. a new page window holds only the page: no note under it, ✎ opens its note beside the page and closes it';
+  const C14 = '14. tabs: a link that opens a new tab lands as a tab in the same page window and ⌘T in a page adds a tab to it; the dock\'s page button makes a page window of its own (item 1)';
+  const C15 = '15. the finger map (MAC_NOTES 60): two fingers pan the board and stay in the space; three fingers step to the first sub-workspace and back; four step to the next workspace and back';
+  const C17 = '17. closing a page window whose page guards unsaved typing closes it at once with no leave/stay ask, and ⇧⌘T in the next 10 s brings the same page back with the typing (owner, Nov 1 20:47)';
+  const C16 = '16. every Claude Code process the e2e started ran inside ~/.flow-dev/ship (--dev moves the seed\'s folders there)';
+  const IMAGES = LINUX ? [C12A, C12B] : [C12A];
+  const later = [C1B, C2, ...IMAGES, C3A, C3B, C13, C14, C17, C4A, C4B, C4C, C4D, C4E, C5, C11, C6A, C15, C6B, C7, C8, C9, C10, ...(opt.dev ? [C16] : [])];
+
+  let seed = null;
+  await check(C0, async () => {
+    const got = await readSeed(stamp);
+    seed = got.seed;
+    const probeErrors = consoleErrors.filter((e) => e.phase === 'probe');
+    const detail = checkSeed(seed);
+    if (probeErrors.length) throw new Error(`the probe app logged ${describeErrors(probeErrors, 4)}`);
+    if (got.shown !== 0) throw new Error(`the probe app shows ${got.shown} window(s); it should open nothing`);
+    return detail;
+  });
+  if (!seed) {
+    [C1, ...later].forEach((n) => notRun(n, 'there is no seed to start from (e2e never starts the app on a fresh seed: it would open ssh claude-agents)'));
+    return;
+  }
+  const { doc: firstState, removed } = withoutHosts(seed);
+  fs.mkdirSync(userData, { recursive: true });
+  fs.writeFileSync(path.join(userData, 'flow-state.json'), JSON.stringify(firstState));
+  console.log(`e2e: wrote the seed without its VM windows (removed ${removed.join(', ')}) to ${path.join(userData, 'flow-state.json')}`);
+
+  let s1;
+  try {
+    s1 = await launch('1', userData, 'launch 1');
+  } catch (e) {
+    notRun(C1, `the app did not come up: ${e.message}`);
+    later.forEach((n) => notRun(n, 'the app did not come up'));
+    return;
+  }
+  const cdp = s1.cdp;
+  shotCdp = cdp;
+
+  await check(C1, async () => {
+    await sleep(3000);
+    const ui = await cdp.eval(`(() => {
+      const sb = document.querySelector('#sb'), list = document.querySelector('#sblist');
+      return {
+        pills: [...document.querySelectorAll('#spaces .sp')].map((p) => (p.querySelector('.sn') || p).textContent.replace('⤢', '').trim()),
+        sidebar: !!sb && !sb.classList.contains('hide') && sb.getBoundingClientRect().width > 100,
+        header: list && list.querySelector('.wsh .wsn') ? list.querySelector('.wsh .wsn').textContent.trim() : null,
+        rowsWs: list ? [...new Set([...list.querySelectorAll('.tr[data-ws], .grp[data-ws]')].map((r) => r.dataset.ws))] : [],
+        groups: list ? [...list.querySelectorAll('.grp')].map((g) => g.textContent.trim()) : [],
+        rows: list ? list.querySelectorAll('.tr').length : 0,
+        dock: [...document.querySelectorAll('#dock button[data-k]')].map((b) => b.dataset.k),
+      };
+    })()`);
+    await shot(cdp, '01-loaded');
+    const bad = [];
+    if (ui.pills.join('|') !== SEED_NAMES.join('|')) bad.push(`pills are [${ui.pills.join(', ')}], expected [${SEED_NAMES.join(', ')}]`);
+    if (!ui.sidebar) bad.push('the sidebar is not showing');
+    if (ui.header !== null && ui.header !== 'flow') bad.push(`the sidebar tree is headed ${q(ui.header)}, expected "flow"`);
+    if (ui.rowsWs.join(',') !== '0') bad.push(`the sidebar rows belong to workspaces [${ui.rowsWs.join(', ')}], expected only the first (flow)`);
+    if (!ui.groups.includes('agents') || !ui.groups.includes('notes') || ui.rows < 5) bad.push(`the sidebar tree has groups [${ui.groups.join(', ')}] and ${ui.rows} rows`);
+    if (ui.dock.join(',') !== DOCK.join(',')) bad.push(`the dock has [${ui.dock.join(', ')}], expected [${DOCK.join(', ')}]`);
+    if (bad.length) throw new Error(bad.join('; '));
+    return `ready in ${s1.readyMs}ms; pills ${ui.pills.join(' / ')}; sidebar ${ui.groups.join(', ')} (${ui.rows} rows); dock ${ui.dock.join(' ')}`;
+  });
+  await check(C1B, async () => {
+    const errs = consoleErrors.filter((e) => e.phase === 'launch 1');
+    if (errs.length) throw new Error(describeErrors(errs, 6));
+    return 'none';
+  });
+  const errorsAfterC1 = consoleErrors.length;
+
+  let agent = null;
+  await check(C2, async () => {
+    const w = await cdp.eval(`(async () => { const w = await window.__flow.spawn('agent'); return w && typeof w === 'object' ? { id: w.id } : w; })()`);
+    const id = idOf(w);
+    if (!id) throw new Error(`__flow.spawn('agent') returned ${q(w)}`);
+    const t0 = Date.now();
+    let text = '';
+    await waitFor(async () => {
+      text = (await cdp.eval(termText(id))) || '';
+      return CLAUDE_RE.test(text);
+    }, { timeout: 40000, interval: 500, label: `Claude Code in window ${id}` }).catch((e) => {
+      throw new Error(`${e.message}; __flow.term(${q(id)}).getText() is ${q(oneLine(text, 400))}`);
+    });
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    const s = findSession(id);
+    if (!s) throw new Error(`tmux -L ${SOCKET} ls does not list flow_${id} (it lists: ${tmuxSessions().map((x) => x.name).join(', ') || 'nothing'})`);
+    const pane = tmuxPane(s.name);
+    agent = { id, name: s.name, created: s.created, panePid: pane.pid };
+    const sid = await cdp.eval(`(window.__flow.windows().find((w) => w.id === ${q(id)}) || {}).sessionId || ''`);
+    ownIds.push(`${sid || '(no session id)'} (new agent ${id}; only images are put in its input, and cleared)`);
+    await shot(cdp, '02-agent');
+    return `tmux lists ${s.name} (pane runs ${pane.command}); Claude Code on screen after ${secs}s: ${q(claudeLine(text))}`;
+  });
+
+  await check(C12A, () => imageCheck(cdp, agent, 'drop', userData));
+  // On the Mac the owner works while e2e runs: putting an image on the clipboard would replace theirs.
+  if (LINUX) await check(C12B, () => imageCheck(cdp, agent, 'paste', userData));
+  else console.log('e2e: 12b (⌘V of a clipboard image) runs on Linux only: on macOS it would replace the owner\'s clipboard; 12a covers images on macOS');
+
+  async function waitPage(id, wantUrl, titleOk, label) {
+    let info = null;
+    await waitFor(async () => {
+      info = await cdp.eval(pageInfo(id));
+      return info && wantUrl.test(info.url || '') && !info.loading && info.title && titleOk(info.title) && info;
+    }, { timeout: 45000, interval: 500, label }).catch((e) => {
+      throw new Error(`${e.message}; __flow.page(${q(id)}) reports ${q(info)}`);
+    });
+    return info;
+  }
+  async function guest(urlRe) {
+    let lastErr = 'no matching webview target';
+    for (const t of (await listTargets()).filter((x) => x.type === 'webview' && urlRe.test(x.url))) {
+      const c = new CDP(t.webSocketDebuggerUrl);
+      try {
+        await c.open();
+        return await c.eval(`({ title: document.title, chars: document.body ? document.body.innerText.length : 0, h1: ((document.querySelector('h1') || {}).innerText || '').trim().slice(0, 140) })`, 10000);
+      } catch (e) {
+        lastErr = e.message;
+      } finally {
+        c.close();
+      }
+    }
+    throw new Error(`could not read the page inside the webview: ${lastErr}`);
+  }
+
+  await check(C3A, async () => {
+    const w = await cdp.eval(`(async () => { const w = await window.__flow.openPage(${q(ALPHAXIV)}); return w && typeof w === 'object' ? { id: w.id } : w; })()`);
+    const id = idOf(w);
+    if (!id) throw new Error(`__flow.openPage() returned ${q(w)}`);
+    const info = await waitPage(id, /alphaxiv\.org\/abs\/2610\.38355/, (t) => !ERROR_PAGE_RE.test(t) && !/^https?:/.test(t), 'the alphaxiv page to finish loading with a real title');
+    const g = await guest(/alphaxiv\.org\/abs\/2610\.38355/);
+    if (g.chars < 300) throw new Error(`the page inside the webview has only ${g.chars} characters of text (title ${q(g.title)})`);
+    await shot(cdp, '03a-alphaxiv');
+    return `title ${q(info.title)}, ${g.chars} characters of text${g.h1 ? `, h1 ${q(g.h1)}` : ''}`;
+  });
+
+  await check(C3B, async () => {
+    const found = await cdp.eval(`(() => {
+      const s = window.__flow.state() || {};
+      for (const ws of s.ws || []) for (const w of ws.windows || []) {
+        if (w.type !== 'page') continue;
+        const n = (ws.notes || []).find((x) => x.id === w.noteId) || {};
+        const url = n.url || w.url || '';
+        if (url.includes('mckinsey.com')) return { id: w.id, url };
+      }
+      return null;
+    })()`);
+    if (!found) throw new Error('__flow.state() has no page window with a mckinsey.com url');
+    const info = await waitPage(found.id, /mckinsey\.com/, (t) => /judgment/i.test(t) || /access denied/i.test(t), 'the McKinsey page to finish loading');
+    if (/access denied/i.test(info.title) || !/judgment/i.test(info.title)) throw new Error(`title is ${q(info.title)}`);
+    const g = await guest(/mckinsey\.com/);
+    if (/access denied/i.test(g.title) || g.chars < 1000) throw new Error(`the page inside the webview: title ${q(g.title)}, ${g.chars} characters of text`);
+    await shot(cdp, '03b-mckinsey');
+    return `window ${found.id}: title ${q(info.title)}, ${g.chars} characters of text`;
+  });
+
+  await check(C13, () => pageNoteCheck(cdp));
+  await check(C14, () => tabsCheck(cdp));
+  await check(C17, () => guardCheck(cdp));
+
+  const stateFile = path.join(userData, 'flow-state.json');
+  const readState = () => (fs.existsSync(stateFile) ? fs.readFileSync(stateFile, 'utf8') : '');
+  let note = null;
+  await check(C4A, async () => {
+    const made = await cdp.eval(`(async () => {
+      const w = await window.__flow.spawn('note');
+      const id = typeof w === 'string' ? w : w && w.id;
+      // on a timer: a window macOS reports covered draws no frames to wait on
+      const find = () => id && (document.querySelector('.win[data-id="' + CSS.escape(id) + '"]') || document.querySelector('.win[data-wid="' + CSS.escape(id) + '"]'));
+      for (let i = 0; i < 20 && !find(); i++) await new Promise((r) => setTimeout(r, 100));
+      const byId = find();
+      const win = byId || (document.activeElement && document.activeElement.closest('.win'));
+      if (!win) return { id, error: 'cannot find the new note window in the DOM (no .win[data-id] and nothing focused in it)' };
+      win.dataset.e2e = 'note';
+      return { id, title: !!win.querySelector('.ntitle'), body: !!win.querySelector('.nbody') };
+    })()`);
+    if (!made || made.error || !made.title || !made.body) throw new Error(`__flow.spawn('note'): ${q(made)}`);
+    note = { id: made.id, title: `e2e note ${stamp}`, body: `typed by the e2e test at ${stamp}`, late: `and this line right before quitting ${stamp}` };
+    const how = await typeInto(cdp, '.win[data-e2e="note"] .ntitle', note.title, true);
+    await typeInto(cdp, '.win[data-e2e="note"] .nbody', note.body, true);
+    await waitFor(() => cdp.eval(`JSON.stringify(window.__flow.state()).includes(${q(note.body)})`), { timeout: 5000, label: 'the typed text in __flow.state()' });
+    await waitFor(() => readState().includes(note.body) && readState().includes(note.title), { timeout: 8000, label: `the typed text in ${stateFile}` });
+    return `${how} title ${q(note.title)} and body ${q(note.body)}; both are in __flow.state() and ${stateFile}`;
+  });
+
+  let fileAfterQuit = '';
+  let quitOk = false;
+  await check(C4B, async () => {
+    if (note) await typeInto(cdp, '.win[data-e2e="note"] .nbody', ` ${note.late}`, false);
+    const t0 = Date.now();
+    const exit = await s1.app.quit(20000);
+    if (!exit) throw new Error('Flow was still running 20s after SIGTERM');
+    quitOk = true;
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    let left = [];
+    await waitFor(() => (left = s1.app.leftovers()).length === 0, { timeout: 8000, label: 'Electron helper processes to exit' }).catch(() => {});
+    fileAfterQuit = readState();
+    const bad = [];
+    if (exit.signal || exit.code !== 0) bad.push(`it did not quit normally (${s1.app.describeExit()})`);
+    if (left.length) bad.push(`processes left behind: ${left.join(' | ')}`);
+    if (!agent) bad.push('no agent from check 2 to look for');
+    else {
+      const s = tmuxSessions().find((x) => x.name === agent.name);
+      if (!s) bad.push(`${agent.name} is gone (tmux lists: ${tmuxSessions().map((x) => x.name).join(', ') || 'nothing'})`);
+      else {
+        if (s.created !== agent.created) bad.push(`${agent.name} was recreated`);
+        if (s.attached !== 0) bad.push(`${agent.name} still has ${s.attached} client(s) attached`);
+      }
+    }
+    if (bad.length) throw new Error(bad.join('; '));
+    return `exit code 0 after ${secs}s, no processes left; ${agent.name} still running, 0 clients`;
+  });
+  if (!quitOk) await s1.app.kill();
+
+  const noSsh = async () => {
+    const f = sshFindings(stateFile);
+    if (hostWindows(firstState.ws, firstState.ui).length) f.bad.push('the state written before launch 1 has windows with a host');
+    if (f.bad.length) throw new Error(f.bad.join('; '));
+    return `${f.summary} (removed before launch 1: ${removed.join(', ')})`;
+  };
+
+  let s2;
+  try {
