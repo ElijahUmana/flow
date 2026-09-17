@@ -345,3 +345,350 @@ async function termPoint(cdp, id) {
 
 // Claude Code's input line must be up (never its trust question, which the e2e does not answer).
 async function claudePrompt(cdp, id, what) {
+  let text = '';
+  await waitFor(async () => {
+    text = (await cdp.eval(termText(id))) || '';
+    return TRUST_RE.test(text) || PROMPT_RE.test(text);
+  }, { timeout: 30000, interval: 500, label: `Claude Code's input line in ${id}` }).catch((e) => {
+    throw new Error(`${e.message}; screen ${q(oneLine(text, 240))}`);
+  });
+  if (TRUST_RE.test(text)) throw new Error(`Claude Code in ${id} is asking whether to trust its folder; the e2e never answers that, so nothing was ${what} (screen ${q(oneLine(text, 200))})`);
+  return text;
+}
+
+async function clearClaudeInput(cdp, id, at) {
+  await click(cdp, at.x, at.y);
+  await key(cdp, 'u', 2);
+  await waitFor(async () => !/\[Image #\d+\]/.test((await cdp.eval(termText(id))) || ''), { timeout: 5000, interval: 200, label: `Claude Code's input in ${id} to be empty again after ctrl+u` });
+}
+
+// 12a drops an image file on the agent's terminal; 12b puts an image on the clipboard and pastes it with ⌘V.
+async function imageCheck(cdp, agent, how, userData) {
+  if (!agent) throw new Error('no agent from check 2');
+  await claudePrompt(cdp, agent.id, how === 'drop' ? 'dropped' : 'pasted');
+  const at = await termPoint(cdp, agent.id);
+  const savedDir = path.join(userData, 'pasted-images');
+  const savedBefore = fs.existsSync(savedDir) ? fs.readdirSync(savedDir).length : 0;
+  if (how === 'drop') {
+    const file = writePng(path.join(userData, 'e2e image.png'));
+    const data = { items: [], files: [file], dragOperationsMask: 1 };
+    for (const type of ['dragEnter', 'dragOver', 'drop']) await cdp.send('Input.dispatchDragEvent', { type, x: at.x, y: at.y, data });
+  } else {
+    const wrote = await cdp.eval(`(async () => {
+      const c = document.createElement('canvas');
+      c.width = 48;
+      c.height = 32;
+      const g = c.getContext('2d');
+      g.fillStyle = '#d77757';
+      g.fillRect(0, 0, 48, 32);
+      const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+      return true;
+    })()`).catch((e) => e.message);
+    if (wrote !== true) throw new Error(`could not put an image on the clipboard: ${wrote}`);
+    await click(cdp, at.x, at.y);
+    await key(cdp, 'v', 4, ['paste']);
+  }
+  let text = '';
+  await waitFor(async () => {
+    text = (await cdp.eval(termText(agent.id))) || '';
+    return /\[Image #\d+\]/.test(text);
+  }, { timeout: 30000, interval: 300, label: `[Image #N] in Claude Code's input in ${agent.id}` }).catch((e) => {
+    const typed = /e2e\\ image\.png|pasted-images|paste-[\dT-]+Z-\w+\.png/.test(text);
+    throw new Error(`${e.message}${typed ? '; the image path is in Claude Code\'s input but Claude Code did not attach it' : ''}; the last lines are ${q(oneLine(text.split('\n').filter((l) => l.trim()).slice(-4).join(' / '), 300))}`);
+  });
+  const line = text.split('\n').find((l) => /\[Image #\d+\]/.test(l)).trim();
+  let saved = '';
+  if (how === 'paste') {
+    const now = fs.existsSync(savedDir) ? fs.readdirSync(savedDir) : [];
+    if (now.length <= savedBefore) throw new Error(`Claude Code shows ${q(line)} but nothing new was saved in ${savedDir}`);
+    saved = `; main saved it as ${path.join(savedDir, now.sort().pop())}`;
+  }
+  await clearClaudeInput(cdp, agent.id, at);
+  return `Claude Code's input shows ${q(line)}${saved}; cleared again with ctrl+u, nothing sent`;
+}
+
+// A page window holds only the page; its note is a side panel behind ✎, closed by default (owner, Nov 1).
+async function pageNoteCheck(cdp) {
+  const id = idOf(await cdp.eval(`window.__flow.spawn('page')`));
+  if (!id) throw new Error(`__flow.spawn('page') returned no window`);
+  await sleep(500);
+  const look = () => cdp.eval(`(() => {
+    const w = document.querySelector('.win[data-id="${id}"]');
+    if (!w) return null;
+    const ed = w.querySelector('.npane') || w.querySelector('.anote') || w.querySelector('.pnote'), pn = w.querySelector('.pn'), pen = w.querySelector(':scope > .tb [data-act="note"]');
+    const er = ed ? ed.getBoundingClientRect() : null, nr = pn ? pn.getBoundingClientRect() : null, pr = pen ? pen.getBoundingClientRect() : null;
+    return {
+      noted: w.classList.contains('noted'),
+      visible: !!er && ed.offsetParent !== null && er.width > 0 && er.height > 0,
+      focused: !!ed && !!document.activeElement && ed.contains(document.activeElement),
+      beside: !!er && !!nr && er.left >= nr.right - 2,
+      pen: pr && pr.width ? { x: pr.left + pr.width / 2, y: pr.top + pr.height / 2 } : null,
+    };
+  })()`);
+  const a = await look();
+  if (!a) throw new Error(`window ${id} is not in the DOM`);
+  const bad = [];
+  if (a.noted || a.visible) bad.push(`the new page shows a note (${q(a)})`);
+  if (!a.pen) {
+    bad.push('the page window has no ✎ in its title bar');
+  } else {
+    await click(cdp, a.pen.x, a.pen.y);
+    await sleep(500);
+    const b = await look();
+    if (!b.noted || !b.visible || !b.beside) bad.push(`✎ should open the note beside the page (${q(b)})`);
+    await click(cdp, b.pen.x, b.pen.y);
+    await sleep(500);
+    const c = await look();
+    if (c.noted || c.visible) bad.push(`a second ✎ should close it (${q(c)})`);
+  }
+  if (bad.length) throw new Error(bad.join('; '));
+  await shot(cdp, '13-page-note');
+  return `new page ${id}: no note showing; ✎ opened the note beside the page and closed it again`;
+}
+
+// A local page with a link that opens a new tab, served by the e2e itself (127.0.0.1 only, closed after the check).
+function tabSite() {
+  return new Promise((resolve) => {
+    const srv = http.createServer((req, res) => {
+      res.setHeader('content-type', 'text/html; charset=utf-8');
+      // __clicks: the clicks the page itself got (clickInPage)
+      const page = (title, body) => `<!doctype html><title>${title}</title><style>body{font:28px sans-serif;margin:40px}a{display:inline-block;margin:30px 0}</style><script>window.__clicks = 0; addEventListener('click', () => { window.__clicks += 1; }, true);</script>${body}`;
+      const guard = '<h1>e2e guard</h1><input id="t" style="font-size:28px;width:80%"><script>addEventListener(\'beforeunload\', (e) => { if (document.getElementById(\'t\').value) { e.preventDefault(); e.returnValue = \'\'; } });</script>';
+      if (req.url === '/guard') return res.end(page('e2e guard', guard));
+      res.end(req.url === '/popped' ? page('e2e popped', '<h1>opened from a link</h1>') : page('e2e tabs', '<h1>e2e tabs</h1><a id="pop" href="/popped" target="_blank">open in a new tab</a>'));
+    });
+    srv.listen(0, '127.0.0.1', () => resolve({ srv, base: `http://127.0.0.1:${srv.address().port}/` }));
+  });
+}
+
+// A link with target=_blank in a page lands as a tab in that page window (owner, Nov 1: "a somehow new tab").
+/* The dock comes up when the pointer reaches the bottom middle (with a window under it, only from the strip at the very
+   bottom): approach the button from there, as a person does, and click it once it is under the pointer. */
+async function clickDock(cdp, kind) {
+  const r = await cdp.eval(`(() => { const b = document.querySelector('#dock button[data-k="${kind}"]'); if (!b) return null; const x = b.getBoundingClientRect(); return { x: x.left + x.width / 2, y: x.top + x.height / 2, vh: innerHeight }; })()`);
+  if (!r) return `the dock has no ${kind} button`;
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: r.x, y: r.vh - 4, button: 'none', buttons: 0 });
+  await sleep(250);
+  let at = null;
+  for (let i = 0; i < 25; i++) {
+    at = await cdp.eval(`(() => { const b = document.querySelector('#dock button[data-k="${kind}"]'); const x = b.getBoundingClientRect(); const cx = x.left + x.width / 2, cy = x.top + x.height / 2; const el = document.elementFromPoint(cx, cy); return { x: cx, y: cy, on: !!el && b.contains(el) && getComputedStyle(b).pointerEvents !== 'none' && +getComputedStyle(document.getElementById('dock')).opacity > 0.5 }; })()`);
+    if (at.on) break;
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: at.x, y: Math.max(at.y, r.vh - 4 - i * 6), button: 'none', buttons: 0 });
+    await sleep(100);
+  }
+  if (!at || !at.on) return `the dock's ${kind} button never came up under the pointer`;
+  await click(cdp, at.x, at.y);
+  return null;
+}
+
+// A click through the window, as a person clicks, then a wait on the app's own state (done). Chromium drops a click that
+// reaches a page before the page has drawn, and a window macOS reports covered may not draw at all, so nothing here waits
+// on the page's frames: the page counts the clicks it gets (g is its CDP). A click it never got is sent again, each retry
+// printed; a click it got with no done() within timeout fails, and so does a page that got none of five.
+async function clickInPage(cdp, g, x, y, what, done, timeout) {
+  for (let i = 1; i <= 5; i++) {
+    const n = await g.eval('window.__clicks');
+    if (typeof n !== 'number') throw new Error(`the page has no click counter (window.__clicks is ${q(n)})`);
+    await click(cdp, x, y);
+    const got = await waitFor(async () => (await g.eval('window.__clicks')) > n, { timeout: 2000, interval: 100, label: `the page to get the click on ${what}` }).then(() => true, () => false);
+    if (got) {
+      const r = await waitFor(done, { timeout, interval: 200, label: what }).catch(() => null);
+      if (!r) throw new Error(`the page got the click on ${what} and nothing came of it within ${timeout / 1000}s`);
+      return r;
+    }
+    const under = await cdp.eval(`(() => { const e = document.elementFromPoint(${x}, ${y}); return e ? e.tagName.toLowerCase() + (typeof e.className === 'string' && e.className.trim() ? '.' + e.className.trim().split(/\\s+/).join('.') : '') : 'nothing'; })()`);
+    console.log(`e2e: retry: click ${i} of 5 on ${what} at ${Math.round(x)},${Math.round(y)} (${under} there) never reached the page${i < 5 ? '; clicking again' : ''}`);
+    if (i < 5) await sleep(1000);
+  }
+  throw new Error(`the page got none of 5 clicks on ${what}`);
+}
+
+async function tabsCheck(cdp) {
+  const { srv, base } = await tabSite();
+  try {
+    const id = idOf(await cdp.eval(`window.__flow.openPage(${q(base)})`));
+    if (!id) throw new Error('__flow.openPage() returned no window');
+    const pageUrl = () => cdp.eval(`(() => { const p = window.__flow.page(${q(id)}); return p && !p.isLoading() ? p.getURL() : null; })()`);
+    const tabCountNow = () => cdp.eval(`(() => { const p = window.__flow.page(${q(id)}); return p ? p.tabs().tabs.length : null; })()`);
+    const stripNow = () => cdp.eval(`(() => { const el = document.querySelector('.win[data-id="${id}"] .ptabs'); return el ? { on: el.classList.contains('on'), tabs: [...el.querySelectorAll('.ptab')].map((t) => t.textContent.replace('×', '').trim()), active: [...el.querySelectorAll('.ptab')].findIndex((t) => t.classList.contains('on')) } : null; })()`);
+    await waitFor(async () => (await pageUrl()) === base, { timeout: 20000, interval: 300, label: `the local page ${base} in window ${id}` });
+    const before = await cdp.eval('window.__flow.windows().length');
+    // A new window can still be gliding to its spot: click once it holds still (as a person clicks where the link is).
+    let last = '';
+    await waitFor(async () => {
+      const r = JSON.stringify(await cdp.eval(`(() => { const w = document.querySelector('.win[data-id="${id}"]'); if (!w) return null; const b = w.getBoundingClientRect(); return [b.left, b.top, b.width, b.height]; })()`));
+      const still = r === last;
+      last = r;
+      return still;
+    }, { timeout: 5000, interval: 300, label: `window ${id} to hold still` });
+    // where the link is on screen: the page is laid out at desktop width and scaled to fit
+    const target = (await listTargets()).find((t) => t.type === 'webview' && t.url === base);
+    if (!target) throw new Error(`no webview target for ${base}`);
+    const g = new CDP(target.webSocketDebuggerUrl);
+    await g.open();
+    try {
+      const link = await g.eval(`(() => { const r = document.getElementById('pop').getBoundingClientRect(); return { x: r.left + Math.min(40, r.width / 2), y: r.top + r.height / 2, vw: innerWidth }; })()`);
+      const wv = await cdp.eval(`(() => { const v = document.querySelector('.win[data-id="${id}"] webview:not(.off)') || document.querySelector('.win[data-id="${id}"] webview'); if (!v) return null; const r = v.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width }; })()`);
+      if (!wv) throw new Error(`window ${id} has no webview`);
+      const sc = wv.w / link.vw;
+      await clickInPage(cdp, g, wv.x + link.x * sc, wv.y + link.y * sc, `a target=_blank link in window ${id}`, async () => (await tabCountNow()) >= 2, 15000);
+    } finally {
+      g.close();
+    }
+    const strip = await waitFor(async () => {
+      const r = await stripNow();
+      return r && r.tabs.length >= 2 ? r : null;
+    }, { timeout: 5000, interval: 200, label: `the tab strip of window ${id} to show its second tab` });
+    await waitFor(async () => (await pageUrl()) === `${base}popped`, { timeout: 15000, interval: 300, label: 'the new tab to show the linked page' });
+    const after = await cdp.eval('window.__flow.windows().length');
+    const bad = [];
+    if (!strip.on) bad.push('the tab strip is not showing with two tabs');
+    if (after !== before) bad.push(`the link opened ${after - before} new window(s) instead of a tab`);
+    // ⌘T in a page (item 1): the keys are in the page, as when the owner works there, so first a click on a blank spot of
+    // it; then the native menu's new-page action, run the way main runs it (CDP key events never reach the native menu).
+    // With the keys anywhere else ⌘T makes a page window of its own.
+    const popped = await waitFor(async () => (await listTargets()).find((t) => t.type === 'webview' && t.url === `${base}popped`), { timeout: 10000, interval: 300, label: `a webview target for ${base}popped` });
+    const spot = await cdp.eval(`(() => { const v = document.querySelector('.win[data-id="${id}"] webview:not(.off)'); if (!v) return null; const r = v.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height * 0.85 }; })()`);
+    if (!spot) throw new Error(`window ${id} shows no webview for its second tab`);
+    const pg = new CDP(popped.webSocketDebuggerUrl);
+    await pg.open();
+    try {
+      const keysIn = () => cdp.eval(`(() => { const w = document.querySelector('.win[data-id="${id}"]'); return !!w && w.contains(document.activeElement); })()`);
+      await clickInPage(cdp, pg, spot.x, spot.y, `a blank spot of the page in window ${id}`, keysIn, 3000).catch((e) => bad.push(`a click in the page did not put the keys in window ${id} (${e.message})`));
+    } finally {
+      pg.close();
+    }
+    const ran = await cdp.eval(`typeof window.__flow.menu === 'function' ? window.__flow.menu('new-page') : 'no __flow.menu'`);
+    let t3 = null;
+    if (ran !== true) bad.push(`__flow.menu('new-page') returned ${q(ran)}`);
+    else {
+      t3 = await waitFor(async () => {
+        if ((await tabCountNow()) !== strip.tabs.length + 1) return null;
+        const r = await cdp.eval(`(() => { const w = document.querySelector('.win[data-id="${id}"]'); const el = w.querySelector('.ptabs'); const ad = w.querySelector('.addr .ad'); return { tabs: [...el.querySelectorAll('.ptab')].map((t) => t.textContent.replace('×', '').trim()), active: [...el.querySelectorAll('.ptab')].findIndex((t) => t.classList.contains('on')), address: document.activeElement === ad }; })()`);
+        return r.tabs.length === strip.tabs.length + 1 ? r : null;
+      }, { timeout: 5000, interval: 200, label: `a third tab in window ${id} after ⌘T` }).catch((e) => { bad.push(e.message); return null; });
+      if (t3 && t3.active !== t3.tabs.length - 1 && t3.active !== strip.active + 1) bad.push(`the new tab is not the one in front (${q(t3)})`);
+      if (t3 && !t3.address) bad.push('the address field of the new tab is not focused');
+      const after2 = await cdp.eval('window.__flow.windows().length');
+      if (after2 !== before) bad.push(`⌘T opened ${after2 - before} new window(s) instead of a tab`);
+    }
+    // the dock's page button (item 1): a page window of its own, even with this page window in front; its tabs stay
+    const ids = () => cdp.eval('window.__flow.windows().map((w) => w.id)');
+    const tabCount = () => cdp.eval(`document.querySelectorAll('.win[data-id="${id}"] .ptab').length`);
+    const ids0 = await ids(), tabs0 = await tabCount();
+    const dockErr = await clickDock(cdp, 'page');
+    let made = null;
+    if (dockErr) bad.push(dockErr);
+    else {
+      made = await waitFor(async () => {
+        const fresh = (await ids()).filter((x) => !ids0.includes(x));
+        return fresh.length ? cdp.eval(`window.__flow.windows().find((w) => w.id === ${q(fresh[0])})`) : null;
+      }, { timeout: 5000, interval: 200, label: 'a window from the dock\'s page button' }).catch((e) => { bad.push(e.message); return null; });
+      if (made && made.type !== 'page') bad.push(`the dock's page button made a ${made.type} window`);
+      const tabs1 = await tabCount();
+      if (tabs1 !== tabs0) bad.push(`the dock's page button changed the tabs of ${id} (${tabs0} to ${tabs1})`);
+    }
+    if (bad.length) throw new Error(bad.join('; '));
+    await shot(cdp, '14-tabs');
+    return `a target=_blank link in window ${id} opened tab ${strip.active + 1} of ${strip.tabs.length} [${strip.tabs.join(' | ')}] showing ${base}popped; ⌘T (new-page) with that window in front added tab ${t3.active + 1} of ${t3.tabs.length} with the address focused; no new window; the dock's page button made page window ${made && made.id}, tabs of ${id} unchanged`;
+  } finally {
+    srv.close();
+  }
+}
+
+// Closing a page window always closes it, also when its site guards unsaved typing: no leave/stay ask (owner, Nov 1
+// 20:47; lead 17:4x). Such a page is kept out of sight for 10 s, and ⇧⌘T in that time brings it back as it was: the same
+// live page (performance.timeOrigin), typing and all.
+async function guardCheck(cdp) {
+  const { srv, base } = await tabSite();
+  const url = `${base}guard`;
+  try {
+    const id = idOf(await cdp.eval(`window.__flow.openPage(${q(url)})`));
+    if (!id) throw new Error('__flow.openPage() returned no window');
+    await waitFor(async () => (await cdp.eval(`(() => { const p = window.__flow.page(${q(id)}); return p && !p.isLoading() ? p.getURL() : null; })()`)) === url, { timeout: 20000, interval: 300, label: `the guard page in window ${id}` });
+    let last = '';
+    await waitFor(async () => {
+      const r = JSON.stringify(await cdp.eval(`(() => { const w = document.querySelector('.win[data-id="${id}"]'); if (!w) return null; const b = w.getBoundingClientRect(); return [b.left, b.top, b.width, b.height]; })()`));
+      const still = r === last;
+      last = r;
+      return still;
+    }, { timeout: 5000, interval: 300, label: `window ${id} to hold still` });
+    const target = await waitFor(async () => (await listTargets()).find((t) => t.type === 'webview' && t.url === url), { timeout: 10000, interval: 300, label: `a webview target for ${url}` });
+    const g = new CDP(target.webSocketDebuggerUrl);
+    await g.open();
+    const typed = `typed by the e2e ${Date.now()}`;
+    try {
+      const box = await g.eval(`(() => { const r = document.getElementById('t').getBoundingClientRect(); return { x: r.left + 20, y: r.top + r.height / 2, vw: innerWidth }; })()`);
+      const wv = await cdp.eval(`(() => { const v = document.querySelector('.win[data-id="${id}"] webview:not(.off)'); if (!v) return null; const r = v.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width }; })()`);
+      if (!wv) throw new Error(`window ${id} has no webview`);
+      const sc = wv.w / box.vw;
+      await clickInPage(cdp, g, wv.x + box.x * sc, wv.y + box.y * sc, `the text field of the guard page in window ${id}`, () => g.eval(`document.activeElement === document.getElementById('t')`), 3000);
+      await g.send('Input.insertText', { text: typed });
+      await waitFor(async () => (await g.eval(`document.getElementById('t').value`)) === typed, { timeout: 3000, interval: 100, label: 'the typing in the guard page' });
+      const origin = await g.eval('performance.timeOrigin');
+      // close it as a person does: the close light in its title bar
+      const light = await cdp.eval(`(() => { const l = document.querySelector('.win[data-id="${id}"] .lights [data-l="close"]'); if (!l) return null; const r = l.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
+      if (!light) throw new Error(`window ${id} has no close light`);
+      await click(cdp, light.x, light.y);
+      const open = () => cdp.eval(`window.__flow.windows().some((w) => w.id === ${q(id)})`);
+      const gone = await waitFor(async () => !(await open()), { timeout: 3000, interval: 100, label: `window ${id} to close` }).then(() => true, () => false);
+      const asked = await cdp.eval(`(() => { const a = document.querySelector('.win[data-id="${id}"] .pask.on'); if (!a) return null; const t = a.querySelector('.pa-t'); return (t || a).textContent.trim() + ' (' + [...a.querySelectorAll('button')].map((b) => b.textContent.trim()).join(' / ') + ')'; })()`);
+      if (!gone || asked) {
+        // answer "leave", so the page does not hold up the rest of the run (the quit)
+        await cdp.eval(`(() => { const b = document.querySelector('.win[data-id="${id}"] .pask.on .pa-yes'); if (b) b.click(); })()`);
+        throw new Error(`closing page window ${id}, whose page guards typing, ${asked ? `asked ${q(asked)}` : 'left it open'}${gone ? '' : ' and the window stayed'}`);
+      }
+      const ran = await cdp.eval(`typeof window.__flow.menu === 'function' ? window.__flow.menu('tab-reopen') : 'no __flow.menu'`);
+      if (ran !== true) throw new Error(`__flow.menu('tab-reopen') returned ${q(ran)}`);
+      await waitFor(open, { timeout: 3000, interval: 100, label: `⇧⌘T to bring window ${id} back` });
+      const back = await g.eval(`({ value: document.getElementById('t').value, origin: performance.timeOrigin })`);
+      if (back.value !== typed || back.origin !== origin) throw new Error(`after ⇧⌘T window ${id} shows ${back.origin === origin ? 'the same page' : 'a reloaded page'} with ${q(back.value)} in its field, expected ${q(typed)}`);
+    } finally {
+      g.close();
+    }
+    await shot(cdp, '17-guard');
+    // closed again for the rest of the run: it goes at once, and its page after the 10 s
+    const light2 = await cdp.eval(`(() => { const l = document.querySelector('.win[data-id="${id}"] .lights [data-l="close"]'); if (!l) return null; const r = l.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
+    if (light2) await click(cdp, light2.x, light2.y);
+    await waitFor(async () => !(await cdp.eval(`window.__flow.windows().some((w) => w.id === ${q(id)})`)), { timeout: 3000, interval: 100, label: `window ${id} to close again` });
+    return `page window ${id} with typing its page guards closed at once with no leave/stay ask; ⇧⌘T brought back the same page with ${q(typed)} in its field`;
+  } finally {
+    srv.close();
+  }
+}
+
+// The finger map (MAC_NOTES 60): two fingers pan the board and never leave the space; three fingers step through the
+// sub-workspaces of the workspace; four step through the workspaces. Three and four are fed as the trackpad's touch
+// stream (touch.js -> nav.fingers), as on the Mac.
+async function swipeCheck(cdp) {
+  await cdp.eval('window.__flow.go(0)');
+  await waitFor(() => cdp.eval(`window.__flow.state().ui.at === window.__flow.state().ws[0].id`), { timeout: 5000, interval: 150, label: 'the first workspace on screen' });
+  await sleep(800);
+  const st = () => cdp.eval(`(() => { const s = window.__flow.state(); const i = s.ws.findIndex((w) => w.id === s.ui.at); const ws = s.ws[i < 0 ? 0 : i]; return { i, id: ws.id, at: ws.at || null, pan: ws.pan || 0, zones: (ws.zones || []).map((z) => ({ id: z.id, name: z.name })) }; })()`);
+  let s = await st();
+  if (!s.zones.length) throw new Error(`workspace ${s.id} has no sub-workspace to swipe to`);
+  if (s.at) throw new Error(`workspace ${s.id} shows sub-workspace ${s.at}, expected its main space at the start`);
+  const spot = await cdp.eval(`(() => {
+    const v = document.getElementById('viewport').getBoundingClientRect();
+    for (let y = v.top + v.height * 0.15; y < v.bottom - 90; y += 23) for (let x = v.left + 30; x < v.right - 30; x += 29) {
+      const el = document.elementFromPoint(x, y);
+      if (el && (el.classList.contains('canvas') || el.classList.contains('ws'))) return { x, y };
+    }
+    return null;
+  })()`);
+  if (!spot) throw new Error('no bare desktop in view to swipe over');
+  const wheel = async (dx) => {
+    const t0 = Date.now();
+    for (let k = 0; k < 20; k++) {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: spot.x, y: spot.y, deltaX: dx, deltaY: 0, button: 'none', buttons: 0, pointerType: 'mouse', timestamp: (t0 + k * 16) / 1000 });
+    }
+  };
+  const touch = async (n, dx) => {
+    const t0 = Date.now();
+    for (let k = 0; k < 14; k++) await cdp.eval(`window.__flow.nav().fingers({ n: ${n}, t: ${t0 + k * 16}, dx: ${dx} })`);
+    await cdp.eval(`window.__flow.nav().fingers({ n: 0, t: ${t0 + 14 * 16} })`);
+  };
+  // two fingers: the board pans, and the space and workspace stay
+  const pan0 = s.pan;
+  await wheel(30);
