@@ -122,3 +122,126 @@ try {
   fs.writeFileSync(path.join(probe, 'scripts/test-node-pty-old-new-darwin.sh'), oldNewScript);
   fs.copyFileSync(watchdog, path.join(probe, 'scripts/pty-lifecycle-watchdog.cjs'));
   fs.writeFileSync(path.join(probe, 'bin/uname'), '#!/bin/sh\ncase "$1" in -s) printf "Darwin\\n" ;; -m) printf "arm64\\n" ;; *) exit 2 ;; esac\n', { mode: 0o700 });
+  fs.writeFileSync(path.join(probe, 'node_modules/.bin/electron'), '#!/usr/bin/env node\nconsole.error(process.env.FLOW_PROBE_OLD_MESSAGE); process.exit(Number(process.env.FLOW_PROBE_OLD_STATUS));\n', { mode: 0o700 });
+  fs.writeFileSync(path.join(probe, 'scripts/rebuild-node-pty-darwin.sh'), '#!/bin/sh\nprintf "new gate ran\\n" > "$FLOW_PROBE_MARKER"\nexit "$FLOW_PROBE_NEW_STATUS"\n', { mode: 0o700 });
+  let leakMessage;
+  try {
+    assert.deepStrictEqual([42], [], 'natural exit cycle 1: PTY masters did not return to baseline []; now [42]');
+  } catch (err) {
+    leakMessage = `FAIL pty-native-lifecycle: ${err.stack}`.split('\n')[0];
+  }
+  for (const [label, message, oldStatus, newStatus, expected, newRan] of [
+    ['unrelated failure', 'FAIL pty-native-lifecycle: Error: lsof exited 2', 1, 0, 2, false],
+    ['runtime failure', 'FAIL pty-native-lifecycle: AssertionError [ERR_ASSERTION]: expected Electron runtime', 1, 0, 2, false],
+    ['wrong cycle', leakMessage.replace('cycle 1:', 'cycle 2:'), 1, 0, 2, false],
+    ['no leaked descriptor', leakMessage.replace('now [42]', 'now []'), 1, 0, 2, false],
+    ['timeout', leakMessage, 124, 0, 2, false],
+    ['old unexpectedly passed', leakMessage, 0, 0, 2, false],
+    ['exact leak and new pass', leakMessage, 1, 0, 0, true],
+    ['exact leak and new failure', leakMessage, 1, 7, 7, true],
+  ]) {
+    const marker = path.join(probe, 'new-gate-marker');
+    fs.rmSync(marker, { force: true });
+    const result = run('/bin/bash', [path.join(probe, 'scripts/test-node-pty-old-new-darwin.sh'), path.join(probe, 'old')], probe, {
+      ...process.env, PATH: path.join(probe, 'bin') + path.delimiter + process.env.PATH,
+      FLOW_PROBE_OLD_MESSAGE: message, FLOW_PROBE_OLD_STATUS: String(oldStatus),
+      FLOW_PROBE_NEW_STATUS: String(newStatus), FLOW_PROBE_MARKER: marker,
+    });
+    assert.strictEqual(result.status, expected, `${label}: ${result.stdout}${result.stderr}`);
+    assert.strictEqual(fs.existsSync(marker), newRan, `${label}: new gate execution`);
+  }
+  console.log('PASS: old control requires the exact cycle-1 descriptor leak; unrelated failures and timeouts are rejected; new gate must pass');
+  const watchdogResult = run(process.execPath, [watchdogCheck], shipped);
+  pass(watchdogResult);
+  process.stdout.write(watchdogResult.stdout);
+  assert.strictEqual(crypto.createHash('md5').update(fs.readFileSync(lifecycle)).digest('hex'), '0315345126ad9defea0e731f5c4ad585');
+  assert.strictEqual(hash(path.join(shipped, 'native/icon.icns')), '1505cbd0ac82330ad93f4d15921b7398691aff360c2895eb687045a0d9d5283e');
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(shipped, 'package.json'), 'utf8')).devDependencies.electron, '45.2.1');
+  assert.ok(packageScript.indexOf('scripts/apply-node-pty-patch.cjs') < packageScript.indexOf('scripts/rebuild-node-pty-darwin.sh'));
+  assert.ok(rebuildScript.indexOf('scripts/apply-node-pty-patch.cjs') < rebuildScript.indexOf('scripts/node-pty-darwin-cleanup.py'));
+  assert.ok(rebuildScript.indexOf('scripts/node-pty-darwin-cleanup.py') < rebuildScript.indexOf('npm rebuild node-pty --build-from-source'));
+  assert.ok(rebuildScript.indexOf('npm rebuild node-pty --build-from-source') < rebuildScript.indexOf('scripts/pty-native-lifecycle.cjs'));
+  assert.ok(packageScript.indexOf('"$PACKAGER" "$ROOT"') < packageScript.indexOf('scripts/pty-native-lifecycle.cjs'));
+  console.log('ok shipped paths, gate order, lifecycle/icon identity, SHA256 selection and shasum-only fallback');
+
+  const originalManifest = fs.readFileSync(manifest);
+  assert.strictEqual(JSON.parse(originalManifest).version, '1.1.0');
+  if (hash(source) === after) {
+    pass(run('/usr/bin/patch', ['--batch', '--reverse', '-p1', '-i', patch], shipped));
+  }
+  assert.strictEqual(hash(source), before, 'dependency source is not the exact baseline or patched source');
+  const baseline = fs.readFileSync(source);
+  let result = run('python3', ['-I', cleanup, source, '--expect', 'fail'], shipped);
+  pass(result);
+  assert.match(result.stdout, /FAIL: success leaked descriptor\(s\), std mask 0/);
+  process.stdout.write(result.stdout);
+  pass(run(process.execPath, [apply, shipped], shipped));
+  assert.strictEqual(hash(source), after);
+  const patched = fs.readFileSync(source);
+  const unchanged = fs.statSync(source);
+  pass(run(process.execPath, [apply, shipped], shipped));
+  assert.strictEqual(hash(source), after);
+  assert.strictEqual(fs.statSync(source).mtimeMs, unchanged.mtimeMs, 'patched no-op rewrote the source');
+  result = run('python3', ['-I', cleanup, source, '--expect', 'pass'], shipped);
+  pass(result);
+  process.stdout.write(result.stdout);
+
+  for (const contents of [baseline, patched]) {
+    fs.writeFileSync(source, Buffer.concat([contents, Buffer.from('\n')]));
+    const mutationHash = hash(source);
+    result = run(process.execPath, [apply, shipped], shipped);
+    assert.notStrictEqual(result.status, 0, 'source mutation was accepted');
+    assert.match(result.stderr, /expected baseline/);
+    assert.strictEqual(hash(source), mutationHash, 'rejected source mutation was changed');
+    fs.writeFileSync(source, contents);
+    const invalidManifest = JSON.stringify({ ...JSON.parse(originalManifest), version: '1.1.1' });
+    fs.writeFileSync(manifest, invalidManifest);
+    result = run(process.execPath, [apply, shipped], shipped);
+    assert.notStrictEqual(result.status, 0, 'unsupported node-pty version was accepted');
+    assert.match(result.stderr, /expected node-pty 1\.1\.0/);
+    assert.strictEqual(hash(source), contents === baseline ? before : after, 'version rejection changed source');
+    assert.strictEqual(fs.readFileSync(manifest, 'utf8'), invalidManifest, 'version rejection changed manifest');
+    fs.writeFileSync(manifest, originalManifest);
+  }
+  const originalPatch = fs.readFileSync(patch);
+  fs.writeFileSync(source, baseline);
+  fs.appendFileSync(patch, '\n');
+  const mutatedPatchHash = hash(patch);
+  result = run(process.execPath, [apply, shipped], shipped);
+  assert.notStrictEqual(result.status, 0, 'mutated patch was accepted');
+  assert.match(result.stderr, /patch content differs/);
+  assert.strictEqual(hash(source), before, 'patch rejection changed source');
+  assert.strictEqual(hash(patch), mutatedPatchHash, 'patch rejection changed patch');
+  fs.writeFileSync(patch, originalPatch);
+  fs.writeFileSync(source, patched);
+  console.log(`ok exact baseline ${before} -> patched ${after}; no-op and rejected source/version/patch mutations stay unchanged`);
+
+  for (const text of [packageScript, rebuildScript]) {
+    assert.ok(text.includes('[ "$(uname -s)" = Darwin ]'), 'missing macOS guard');
+    assert.ok(text.includes('[ "$(uname -m)" = arm64 ]'), 'missing arm64 guard');
+  }
+
+  for (const input of ['node_modules/.bin/electron-packager', 'node_modules/electron/package.json', 'node_modules/electron/dist/version']) {
+    assert.ok(fs.existsSync(path.join(shipped, input)), `existing dependency tree is missing ${input}`);
+    console.log(`ok existing dependency input: ${input}`);
+  }
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(shipped, 'node_modules/electron/package.json'), 'utf8')).version, '45.2.1');
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(shipped, 'node_modules/electron-packager/package.json'), 'utf8')).version, '17.1.2');
+  assert.strictEqual(fs.readFileSync(path.join(shipped, 'node_modules/electron/dist/version'), 'utf8').trim(), '45.2.1');
+  if (process.platform === 'linux') {
+    result = run(process.execPath, [watchdog, '120000', path.join(shipped, 'node_modules', electronExecutable), lifecycle, path.join(shipped, 'node_modules/node-pty')], shipped,
+      { ...process.env, ELECTRON_RUN_AS_NODE: '1' });
+    pass(result);
+    process.stdout.write(result.stdout);
+    console.log('ok Linux Electron lifecycle only; no Darwin package was executed');
+  }
+  assert.deepStrictEqual(snapshot(dependencies), originalDependencies, 'source dependencies changed during closure checks');
+  console.log('ok original dependency hashes unchanged after all temporary-tree checks');
+  console.log('PASS: shipped-source closure and deterministic patch/cleanup gates; Darwin arm64 rebuild, Mach-O and packaged lifecycle still require macOS');
+} finally {
+  fs.rmSync(temporary, { recursive: true, force: true });
+}
+
+
+
+
