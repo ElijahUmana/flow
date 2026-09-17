@@ -692,3 +692,350 @@ async function swipeCheck(cdp) {
   // two fingers: the board pans, and the space and workspace stay
   const pan0 = s.pan;
   await wheel(30);
+  await sleep(900);
+  let a = await st();
+  if (a.at || a.i !== s.i) throw new Error(`a two-finger swipe left the space: now ${q(a)}`);
+  if (Math.abs(a.pan - pan0) < 0.01) throw new Error(`a two-finger swipe did not move the board (pan ${pan0} -> ${a.pan})`);
+  // three fingers: the next sub-workspace, then back
+  await touch(3, 40);
+  s = await waitFor(async () => { const x = await st(); return x.at === x.zones[0].id ? x : null; }, { timeout: 5000, interval: 150, label: `a three-finger swipe to move ${s.id} to its first sub-workspace` }).catch(async (e) => { throw new Error(`${e.message}; now ${q(await st())}`); });
+  await shot(cdp, '15-swiped');
+  if (s.i !== a.i) throw new Error('the three-finger swipe changed the workspace instead of the space');
+  await sleep(600);
+  await touch(3, -40);
+  await waitFor(async () => !(await st()).at, { timeout: 5000, interval: 150, label: 'a three-finger swipe back to the main space' }).catch(async (e) => { throw new Error(`${e.message}; now ${q(await st())}`); });
+  // four fingers: the next workspace, then back
+  await sleep(600);
+  await touch(4, 40);
+  const b = await waitFor(async () => { const x = await st(); return x.i === a.i + 1 ? x : null; }, { timeout: 5000, interval: 150, label: 'a four-finger swipe to the next workspace' }).catch(async (e) => { throw new Error(`${e.message}; now ${q(await st())}`); });
+  await sleep(600);
+  await touch(4, -40);
+  await waitFor(async () => (await st()).i === a.i, { timeout: 5000, interval: 150, label: 'a four-finger swipe back' }).catch(async (e) => { throw new Error(`${e.message}; now ${q(await st())}`); });
+  return `in ${a.id}: two fingers panned the board (pan ${pan0} -> ${a.pan}) and stayed in the space; three fingers moved to sub-workspace ${q(s.zones[0].name)} and back; four fingers moved to ${b.id} and back`;
+}
+
+function isExec(p) {
+  try {
+    fs.accessSync(p, fs.constants.X_OK);
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// Where pty.js finds claude: ~/bin, ~/.local/bin, then the login shell's PATH.
+function claudeBin() {
+  for (const p of [path.join(HOME, 'bin/claude'), path.join(HOME, '.local/bin/claude')]) if (isExec(p)) return p;
+  const r = spawnSync('/bin/zsh', ['-ilc', 'command -v claude'], { encoding: 'utf8', timeout: 20000 });
+  const p = (r.stdout || '').trim().split('\n').pop() || '';
+  if (p.startsWith('/') && isExec(p)) return p;
+  throw new Error(`cannot find claude in ~/bin, ~/.local/bin or the login shell's PATH (${q(oneLine(r.stderr || r.stdout || '', 160))})`);
+}
+
+// Tests only open, resume or fork sessions they made themselves (STATUS, since Nov 1 18:45). The /cost setup denies
+// Bash: some Claude builds treat /cost as a prompt, and Bash can recursively invoke claude. It runs in a detached,
+// bounded process group so a timeout kills every descendant before the e2e continues. OWN_DIR is removed at the end of
+// the run; the transcript stays.
+const OWN_DIR = path.join(HOME, '.flow-dev', 'ship', `e2e-${Date.now()}`);
+const ownIds = [];
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function processGroupAlive(pid) {
+  if (process.platform === 'win32') return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (e) {
+    if (e.code === 'ESRCH') return false;
+    if (e.code === 'EPERM') return true;
+    throw e;
+  }
+}
+
+function signalProcessGroup(pid, signal) {
+  try {
+    if (process.platform === 'win32') process.kill(pid, signal);
+    else process.kill(-pid, signal);
+  } catch (e) {
+    if (e.code !== 'ESRCH') throw e;
+  }
+}
+
+async function waitForProcessGroupGone(pid, timeout) {
+  const end = Date.now() + timeout;
+  while (processGroupAlive(pid) && Date.now() < end) await delay(25);
+  return !processGroupAlive(pid);
+}
+
+async function runDetachedProbe(command, args, { cwd, env, timeout }) {
+  const child = spawn(command, args, {
+    cwd,
+    env,
+    detached: process.platform !== 'win32',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '', stderr = '', outputTruncated = false;
+  const capture = (current, chunk) => {
+    const room = 1024 * 1024 - current.length;
+    if (chunk.length > room) outputTruncated = true;
+    return room > 0 ? current + chunk.slice(0, room) : current;
+  };
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (s) => { stdout = capture(stdout, s); });
+  child.stderr.on('data', (s) => { stderr = capture(stderr, s); });
+  const failed = new Promise((_, reject) => child.once('error', reject));
+  let exitResult = { code: null, signal: null };
+  child.once('exit', (code, signal) => { exitResult = { code, signal }; });
+  const closed = new Promise((resolve) => child.once('close', () => resolve(exitResult)));
+  let timer;
+  const timedOut = new Promise((resolve) => { timer = setTimeout(() => resolve({ timedOut: true }), timeout); });
+  let result;
+  try {
+    result = await Promise.race([closed, failed, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (result.timedOut) {
+    signalProcessGroup(child.pid, 'SIGTERM');
+    if (!await waitForProcessGroupGone(child.pid, 400)) signalProcessGroup(child.pid, 'SIGKILL');
+    const gone = await waitForProcessGroupGone(child.pid, 2000);
+    child.stdout.destroy();
+    child.stderr.destroy();
+    if (!gone) throw new Error(`timed-out process group ${child.pid} survived SIGKILL`);
+    return { code: null, signal: 'SIGKILL', timedOut: true, stdout, stderr, outputTruncated, pid: child.pid };
+  }
+  await closed;
+  if (processGroupAlive(child.pid)) {
+    signalProcessGroup(child.pid, 'SIGKILL');
+    await waitForProcessGroupGone(child.pid, 2000);
+    throw new Error(`probe exited but descendant process group ${child.pid} remained`);
+  }
+  return { ...result, timedOut: false, stdout, stderr, outputTruncated, pid: child.pid };
+}
+
+async function makeOwnSession() {
+  const word = `flowe2e${Date.now().toString(36)}`;
+  const dir = path.join(OWN_DIR, word);
+  fs.mkdirSync(dir, { recursive: true });
+  const id = crypto.randomUUID();
+  const bin = claudeBin();
+  const env = { PATH: process.env.PATH, HOME, USER: process.env.USER, LOGNAME: process.env.LOGNAME, SHELL: process.env.SHELL, TERM: 'xterm-256color' };
+  const r = await runDetachedProbe(bin,
+    ['-p', '/cost', '--disallowedTools', 'Bash', '--session-id', id],
+    { cwd: dir, env, timeout: 90000 });
+  const files = [...new Set([dir, fs.realpathSync(dir)])].map((d) => path.join(HOME, '.claude/projects', d.replace(/[^a-zA-Z0-9]/g, '-'), `${id}.jsonl`));
+  const file = files.find((f) => fs.existsSync(f));
+  ownIds.push(`${id} (claude -p "/cost" in ${dir})`);
+  if (r.timedOut || r.outputTruncated || r.code !== 0 || !file) {
+    const outcome = r.timedOut ? 'timed out after 90s; process group killed' : r.outputTruncated ? 'wrote more than 1 MiB to stdout/stderr' : `exit ${r.code}${r.signal ? ` (${r.signal})` : ''}`;
+    throw new Error(`${bin} -p "/cost" --disallowedTools Bash --session-id ${id} in ${dir}: ${outcome}, transcript ${file ? 'written' : `missing (looked at ${files.join(', ')})`}, stdout ${q(oneLine(r.stdout || '', 400))}, stderr ${q(oneLine(r.stderr || '', 400))}`);
+  }
+  return { id, word, dir, file, said: commandOutput(file), probe: r, bin };
+}
+
+// What a local command printed, as the session's transcript keeps it (<local-command-stdout>): for /cost, "Total cost: ..."
+// with an API key, and on a Max account a sentence about the subscription or its overages, worded by Claude Code's version
+// (MAC_NOTES 17, 31). Lines of 12 characters or more, spaces collapsed.
+function commandOutput(file) {
+  const lines = [];
+  fs.readFileSync(file, 'utf8').split('\n').forEach((l, i) => {
+    if (!l.trim()) return;
+    let d;
+    try {
+      d = JSON.parse(l);
+    } catch (e) {
+      throw new Error(`${file} line ${i + 1} is not JSON: ${e.message}`);
+    }
+    const m = typeof d.content === 'string' && d.content.match(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/);
+    if (m) lines.push(...m[1].split('\n').map((x) => x.replace(/\s+/g, ' ').trim()).filter((x) => x.length >= 12));
+  });
+  return lines;
+}
+// A screen shows one of those lines (its first 40 characters), long lines wrapped at any width.
+const showsOutput = (said, t) => {
+  const flat = [String(t || '').replace(/\n\s*/g, ''), String(t || '').replace(/\n\s*/g, ' ')].map((x) => x.replace(/\s+/g, ' '));
+  return said.find((l) => flat.some((f) => f.includes(l.slice(0, 40)))) || null;
+};
+
+async function forkCheck(cdp) {
+  const own = await makeOwnSession();
+  await cdp.eval('document.activeElement && document.activeElement.blur && document.activeElement.blur()');
+  const box = await cdp.eval(`(() => { const el = document.querySelector('#q'); if (!el) return null; const b = el.getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 }; })()`);
+  if (!box) throw new Error('there is no sidebar search box (#q)');
+  await click(cdp, box.x, box.y);
+  const rowOf = () => cdp.eval(`(() => { const r = document.querySelector('#sblist .srow[data-sess="${own.id}"]'); if (!r) return null; const b = r.getBoundingClientRect(); return { x: b.left + Math.min(60, b.width / 2), y: b.top + b.height / 2 }; })()`);
+  let row = null;
+  for (const text of [own.id.slice(0, 8), own.word]) {
+    await cdp.eval(`(() => { const el = document.querySelector('#q'); el.focus(); el.select(); })()`);
+    await cdp.send('Input.insertText', { text });
+    row = await waitFor(rowOf, { timeout: 8000, interval: 300, label: `the session ${own.id} in the sidebar search for ${q(text)}` }).catch(() => null);
+    if (row) break;
+  }
+  if (!row) throw new Error(`the sidebar search lists session ${own.id} neither for the start of its id nor for its folder ${q(own.word)}`);
+  await click(cdp, row.x, row.y);
+  const winOf = (expr) => cdp.eval(`(() => { const w = window.__flow.windows().find((x) => ${expr}); return w ? { id: w.id, title: w.title, sessionId: w.sessionId } : null; })()`);
+  const parent = await waitFor(() => winOf(`x.sessionId === ${q(own.id)}`), { timeout: 8000, interval: 200, label: 'a window for the session opened from the search' });
+  let ptext = '';
+  const claudeUp = (t) => CLAUDE_RE.test(t) || TRUST_RE.test(t);
+  // The conversation is what /cost printed, read from the session's own transcript; without that, the fixed /cost lines.
+  const CONVERSATION = /Total cost:|Total duration \(|Total code changes:|\d+ input, \d+ output/;
+  const conversation = (t) => (own.said.length ? !!showsOutput(own.said, t) : CONVERSATION.test(t) || subscriptionCost(t));
+  // Up means the conversation (the /cost exchange) or the trust question is drawn, not just the banner.
+  await waitFor(async () => {
+    ptext = (await cdp.eval(termText(parent.id))) || '';
+    return TRUST_RE.test(ptext) || conversation(ptext);
+  }, { timeout: 40000, interval: 500, label: `the resumed session ${parent.id} to show its conversation or the trust question` }).catch((e) => {
+    if (!claudeUp(ptext)) throw new Error(`${e.message}; screen ${q(oneLine(ptext, 240))}`);
+  });
+  // the window's menu (fork) is on its title bar: a right-click in the terminal opens the terminal's own menu (Copy, Paste,
+  // Select All) from batch 10 (term.js)
+  const at = await cdp.eval(`(() => { const t = document.querySelector('.win[data-id="${parent.id}"] > .tb .title'); if (!t) return null; const r = t.getBoundingClientRect(); return { x: r.left + Math.min(60, r.width / 2), y: r.top + r.height / 2 }; })()`);
+  if (!at) throw new Error(`window ${parent.id} has no title bar to right-click`);
+  const before = await cdp.eval(`(() => { const r = document.querySelector('.win[data-id="${parent.id}"]').getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; })()`);
+  await rightClick(cdp, at.x, at.y);
+  const items = await waitFor(async () => {
+    const l = await cdp.eval(`[...document.querySelectorAll('.ctx button')].map((b) => b.textContent)`);
+    return l.length ? l : null;
+  }, { timeout: 3000, interval: 100, label: 'a menu after right-clicking the agent' }).catch(() => []);
+  const after = (await cdp.eval(termText(parent.id))) || '';
+  const tmuxMenu = /Horizontal Split|Vertical Split|Respawn|Swap Up/.test(after) && !/Horizontal Split|Vertical Split|Respawn|Swap Up/.test(ptext);
+  const fi = items.findIndex((t) => /^fork/.test(t));
+  if (fi < 0 || tmuxMenu) throw new Error(`right-clicking the agent showed ${items.length ? `Flow's menu [${items.join(' | ')}]` : 'no Flow menu'}${tmuxMenu ? ' and tmux\'s own menu in the terminal' : ''}`);
+  const btn = await cdp.eval(`(() => { const b = document.querySelectorAll('.ctx button')[${fi}].getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 }; })()`);
+  await click(cdp, btn.x, btn.y);
+  const fork = await waitFor(() => cdp.eval(`(() => { for (const ws of window.__flow.state().ws) for (const w of ws.windows) if (w.forkFrom === ${q(own.id)}) return { id: w.id, title: w.title, label: w.label, sessionId: w.sessionId, forkFrom: w.forkFrom }; return null; })()`), { timeout: 10000, interval: 200, label: 'a window forked from the session' });
+  const bad = [];
+  if (!UUID_V4.test(fork.sessionId || '') || fork.sessionId === own.id) bad.push(`the fork's session id is ${q(fork.sessionId)}, it must be a new UUID`);
+  // Its own title stays empty so Claude's topic shows (owner, 20:45); "fork of ..." is the name it carries until then.
+  if (!/^fork of /.test(fork.title || fork.label || '')) bad.push(`the fork is named ${q(fork.title || fork.label)}`);
+  await sleep(1200);
+  const rects = await cdp.eval(`(() => { const r = (id) => { const b = document.querySelector('.win[data-id="' + id + '"]').getBoundingClientRect(); return { x: b.left, y: b.top, w: b.width, h: b.height }; }; return { p: r(${q(parent.id)}), f: r(${q(fork.id)}), vw: document.getElementById('viewport').clientWidth, vh: document.getElementById('viewport').clientHeight }; })()`);
+  const { p, f } = rects;
+  const sideBySide = Math.abs(f.y - p.y) < 3 && f.x > p.x && f.x - (p.x + p.w) < rects.vw * 0.03;
+  const stacked = Math.abs(f.x - p.x) < 3 && f.y > p.y && f.y - (p.y + p.h) < rects.vh * 0.04;
+  if (!sideBySide && !stacked) bad.push(`the fork is not beside its parent (parent ${q(p)}, fork ${q(f)}, parent before ${q(before)})`);
+  const cmd = tmux(['list-panes', '-t', `flow_${fork.id}`, '-F', '#{pane_start_command}']).out;
+  if (!cmd.includes(`--resume ${own.id} --fork-session --session-id ${fork.sessionId}`)) bad.push(`tmux pane of flow_${fork.id} started ${q(oneLine(cmd, 300))}`);
+  ownIds.push(`${fork.sessionId} (fork of ${own.id}, window ${fork.id})`);
+  // The parent's conversation is the /cost exchange; the fork must show it too (unless Claude Code asks to trust the
+  // folder first, as it may on a Mac whose home folder is not trusted: then only the rest is checked).
+  // Any line of the /cost exchange: a fork window can be half the parent's height, so the top lines may be out of view.
+  let ftext = '';
+  const trusted = !TRUST_RE.test(ptext);
+  await waitFor(async () => {
+    ftext = (await cdp.eval(termText(fork.id))) || '';
+    return trusted ? conversation(ftext) : claudeUp(ftext);
+  }, { timeout: 40000, interval: 500, label: trusted ? `the parent's conversation (the /cost exchange) in the fork ${fork.id}` : `Claude Code in the fork ${fork.id}` }).catch((e) => bad.push(`${e.message}; screen ${q(oneLine(ftext, 240))}`));
+  if (trusted && !conversation(ptext)) bad.push(`the parent does not show its conversation either (screen ${q(oneLine(ptext, 200))})`);
+  if (bad.length) throw new Error(bad.join('; '));
+  await shot(cdp, '11-fork');
+  const shown = trusted ? `; the parent and the fork both show the conversation (${q(oneLine((own.said.length ? showsOutput(own.said, ftext) : ftext.split('\n').find((l) => CONVERSATION.test(l) || SUBSCRIPTION_RE.test(l))) || '', 60))}, ${own.said.length ? `one of ${own.said.length} lines /cost printed in the transcript` : 'the fixed /cost lines: the transcript kept no command output'})` : `; Claude Code asks whether to trust ${own.dir} (never answered), so the conversation itself is not on screen`;
+  return `session ${own.id} made with claude -p "/cost" in ${own.dir}, opened from the search; right-click showed [${items.join(' | ')}]; fork ${fork.id} with session ${fork.sessionId}, ${sideBySide ? 'right of' : 'below'} its parent, runs claude --resume <parent> --fork-session --session-id <fork>${shown}`;
+}
+
+/* ---------- tmux (the e2e socket only) ---------- */
+
+function tmux(args) {
+  const r = spawnSync(TMUX, ['-L', SOCKET, ...args], { encoding: 'utf8' });
+  return { ok: r.status === 0, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
+}
+function tmuxSessions() {
+  const r = tmux(['list-sessions', '-F', '#{session_name}\t#{session_created}\t#{session_attached}']);
+  if (!r.ok) return [];
+  return r.out.split('\n').filter(Boolean).map((l) => {
+    const [name, created, attached] = l.split('\t');
+    return { name, created: Number(created), attached: Number(attached) };
+  });
+}
+function tmuxPane(session) {
+  const r = tmux(['list-panes', '-t', `=${session}:`, '-F', '#{pane_pid}\t#{pane_current_command}']);
+  const [pid, command] = (r.out.split('\n')[0] || '').split('\t');
+  return { pid: Number(pid) || 0, command: command || '?' };
+}
+function findSession(id) {
+  const names = new Set([`flow_${id}`, `flow_${id.replace(/[^A-Za-z0-9_-]/g, '_')}`, `flow_${id.replace(/[^A-Za-z0-9_-]/g, '')}`]);
+  return tmuxSessions().find((s) => names.has(s.name)) || null;
+}
+
+/* ---------- the app process ---------- */
+
+function plistValue(bundle, k) {
+  const r = spawnSync('/usr/libexec/PlistBuddy', ['-c', `Print :${k}`, path.join(bundle, 'Contents/Info.plist')], { encoding: 'utf8' });
+  return r.status === 0 ? r.stdout.trim() : '';
+}
+
+function launchCommand() {
+  if (opt.dev) {
+    const rel = fs.readFileSync(path.join(ROOT, 'node_modules/electron/path.txt'), 'utf8').trim();
+    // Linux (the VM, under xvfb): Chromium's setuid sandbox helper is not installed. The marker makes the e2e's own
+    // Electron recognizable in ps; the e2e itself only ever stops the pid it launched and that pid's process group.
+    const extra = LINUX ? ['--no-sandbox', '--flow-e2e'] : [];
+    return { bin: path.join(ROOT, 'node_modules/electron/dist', rel), args: [ROOT, ...extra], cwd: ROOT, label: `dev build, ${ROOT}` };
+  }
+  if (!fs.existsSync(path.join(opt.app, 'Contents/Info.plist'))) throw new Error(`there is no app bundle at ${opt.app} (build and install it with scripts/package.sh)`);
+  const id = plistValue(opt.app, 'CFBundleIdentifier');
+  if (id !== BUNDLE_ID) throw new Error(`${opt.app} is ${id || 'not an app'}, not ${BUNDLE_ID}; not launching it`);
+  const exe = plistValue(opt.app, 'CFBundleExecutable');
+  return { bin: path.join(opt.app, 'Contents/MacOS', exe), args: [], cwd: '/', label: `${opt.app} (${plistValue(opt.app, 'CFBundleShortVersionString')})` };
+}
+
+// What launchd gives an app opened from the Finder or the Dock: no login PATH, no terminal variables.
+function appEnv(userData) {
+  const env = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' };
+  // On Linux the app also needs the X display that xvfb-run gives this process.
+  for (const k of ['HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'SSH_AUTH_SOCK', '__CF_USER_TEXT_ENCODING', ...(LINUX ? ['DISPLAY', 'XAUTHORITY'] : [])]) {
+    if (process.env[k]) env[k] = process.env[k];
+  }
+  // FLOW_BACKGROUND=1: every Flow window opens inactive (no focus, no dock icon), so a run on the Mac never takes
+  // focus from the owner's own Flow (MAC_NOTES item 10). Check 9 proves it.
+  return { ...env, FLOW_USER_DATA: userData, FLOW_TMUX_SOCKET: SOCKET, FLOW_CDP_PORT: String(PORT), FLOW_BACKGROUND: '1' };
+}
+
+class App {
+  constructor(label, userData) {
+    this.label = label;
+    this.userData = userData;
+    this.exit = null;
+  }
+
+  start() {
+    const { bin, args, cwd } = launchCommand();
+    this.logPath = path.join(SHOTS, `main-${this.label}.log`);
+    const fd = fs.openSync(this.logPath, 'w');
+    this.proc = spawn(bin, args, { cwd, env: appEnv(this.userData), stdio: ['ignore', fd, fd], detached: true });
+    fs.closeSync(fd);
+    this.exited = new Promise((resolve) => {
+      this.proc.once('exit', (code, signal) => { this.exit = { code, signal }; resolve(this.exit); });
+      this.proc.once('error', (e) => { this.exit = { error: e.message }; resolve(this.exit); });
+    });
+  }
+
+  running() {
+    return !!this.proc && !this.exit;
+  }
+
+  describeExit() {
+    if (!this.exit) return 'still running';
+    if (this.exit.error) return `could not start: ${this.exit.error}`;
+    return this.exit.signal ? `killed by ${this.exit.signal}` : `exit code ${this.exit.code}`;
+  }
+
+  logTail(n = 30) {
+    try {
+      return fs.readFileSync(this.logPath, 'utf8').trim().split('\n').slice(-n).join('\n');
+    } catch {
+      return '';
+    }
+  }
+
+  logSize() {
+    try {
+      return fs.statSync(this.logPath).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  async quit(timeout = 20000) {
+    if (!this.running()) return this.exit;
