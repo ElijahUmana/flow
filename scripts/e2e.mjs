@@ -1039,3 +1039,350 @@ class App {
 
   async quit(timeout = 20000) {
     if (!this.running()) return this.exit;
+    this.quitOffset = this.logSize();
+    this.proc.kill('SIGTERM');
+    return Promise.race([this.exited, sleep(timeout).then(() => null)]);
+  }
+
+  // Processes Electron started that are still in the app's process group (the app was spawned as its leader).
+  leftovers() {
+    if (!this.proc) return [];
+    const r = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,command='], { encoding: 'utf8' });
+    return (r.stdout || '').trim().split('\n')
+      .map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
+      .filter((m) => m && Number(m[2]) === this.proc.pid)
+      .map((m) => oneLine(`${m[1]} ${m[3]}`, 140));
+  }
+
+  async kill() {
+    if (!this.proc) return;
+    if (this.running()) {
+      if (this.quitOffset == null) this.quitOffset = this.logSize();
+      this.proc.kill('SIGTERM');
+      await Promise.race([this.exited, sleep(8000)]);
+    }
+    try {
+      process.kill(-this.proc.pid, 'SIGKILL');
+    } catch {
+      // the process group is already empty
+    }
+  }
+}
+
+async function portInUse(port) {
+  return new Promise((resolve) => {
+    const s = net.connect({ port, host: '127.0.0.1' });
+    s.once('connect', () => { s.destroy(); resolve(true); });
+    s.once('error', () => resolve(false));
+  });
+}
+
+async function launch(label, userData, phase) {
+  const app = new App(label, userData);
+  apps.push(app);
+  app.start();
+  let target;
+  try {
+    target = await waitFor(async () => {
+      if (!app.running()) throw new Fatal(`the app exited during startup (${app.describeExit()})`);
+      const list = await listTargets();
+      return list.find(isMainWindow);
+    }, { timeout: 45000, interval: 200, label: `the Flow window (index.html) on CDP port ${PORT}` });
+  } catch (e) {
+    const tail = app.logTail();
+    throw new Error(`${e.message}${tail ? `\nmain log (${app.logPath}):\n${tail}` : ''}`);
+  }
+  const cdp = await attach(target, phase);
+  const readyMs = await waitReady(cdp);
+  return { app, cdp, readyMs };
+}
+
+/* ---------- results ---------- */
+
+const results = [];
+const apps = [];
+const connections = [];
+let shotCdp = null;
+
+async function check(name, fn) {
+  try {
+    const detail = await fn();
+    results.push({ name, ok: true });
+    console.log(`ok   ${name}${detail ? `: ${detail}` : ''}`);
+    return true;
+  } catch (e) {
+    results.push({ name, ok: false });
+    console.log(`FAIL ${name}: ${String(e && e.message ? e.message : e).trim()}`);
+    if (shotCdp && !shotCdp.closed) await shot(shotCdp, `fail-${slug(name)}`).catch(() => {});
+    return false;
+  }
+}
+function notRun(name, why) {
+  results.push({ name, ok: false });
+  console.log(`FAIL ${name}: not run, ${why}`);
+}
+
+/* ---------- picking a real old session ---------- */
+
+function pickOldSession() {
+  const file = path.join(HOME, '.claude/history.jsonl');
+  const sessions = new Map();
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!e || !e.sessionId || typeof e.display !== 'string') continue;
+    const at = typeof e.timestamp === 'number' ? e.timestamp : Date.parse(e.timestamp) || 0;
+    let s = sessions.get(e.sessionId);
+    if (!s) sessions.set(e.sessionId, (s = { id: e.sessionId, cwd: e.project, prompts: [], lastAt: 0 }));
+    s.prompts.push(e.display);
+    s.lastAt = Math.max(s.lastAt, at);
+  }
+  const all = [...sessions.values()].map((s) => ({
+    ...s,
+    title: (s.prompts.find((p) => !p.trim().startsWith('/')) || '').replace(/\s+/g, ' ').trim(),
+    text: s.prompts.join('\n').replace(/\s+/g, ' ').toLowerCase(),
+  }));
+  // Four dictionary words that together appear in only one session. Without /usr/share/dict/words (this Linux VM has
+  // none; macOS ships it) any four plain lowercase words qualify; the phrase must still match exactly one session.
+  const DICT = '/usr/share/dict/words';
+  const dict = fs.existsSync(DICT) ? new Set(fs.readFileSync(DICT, 'utf8').toLowerCase().split('\n')) : null;
+  const dayAgo = Date.now() - 86400000;
+  const old = all.filter((s) => s.title && s.lastAt && s.lastAt < dayAgo).sort((a, b) => b.lastAt - a.lastAt);
+  for (const s of old) {
+    if (/\[(pasted|image)/i.test(s.title)) continue;
+    const words = s.title.split(' ').slice(0, 14);
+    for (let i = 0; i + 4 <= words.length; i++) {
+      const four = words.slice(i, i + 4);
+      const query = four.join(' ');
+      if (query.length < 18 || !four.every((w) => /^[A-Za-z][a-z]+$/.test(w) && (dict ? dict.has(w.toLowerCase()) : w.length >= 3))) continue;
+      const lq = query.toLowerCase();
+      if (all.filter((o) => o.text.includes(lq)).length === 1) return { ...s, query, sessions: all.length };
+    }
+  }
+  throw new Error(`no old session in ${file} has a distinctive four-word phrase in its title`);
+}
+
+/* ---------- the seed, without the windows that ssh to the VM (MAC_NOTES item 6) ---------- */
+
+// A fresh seed opens "team flow" and "team mynotes-audio" over `ssh claude-agents` and attaches to live tmux sessions
+// there: on the Mac the ccm window this team works in, on the VM a loop back over ssh. So e2e never lets the app build
+// the seed itself. A probe app whose state is one empty workspace (nothing to open) returns seed() through
+// __flow.seed(), every window with a host is removed, and that document goes into FLOW_USER_DATA before launch 1.
+const SEED_IDS = ['flow', 'mynotes', 'infra', 'voiceless', 'ef'];
+const PROBE_STATE = { v: 11, ws: [{ id: 'e2e-probe', name: 'e2e probe', folder: '~', bg: '#141319', zones: [], notes: [], windows: [], closed: [] }], ui: {} };
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const probeDirs = [];
+
+async function readSeed(stamp) {
+  const dir = `/tmp/flow-e2e-${stamp}-probe`;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'flow-state.json'), JSON.stringify(PROBE_STATE));
+  probeDirs.push(dir);
+  const s = await launch('probe', dir, 'probe');
+  try {
+    if (!(await s.cdp.eval('typeof window.__flow.seed === "function"'))) {
+      throw new Error('window.__flow.seed() does not exist, so the seed cannot be read without opening it and its ssh windows; not starting the app on a fresh seed');
+    }
+    const seed = await s.cdp.eval('window.__flow.seed()');
+    const shown = await s.cdp.eval('document.querySelectorAll(".win").length');
+    // Quit the probe only once main has shown its window (check 9 wants that line for every launch); a busy machine
+    // can answer CDP before the window is shown.
+    await waitFor(() => fs.readFileSync(s.app.logPath, 'utf8').includes('[flow] background: main shown inactive'), { timeout: 10000, interval: 200, label: 'the probe window to be shown' }).catch(() => {});
+    return { seed, shown };
+  } finally {
+    s.cdp.close();
+    if (!(await s.app.quit(20000))) await s.app.kill();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Every window with a host in a list of workspaces (windows and closed lists) and in ui.closed.
+function hostWindows(wsList, uiDoc) {
+  const out = [];
+  for (const w of Array.isArray(wsList) ? wsList : []) {
+    for (const k of ['windows', 'closed']) {
+      for (const x of Array.isArray(w[k]) ? w[k] : []) if (x && x.host) out.push({ ws: w.id, list: k, id: x.id, host: x.host, attach: x.attach });
+    }
+  }
+  for (const x of uiDoc && Array.isArray(uiDoc.closed) ? uiDoc.closed : []) if (x && x.host) out.push({ ws: x.ws || '?', list: 'ui.closed', id: x.id, host: x.host, attach: x.attach });
+  return out;
+}
+
+function checkSeed(seed) {
+  if (!Array.isArray(seed)) throw new Error(`__flow.seed() returned ${q(seed)}`);
+  const bad = [];
+  const ids = seed.map((w) => w.id);
+  const names = seed.map((w) => w.name);
+  if (ids.join('|') !== SEED_IDS.join('|')) bad.push(`workspace ids are [${ids.join(', ')}], expected [${SEED_IDS.join(', ')}]`);
+  if (names.join('|') !== SEED_NAMES.join('|')) bad.push(`workspace names are [${names.join(', ')}], expected [${SEED_NAMES.join(', ')}]`);
+  // BRIEF 3.1: real urls for McKinsey, alphaxiv, EF Start and the Voiceless Notion page; none known for MyNotes.
+  const pages = seed.flatMap((w) => (w.notes || []).filter((n) => n.kind === 'page').map((n) => ({ ws: w.id, title: n.title || '', url: n.url || '' })));
+  const want = [
+    ['McKinsey', /judgment bottleneck/i, 'mckinsey.com', (u) => u.startsWith('https://www.mckinsey.com/')],
+    ['FlatCake', /FlatCake/, ALPHAXIV, (u) => u === ALPHAXIV],
+    ['EF Start', /^EF Start/, 'https://app.efstart.com/work', (u) => u === 'https://app.efstart.com/work'],
+    ['Voiceless: Full System Design', /^Voiceless: Full System Design$/, 'https://www.notion.so/f675abdb2a9b4ddd98eb09e2d576f669', (u) => u === 'https://www.notion.so/f675abdb2a9b4ddd98eb09e2d576f669'],
+    ['MyNotes Noise Pipeline', /^MyNotes Noise Pipeline$/, '""', (u) => u === ''],
+  ];
+  for (const [label, re, expected, ok] of want) {
+    const pg = pages.find((x) => re.test(x.title));
+    if (!pg) bad.push(`no ${label} page`);
+    else if (!ok(pg.url)) bad.push(`the ${label} page has url ${q(pg.url)}, BRIEF 3.1 wants ${expected}`);
+  }
+  const alpha = pages.filter((x) => /alphaxiv/.test(x.url));
+  if (alpha.some((x) => !x.url.startsWith('https://www.alphaxiv.org/abs/'))) bad.push(`alphaxiv urls: ${alpha.map((x) => x.url).join(', ')}`);
+  const hosts = hostWindows(seed);
+  const vm = (id, ws, attach) => hosts.find((h) => h.id === id && h.ws === ws && h.list === 'windows' && h.host === 'claude-agents' && h.attach === attach);
+  if (!vm('w-team', 'flow', 'ccm')) bad.push('no w-team in flow with host claude-agents, attach ccm');
+  if (!vm('mn-team', 'mynotes', 'mynotes-audio')) bad.push('no mn-team in mynotes with host claude-agents, attach mynotes-audio');
+  if (hosts.length !== 2) bad.push(`${hosts.length} windows have a host: ${hosts.map((h) => `${h.ws}/${h.id}`).join(', ')}`);
+  const claude = seed.flatMap((w) => (w.windows || []).filter((x) => x.cmd === 'claude'));
+  const noId = claude.filter((x) => !UUID_RE.test(x.sessionId || ''));
+  if (noId.length) bad.push(`claude windows without a session id: ${noId.map((x) => x.id).join(', ')}`);
+  if (bad.length) throw new Error(bad.join('; '));
+  return `workspaces ${ids.join(', ')}; ${pages.length} pages with the BRIEF 3.1 urls; VM windows w-team (attach ccm) and mn-team (attach mynotes-audio); ${claude.length} claude windows with fresh session ids`;
+}
+
+// In --dev runs every folder the seed would start Claude Code in (~/flow, ~/infra-reading, ...) moves under
+// OWN_DIR/seed: a test's Claude sessions live only under ~/.flow-dev/ship (lead, Nov 2), never in the real projects of
+// the machine it runs on. A run of the packaged app keeps the seed as the owner gets it.
+function intoTestFolders(doc) {
+  for (const w of doc.ws) {
+    const dir = path.join(OWN_DIR, 'seed', w.id);
+    fs.mkdirSync(dir, { recursive: true });
+    w.folder = dir;
+    for (const k of ['windows', 'closed']) for (const x of Array.isArray(w[k]) ? w[k] : []) if (x && 'cwd' in x) x.cwd = dir;
+  }
+  return doc;
+}
+
+function claudeCwdFindings() {
+  const bad = [...claudeCwds].filter(([, v]) => v.cwd !== ALLOWED_CWD && !v.cwd.startsWith(ALLOWED_CWD + '/'));
+  if (!claudeCwds.size) return { bad: ['no Claude Code process was seen to check'], summary: '' };
+  return { bad: bad.map(([pid, v]) => `pid ${pid} ran in ${v.cwd} (${v.cmd})`), summary: `${claudeCwds.size} Claude Code process(es), all inside ${ALLOWED_CWD}` };
+}
+
+function withoutHosts(seed) {
+  const ws = JSON.parse(JSON.stringify(seed));
+  const removed = [];
+  for (const w of ws) {
+    for (const k of ['windows', 'closed']) {
+      if (!Array.isArray(w[k])) continue;
+      w[k] = w[k].filter((x) => {
+        if (!x || !x.host) return true;
+        removed.push(`${w.id}/${x.id}`);
+        return false;
+      });
+    }
+  }
+  const doc = { v: 11, ws, ui: {} };
+  return { doc: opt.dev ? intoTestFolders(doc) : doc, removed };
+}
+
+// Samples the process table once a second and records every `ssh ... claude-agents` whose ancestors include an app
+// this run started or the e2e tmux server. Main logs and console errors are checked as well, for short-lived ones.
+const sshSeen = [];
+let sshSamples = 0;
+let sshLive = 0;      // samples taken while an app of the e2e was running: the only ones that can see its ssh
+let sshTimer = null;
+const ALLOWED_CWD = path.join(HOME, '.flow-dev', 'ship');
+const claudeCwds = new Map();   // pid -> cwd, every Claude Code process seen under the e2e's apps or tmux server
+const isClaude = (cmd) => { const first = cmd.split(' ')[0]; return path.basename(first) === 'claude' || /\/share\/claude\/versions\//.test(first) || /\.local\/bin\/claude\b/.test(cmd); };
+function cwdOf(pid) {
+  if (LINUX) {
+    try { return fs.readlinkSync(`/proc/${pid}/cwd`); } catch { return ''; }
+  }
+  const r = spawnSync('/usr/sbin/lsof', ['-a', '-d', 'cwd', '-Fn', '-p', String(pid)], { encoding: 'utf8' });
+  const line = (r.stdout || '').split('\n').find((l) => l.startsWith('n'));
+  return line ? line.slice(1) : '';
+}
+function sampleSsh() {
+  const r = spawnSync('/bin/ps', ['-A', '-o', 'pid=,ppid=,command='], { encoding: 'utf8' });
+  const procs = (r.stdout || '').split('\n').map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/)).filter(Boolean)
+    .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] }));
+  const parent = new Map(procs.map((x) => [x.pid, x.ppid]));
+  const roots = new Set(apps.filter((a) => a.proc).map((a) => a.proc.pid));
+  const srv = tmux(['display-message', '-p', '#{pid}']);
+  if (srv.ok && Number(srv.out)) roots.add(Number(srv.out));
+  if (apps.some((a) => a.proc && !a.exit)) sshLive++;
+  roots.add(process.pid);
+  for (const x of procs) {
+    if (!isClaude(x.cmd) || claudeCwds.has(x.pid)) continue;
+    for (let pid = x.ppid, n = 0; pid > 1 && n < 64; pid = parent.get(pid), n++) {
+      if (!roots.has(pid)) continue;
+      const cwd = cwdOf(x.pid);
+      if (cwd) claudeCwds.set(x.pid, { cwd, cmd: oneLine(x.cmd, 120) });
+      break;
+    }
+  }
+  sshSamples++;
+  for (const x of procs) {
+    if (!/(^|\/)ssh\s.*claude-agents/.test(x.cmd)) continue;
+    for (let pid = x.pid, n = 0; pid > 1 && n < 64; pid = parent.get(pid), n++) {
+      if (!roots.has(pid)) continue;
+      if (!sshSeen.some((e) => e.pid === x.pid)) sshSeen.push({ pid: x.pid, cmd: oneLine(x.cmd, 160) });
+      break;
+    }
+  }
+}
+function startSshWatch() {
+  if (!sshTimer) sshTimer = setInterval(sampleSsh, 1000);
+}
+function stopSshWatch() {
+  if (sshTimer) clearInterval(sshTimer);
+  sshTimer = null;
+  sampleSsh();
+}
+
+// For the final check: no ssh to the VM seen, none in any main log or console, no host window in the state file.
+function sshFindings(stateFile) {
+  stopSshWatch();
+  const bad = [];
+  if (!sshLive) bad.push(`the process sampler took no sample while an app was running (${sshSamples} in all), so no ssh could have been seen`);
+  if (sshSeen.length) bad.push(`the e2e app started ssh to claude-agents: ${sshSeen.map((e) => `${e.pid} ${e.cmd}`).join(' | ')}`);
+  const logged = apps.filter((a) => a.logPath && fs.existsSync(a.logPath) && REMOTE_RE.test(fs.readFileSync(a.logPath, 'utf8'))).map((a) => a.logPath);
+  if (logged.length) bad.push(`main logs mention ssh claude-agents: ${logged.join(', ')}`);
+  const remote = consoleErrors.filter((e) => REMOTE_RE.test(e.text));
+  if (remote.length) bad.push(`console errors mention ssh claude-agents: ${remote.length}`);
+  let doc = null;
+  try {
+    doc = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  } catch (e) {
+    bad.push(`cannot read ${stateFile}: ${e.message}`);
+  }
+  const hosts = doc ? hostWindows(doc.ws, doc.ui) : [];
+  if (hosts.length) bad.push(`${stateFile} has windows with a host: ${hosts.map((h) => `${h.ws}/${h.id} (${h.list})`).join(', ')}`);
+  return { bad, summary: `no ssh to claude-agents in ${sshSamples} process samples (${sshLive} with an app running), the main logs or the console; ${path.basename(stateFile)} has no window with a host` };
+}
+
+/* ---------- FLOW_BACKGROUND evidence (MAC_NOTES items 10 and 12) ---------- */
+
+// Every launch has FLOW_BACKGROUND=1. main logs `[flow] background: <label> shown inactive, isFocused=<bool>` after each
+// showInactive(), `... <label> got focus; ... stack: ...` on any focus event, `... <label|app> <focus|show|moveTop|
+// restore>() called; stack: ...` when any JS asks for one, and `... <label> hidden` on any hide. The logs cover the whole
+// run, so a focus between two moments is caught too; no inspector is attached (on the Mac an inspector session was
+// followed by focus). Without FLOW_BACKGROUND a window is focused here (xvfb, no window manager).
+let popOutClose = null; // { app, offset }: main-log size when e2e closed the pop-out (its hide is expected after that)
+function backgroundFindings(needPopOut) {
+  const bad = [];
+  const seen = [];
+  for (const a of apps) {
+    if (!a.logPath || !fs.existsSync(a.logPath)) continue;
+    const text = fs.readFileSync(a.logPath, 'utf8');
+    const lines = text.split('\n');
+    let offset = 0;
+    const shown = [];
+    const unseen = [];
+    for (const line of lines) {
+      const at = offset;
+      offset += Buffer.byteLength(line) + 1;
+      let m = line.match(/\[flow\] background: (\S+) shown inactive, isFocused=(true|false)/);
+      if (m) {
+        shown.push(m[1]);
+        if (m[2] === 'true') bad.push(`launch ${a.label}: ${m[1]} was shown with isFocused=true`);
+        continue;
