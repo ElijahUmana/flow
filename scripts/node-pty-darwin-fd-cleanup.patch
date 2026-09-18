@@ -1,0 +1,127 @@
+--- a/node_modules/node-pty/src/unix/pty.cc
++++ b/node_modules/node-pty/src/unix/pty.cc
+@@ -64,6 +64,7 @@
+ #include <os/availability.h>
+ #include <paths.h>
+ #include <spawn.h>
++#include <uv.h>
+ #include <sys/event.h>
+ #include <sys/sysctl.h>
+ #include <termios.h>
+@@ -236,7 +237,16 @@
+ pty_getproc(int, char *);
+ #endif
+ 
+-#if defined(__APPLE__) || defined(__OpenBSD__)
++#if defined(__APPLE__)
++static void
++pty_posix_spawn(char** argv, char** env,
++                const struct termios *termp,
++                const struct winsize *winp,
++                int* master,
++                pid_t* pid,
++                int* err,
++                const char** stage);
++#elif defined(__OpenBSD__)
+ static void
+ pty_posix_spawn(char** argv, char** env,
+                 const struct termios *termp,
+@@ -368,12 +378,15 @@
+   }
+ 
+   int err = -1;
+-  pty_posix_spawn(argv, env, term, &winp, &master, &pid, &err);
++  const char* stage = "posix_spawn";
++  pty_posix_spawn(argv, env, term, &winp, &master, &pid, &err, &stage);
+   if (err != 0) {
+-    throw Napi::Error::New(napiEnv, "posix_spawnp failed.");
+-  }
+-  if (pty_nonblock(master) == -1) {
+-    throw Napi::Error::New(napiEnv, "Could not set master fd to nonblocking.");
++    Napi::Error error = Napi::Error::New(napiEnv,
++      std::string(stage) + " failed: " + strerror(err));
++    error.Set("errno", Napi::Number::New(napiEnv, err));
++    error.Set("code", Napi::String::New(napiEnv, uv_err_name(uv_translate_sys_error(err))));
++    error.Set("syscall", Napi::String::New(napiEnv, stage));
++    throw error;
+   }
+ #else
+   int argc = argv_.Length();
+@@ -690,97 +703,128 @@
+                 const struct winsize *winp,
+                 int* master,
+                 pid_t* pid,
+-                int* err) {
+-  int low_fds[3];
+-  size_t count = 0;
+-
+-  for (; count < 3; count++) {
+-    low_fds[count] = posix_openpt(O_RDWR);
+-    if (low_fds[count] >= STDERR_FILENO)
+-      break;
++                int* err,
++                const char** stage) {
++  struct Resources {
++    int low_fds[3] = {-1, -1, -1};
++    int master = -1;
++    int slave = -1;
++    posix_spawn_file_actions_t acts;
++    posix_spawnattr_t attrs;
++    bool acts_initialized = false;
++    bool attrs_initialized = false;
++
++    ~Resources() {
++      int saved_errno = errno;
++      if (acts_initialized) posix_spawn_file_actions_destroy(&acts);
++      if (attrs_initialized) posix_spawnattr_destroy(&attrs);
++      if (slave != -1) close(slave);
++      if (master != -1) close(master);
++      for (int fd : low_fds) {
++        if (fd != -1) close(fd);
++      }
++      errno = saved_errno;
++    }
++  } owned;
++
++  *master = -1;
++  *pid = -1;
++  *err = 0;
++  auto failed = [&](int code, const char* operation) {
++    if (code == 0) return false;
++    *err = code;
++    *stage = operation;
++    errno = code;
++    return true;
++  };
++
++  // Reserve closed standard descriptors so the slave cannot alias a dup2 target.
++  for (int& fd : owned.low_fds) {
++    fd = posix_openpt(O_RDWR);
++    if (fd == -1) {
++      failed(errno, "posix_openpt");
++      return;
++    }
++    if (fd >= STDERR_FILENO) break;
+   }
+ 
+-  int flags = POSIX_SPAWN_CLOEXEC_DEFAULT |
+-              POSIX_SPAWN_SETSIGDEF |
+-              POSIX_SPAWN_SETSIGMASK |
+-              POSIX_SPAWN_SETSID;
+-  *master = posix_openpt(O_RDWR);
+-  if (*master == -1) {
++  owned.master = posix_openpt(O_RDWR);
++  if (owned.master == -1) {
++    failed(errno, "posix_openpt");
+     return;
+   }
+-
+-  int res = grantpt(*master) || unlockpt(*master);
+-  if (res == -1) {
++  if (grantpt(owned.master) == -1) {
++    failed(errno, "grantpt");
++    return;
++  }
++  if (unlockpt(owned.master) == -1) {
++    failed(errno, "unlockpt");
+     return;
