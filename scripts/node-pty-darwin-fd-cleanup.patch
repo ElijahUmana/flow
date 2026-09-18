@@ -125,3 +125,129 @@
 +  if (unlockpt(owned.master) == -1) {
 +    failed(errno, "unlockpt");
      return;
+   }
+ 
+   // Use TIOCPTYGNAME instead of ptsname() to avoid threading problems.
+-  int slave;
+   char slave_pty_name[128];
+-  res = ioctl(*master, TIOCPTYGNAME, slave_pty_name);
+-  if (res == -1) {
++  if (ioctl(owned.master, TIOCPTYGNAME, slave_pty_name) == -1) {
++    failed(errno, "ioctl(TIOCPTYGNAME)");
+     return;
+   }
+-
+-  slave = open(slave_pty_name, O_RDWR | O_NOCTTY);
+-  if (slave == -1) {
++  owned.slave = open(slave_pty_name, O_RDWR | O_NOCTTY);
++  if (owned.slave == -1) {
++    failed(errno, "open");
+     return;
+   }
+-
+-  if (termp) {
+-    res = tcsetattr(slave, TCSANOW, termp);
+-    if (res == -1) {
+-      return;
+-    };
++  if (termp && tcsetattr(owned.slave, TCSANOW, termp) == -1) {
++    failed(errno, "tcsetattr");
++    return;
+   }
+-
+-  if (winp) {
+-    res = ioctl(slave, TIOCSWINSZ, winp);
+-    if (res == -1) {
+-      return;
+-    }
++  if (winp && ioctl(owned.slave, TIOCSWINSZ, winp) == -1) {
++    failed(errno, "ioctl(TIOCSWINSZ)");
++    return;
++  }
++  // Fail before spawning a child; the caller only takes a usable master.
++  if (pty_nonblock(owned.master) == -1) {
++    failed(errno, "fcntl");
++    return;
+   }
+ 
+-  posix_spawn_file_actions_t acts;
+-  posix_spawn_file_actions_init(&acts);
+-  posix_spawn_file_actions_adddup2(&acts, slave, STDIN_FILENO);
+-  posix_spawn_file_actions_adddup2(&acts, slave, STDOUT_FILENO);
+-  posix_spawn_file_actions_adddup2(&acts, slave, STDERR_FILENO);
+-  posix_spawn_file_actions_addclose(&acts, slave);
+-  posix_spawn_file_actions_addclose(&acts, *master);
+-
+-  posix_spawnattr_t attrs;
+-  posix_spawnattr_init(&attrs);
+-  *err = posix_spawnattr_setflags(&attrs, flags);
+-  if (*err != 0) {
+-    goto done;
++  if (failed(posix_spawn_file_actions_init(&owned.acts), "posix_spawn_file_actions_init")) return;
++  owned.acts_initialized = true;
++  for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
++    if (failed(posix_spawn_file_actions_adddup2(&owned.acts, owned.slave, fd), "posix_spawn_file_actions_adddup2")) return;
+   }
++  if (failed(posix_spawn_file_actions_addclose(&owned.acts, owned.slave), "posix_spawn_file_actions_addclose")) return;
++  if (failed(posix_spawn_file_actions_addclose(&owned.acts, owned.master), "posix_spawn_file_actions_addclose")) return;
+ 
+-  sigset_t signal_set;
+-  /* Reset all signal the child to their default behavior */
+-  sigfillset(&signal_set);
+-  *err = posix_spawnattr_setsigdefault(&attrs, &signal_set);
+-  if (*err != 0) {
+-    goto done;
+-  }
+-
+-  /* Reset the signal mask for all signals */
+-  sigemptyset(&signal_set);
+-  *err = posix_spawnattr_setsigmask(&attrs, &signal_set);
+-  if (*err != 0) {
+-    goto done;
+-  }
+-
+-  do
+-    *err = posix_spawn(pid, argv[0], &acts, &attrs, argv, env);
+-  while (*err == EINTR);
+-done:
+-  posix_spawn_file_actions_destroy(&acts);
+-  posix_spawnattr_destroy(&attrs);
++  if (failed(posix_spawnattr_init(&owned.attrs), "posix_spawnattr_init")) return;
++  owned.attrs_initialized = true;
++  int flags = POSIX_SPAWN_CLOEXEC_DEFAULT |
++              POSIX_SPAWN_SETSIGDEF |
++              POSIX_SPAWN_SETSIGMASK |
++              POSIX_SPAWN_SETSID;
++  if (failed(posix_spawnattr_setflags(&owned.attrs, flags), "posix_spawnattr_setflags")) return;
+ 
+-  for (; count > 0; count--) {
+-    close(low_fds[count]);
++  sigset_t signal_set;
++  if (sigfillset(&signal_set) == -1) {
++    failed(errno, "sigfillset");
++    return;
+   }
++  if (failed(posix_spawnattr_setsigdefault(&owned.attrs, &signal_set), "posix_spawnattr_setsigdefault")) return;
++  if (sigemptyset(&signal_set) == -1) {
++    failed(errno, "sigemptyset");
++    return;
++  }
++  if (failed(posix_spawnattr_setsigmask(&owned.attrs, &signal_set), "posix_spawnattr_setsigmask")) return;
++
++  int result;
++  pid_t child = -1;
++  do {
++    result = posix_spawn(&child, argv[0], &owned.acts, &owned.attrs, argv, env);
++  } while (result == EINTR);
++  if (failed(result, "posix_spawn")) return;
++
++  *pid = child;
++  *master = owned.master;
++  owned.master = -1;
+ }
+ #endif
+ 
+
+
+
+
