@@ -1733,3 +1733,350 @@ async function full(userData, stamp) {
 
   let s2;
   try {
+    s2 = await launch('2', userData, 'launch 2');
+  } catch (e) {
+    [C4C, C4D, C4E, C5, C11, C6A, C15, C6B, C7].forEach((n) => notRun(n, `the relaunch failed: ${e.message}`));
+    await check(C8, noSsh);
+    await check(C9, async () => {
+      const f = backgroundFindings(false);
+      if (f.bad.length) throw new Error(f.bad.join('; '));
+      return f.summary;
+    });
+    await check(C10, async () => {
+      const f = quitFindings();
+      if (f.bad.length) throw new Error(f.bad.join('; '));
+      return f.summary;
+    });
+    if (opt.dev) await check(C16, async () => {
+      const f = claudeCwdFindings();
+      if (f.bad.length) throw new Error(f.bad.join('; '));
+      return f.summary;
+    });
+    return;
+  }
+  const cdp2 = s2.cdp;
+  shotCdp = cdp2;
+
+  await check(C4C, async () => {
+    if (!note) throw new Error('no note was typed in 4a');
+    const r = await cdp2.eval(`(() => {
+      const json = JSON.stringify(window.__flow.state());
+      const bodies = [...document.querySelectorAll('.win .nbody')].map((el) => el.textContent);
+      return { title: json.includes(${q(note.title)}), body: json.includes(${q(note.body)}), shown: bodies.some((b) => b.includes(${q(note.body)})) };
+    })()`);
+    if (!r.title || !r.body || !r.shown) throw new Error(`after relaunch: title in state ${r.title}, body in state ${r.body}, body on screen ${r.shown}`);
+    return `title and body are in __flow.state() and the note window shows ${q(note.body)}`;
+  });
+
+  await check(C4D, async () => {
+    if (!note) throw new Error('no note was typed in 4a');
+    const inState = await cdp2.eval(`JSON.stringify(window.__flow.state()).includes(${q(note.late)})`);
+    if (!fileAfterQuit.includes(note.late) || !inState) throw new Error(`typed ${q(note.late)} and sent SIGTERM at once; flow-state.json after the quit ${fileAfterQuit.includes(note.late) ? 'has' : 'lacks'} it, the relaunched state ${inState ? 'has' : 'lacks'} it`);
+    return 'flushed to flow-state.json during the quit';
+  });
+
+  await check(C4E, async () => {
+    if (!agent) throw new Error('no agent from check 2');
+    let text = '';
+    await waitFor(async () => {
+      text = (await cdp2.eval(termText(agent.id))) || '';
+      return text.trim().length > 0 && CLAUDE_RE.test(text);
+    }, { timeout: 30000, interval: 500, label: `the reopened agent window ${agent.id} to show Claude Code` }).catch((e) => {
+      throw new Error(`${e.message}; buffer is ${q(oneLine(text, 300))}`);
+    });
+    const s = tmuxSessions().find((x) => x.name === agent.name);
+    if (!s) throw new Error(`${agent.name} is gone`);
+    const pane = tmuxPane(agent.name);
+    const bad = [];
+    if (s.created !== agent.created) bad.push(`the session was recreated (created ${agent.created}, now ${s.created})`);
+    if (pane.pid !== agent.panePid) bad.push(`the pane process changed (${agent.panePid}, now ${pane.pid})`);
+    if (s.attached < 1) bad.push('no client is attached');
+    if (bad.length) throw new Error(bad.join('; '));
+    await shot(cdp2, '04-relaunched');
+    return `${agent.name}: same session and pane process ${pane.pid}, ${s.attached} client attached; buffer shows ${q(claudeLine(text))}`;
+  });
+
+  await check(C5, async () => {
+    const pick = pickOldSession();
+    await cdp2.eval('document.activeElement && document.activeElement.blur && document.activeElement.blur()');
+    await key(cdp2, 'k', true);
+    const searchFocused = `(() => { const a = document.activeElement; return !!a && (a.id === 'q' || a.classList.contains('sb-search')); })()`;
+    let via = '⌘K';
+    if (!(await waitFor(() => cdp2.eval(searchFocused), { timeout: 1500, interval: 100 }).catch(() => false))) {
+      // CDP key events never reach the native menu, so ⌘K only arrives here if the page listens for it too.
+      via = 'a click on the search box (⌘K sent over CDP did not reach it)';
+      const r = await cdp2.eval(`(() => { const el = document.querySelector('#q, .sb-search'); if (!el) return null; const b = el.getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 }; })()`);
+      if (!r) throw new Error('there is no sidebar search box (#q)');
+      await click(cdp2, r.x, r.y);
+      if (!(await cdp2.eval(searchFocused))) throw new Error('could not focus the sidebar search box');
+    }
+    await cdp2.send('Input.insertText', { text: pick.query });
+    const want = pick.title.slice(0, 24).toLowerCase();
+    let rows = [];
+    await waitFor(async () => {
+      rows = await cdp2.eval(`[...document.querySelectorAll('#sblist .srow, #sblist [data-sess]')].map((r) => ({ text: r.textContent.replace(/\\s+/g, ' ').trim(), sess: r.dataset.sess || '' }))`);
+      return rows.some((r) => r.sess === pick.id || r.text.toLowerCase().includes(want));
+    }, { timeout: 15000, interval: 300, label: `an old-session result for ${q(pick.query)}` }).catch((e) => {
+      throw new Error(`${e.message}; session ${pick.id} is titled ${q(oneLine(pick.title, 80))}; session rows: ${q(rows.slice(0, 5).map((r) => oneLine(r.text, 60)))}`);
+    });
+    await shot(cdp2, '05-search');
+    await cdp2.eval(`(() => { const el = document.querySelector('#q, .sb-search'); el.focus(); el.select(); })()`);
+    await key(cdp2, 'Backspace');
+    await key(cdp2, 'Escape');
+    return `focused by ${via}; typed ${q(pick.query)} and got session ${pick.id.slice(0, 8)} ${q(oneLine(pick.title, 70))} among ${rows.length} session row(s) (history has ${pick.sessions} sessions)`;
+  });
+
+  await check(C11, () => forkCheck(cdp2));
+
+  await check(C6A, async () => {
+    const names = await cdp2.eval('window.__flow.state().ws.map((w) => w.name)');
+    const shown = `(() => {
+      const on = document.querySelector('#spaces .sp.on');
+      const ws = [...new Set([...document.querySelectorAll('#sblist .tr[data-ws], #sblist .grp[data-ws]')].map((r) => r.dataset.ws))];
+      return { pill: on ? (on.querySelector('.sn') || on).textContent.replace('⤢', '').trim() : null, rows: ws.join(',') };
+    })()`;
+    const seen = [];
+    for (const i of [1, 2, 3, 4, 0]) {
+      await cdp2.eval(`window.__flow.go(${i})`);
+      let s = null;
+      await waitFor(async () => {
+        s = await cdp2.eval(shown);
+        return s.pill === names[i] && s.rows === String(i);
+      }, { timeout: 5000, interval: 150, label: `go(${i}) to show ${q(names[i])}` }).catch((e) => {
+        throw new Error(`${e.message}; the current pill is ${q(s && s.pill)} and the sidebar rows belong to workspace(s) ${q(s && s.rows)}`);
+      });
+      await sleep(1200);
+      await shot(cdp2, `06-ws${i}-${slug(names[i])}`);
+      seen.push(names[i]);
+    }
+    return `the current pill and the sidebar rows followed go(): ${seen.join(' > ')}`;
+  });
+
+  await check(C15, () => swipeCheck(cdp2));
+
+  await check(C6B, async () => {
+    const before = new Set((await listTargets()).map((t) => t.id));
+    const z = await cdp2.eval(`(() => {
+      const el = document.querySelector('#sblist [data-zpop]');
+      if (!el) return null;
+      const row = el.closest('.tr') || el, b = el.getBoundingClientRect(), rb = row.getBoundingClientRect();
+      const label = row.querySelector('.l') ? row.querySelector('.l').textContent.trim() : '';
+      return { x: b.left + b.width / 2, y: b.top + b.height / 2, rx: rb.left + 30, ry: rb.top + rb.height / 2, what: 'the sidebar ⤢ of sub-workspace ' + JSON.stringify(label) };
+    })()`);
+    let what;
+    if (z && z.x > 0) {
+      await mouse(cdp2, 'mouseMoved', z.rx, z.ry);
+      await sleep(150);
+      await click(cdp2, z.x, z.y);
+      what = z.what;
+    } else {
+      const p = await cdp2.eval(`(() => { const sp = document.querySelector('#spaces .sp.on'); if (!sp) return null; const b = sp.getBoundingClientRect(); return { x: b.left + 14, y: b.top + b.height / 2 }; })()`);
+      if (!p) throw new Error('no ⤢ to click: no [data-zpop] in the sidebar and no current pill');
+      await mouse(cdp2, 'mouseMoved', p.x, p.y);
+      await sleep(200);
+      const pop = await cdp2.eval(`(() => { const el = document.querySelector('#spaces .sp.on [data-pop]'); if (!el) return null; const b = el.getBoundingClientRect(); return b.width ? { x: b.left + b.width / 2, y: b.top + b.height / 2 } : null; })()`);
+      if (!pop) throw new Error('hovering the current pill did not show its ⤢');
+      await click(cdp2, pop.x, pop.y);
+      what = 'the ⤢ on the current workspace pill';
+    }
+    const t = await waitFor(async () => (await listTargets()).find((x) => isPopOut(x) && !before.has(x.id)), { timeout: 15000, interval: 300, label: 'a second Flow window (index.html#solo=...) after clicking ⤢' });
+    const pop = await attach(t, 'pop-out');
+    const readyMs = await waitReady(pop);
+    const info = await pop.eval(`(() => { const on = document.querySelector('#spaces .sp.on'); return { pill: on ? on.textContent.trim() : null, wins: document.querySelectorAll('.win').length, hash: location.hash }; })()`);
+    await sleep(1500);
+    await shot(pop, '06b-popout');
+    popOutClose = { app: s2.app, offset: s2.app.logSize() };
+    pop.eval('window.close()', 3000).catch(() => {});
+    await waitFor(async () => !(await listTargets()).some((x) => x.id === t.id), { timeout: 10000, label: 'the pop-out window to close' });
+    await cdp2.eval('1');
+    return `clicking ${what} opened ${info.hash} (ready in ${readyMs}ms, shows ${q(info.pill)} with ${info.wins} window(s)); it closed again and the main window is fine`;
+  });
+
+  await check(C7, async () => {
+    const late = consoleErrors.slice(errorsAfterC1);
+    if (late.length) throw new Error(describeErrors(late, 8));
+    return 'none';
+  });
+
+  const exit = await s2.app.quit(20000);
+  if (!exit) console.log('e2e: the relaunched app did not quit within 20s of SIGTERM; killing it');
+
+  await check(C8, noSsh);
+  await check(C9, async () => {
+    const f = backgroundFindings(true);
+    if (f.bad.length) throw new Error(f.bad.join('; '));
+    return f.summary;
+  });
+  await check(C10, async () => {
+    const f = quitFindings();
+    if (f.bad.length) throw new Error(f.bad.join('; '));
+    return f.summary;
+  });
+  if (opt.dev) await check(C16, async () => {
+    const f = claudeCwdFindings();
+    if (f.bad.length) throw new Error(f.bad.join('; '));
+    return f.summary;
+  });
+}
+
+let cleaned = false;
+async function cleanup(userData) {
+  if (cleaned) return;
+  cleaned = true;
+  for (const c of connections) c.close();
+  if (sshTimer) clearInterval(sshTimer);
+  for (const a of apps) await a.kill();
+  const k = tmux(['kill-server']);
+  if (!k.ok && !/no server running|error connecting|No such file/i.test(k.err)) console.log(`e2e: tmux -L ${SOCKET} kill-server: ${k.err}`);
+  if (userData) fs.rmSync(userData, { recursive: true, force: true });
+  for (const d of probeDirs) fs.rmSync(d, { recursive: true, force: true });
+  fs.rmSync(OWN_DIR, { recursive: true, force: true });
+}
+
+const LOCK = '/tmp/flow-e2e.lock';
+function takeLock() {
+  try {
+    const pid = Number(fs.readFileSync(LOCK, 'utf8'));
+    if (pid && pid !== process.pid) {
+      try {
+        process.kill(pid, 0);
+        throw new Error(`another e2e run (pid ${pid}) is in progress`);
+      } catch (e) {
+        if (e.code !== 'ESRCH') throw e;
+      }
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+  fs.writeFileSync(LOCK, String(process.pid));
+  process.once('exit', () => {
+    try {
+      if (Number(fs.readFileSync(LOCK, 'utf8')) === process.pid) fs.rmSync(LOCK);
+    } catch {
+      // already gone
+    }
+  });
+}
+
+async function recordCostProbe(evidence) {
+  try {
+    const own = await makeOwnSession();
+    const fixed = /Total cost:|Total duration \(|Total code changes:|\d+ input, \d+ output/;
+    const matched = own.said.find((line) => fixed.test(line) || SUBSCRIPTION_RE.test(line));
+    if (!matched) throw new Error(`the real /cost transcript has no cost/subscription line: ${q(own.said)}`);
+    if (processGroupAlive(own.probe.pid)) throw new Error(`real /cost process group ${own.probe.pid} remains`);
+    const result = {
+      command: [own.bin, '-p', '/cost', '--disallowedTools', 'Bash', '--session-id', own.id],
+      cwd: own.dir,
+      timeoutMs: 90000,
+      code: own.probe.code,
+      signal: own.probe.signal,
+      timedOut: own.probe.timedOut,
+      outputTruncated: own.probe.outputTruncated,
+      processGroupId: own.probe.pid,
+      processGroupGone: !processGroupAlive(own.probe.pid),
+      stdout: own.probe.stdout,
+      stderr: own.probe.stderr,
+      transcript: own.file,
+      transcriptSha256: crypto.createHash('sha256').update(fs.readFileSync(own.file)).digest('hex'),
+      parsedLines: own.said,
+      matched,
+    };
+    fs.mkdirSync(path.dirname(evidence), { recursive: true });
+    fs.writeFileSync(evidence, JSON.stringify(result, null, 2) + '\n');
+    console.log(`PASS real cost probe: ${q(matched)}; transcript ${own.file}; process group gone`);
+  } finally {
+    fs.rmSync(OWN_DIR, { recursive: true, force: true });
+  }
+}
+
+async function selfTestCostProbe(fixture) {
+  if (!fs.existsSync(fixture)) throw new Error(`missing cost-probe fixture ${fixture}`);
+  const dir = fs.mkdtempSync('/tmp/flow-e2e-cost-probe-');
+  try {
+    const marker = path.join(dir, 'pids.txt');
+    const recursive = await runDetachedProbe(process.execPath,
+      [fixture, 'recursive', marker, '4'],
+      { cwd: dir, env: process.env, timeout: 300 });
+    if (!recursive.timedOut) throw new Error(`recursive fixture did not time out: ${q(recursive)}`);
+    const pids = fs.readFileSync(marker, 'utf8').trim().split('\n').filter(Boolean).map(Number);
+    if (pids.length < 5) throw new Error(`recursive fixture made only ${pids.length} process(es): ${pids.join(', ')}`);
+    const alive = pids.filter((pid) => {
+      try { process.kill(pid, 0); return true; }
+      catch (e) { if (e.code === 'ESRCH') return false; throw e; }
+    });
+    if (alive.length) throw new Error(`timed-out descendants remain: ${alive.join(', ')}`);
+    const orphanMarker = path.join(dir, 'orphan-pids.txt');
+    const orphan = await runDetachedProbe(process.execPath,
+      [fixture, 'orphan-pipe', orphanMarker],
+      { cwd: dir, env: process.env, timeout: 300 });
+    if (!orphan.timedOut) throw new Error(`descendant-held pipe was not bounded: ${q(orphan)}`);
+    const orphanPids = fs.readFileSync(orphanMarker, 'utf8').trim().split('\n').filter(Boolean).map(Number);
+    const orphanAlive = orphanPids.filter((pid) => {
+      try { process.kill(pid, 0); return true; }
+      catch (e) { if (e.code === 'ESRCH') return false; throw e; }
+    });
+    if (orphanAlive.length) throw new Error(`orphaned pipe holders remain: ${orphanAlive.join(', ')}`);
+    const normal = await runDetachedProbe(process.execPath,
+      [fixture, 'normal'],
+      { cwd: dir, env: process.env, timeout: 2000 });
+    if (normal.timedOut || normal.code !== 0) throw new Error(`normal fixture failed: ${q(normal)}`);
+    const transcript = path.join(dir, 'normal.jsonl');
+    fs.writeFileSync(transcript, JSON.stringify({
+      content: `<local-command-stdout>${normal.stdout.trim()}</local-command-stdout>`,
+    }) + '\n');
+    const said = commandOutput(transcript);
+    const shown = showsOutput(said, normal.stdout);
+    if (!shown || !SUBSCRIPTION_RE.test(shown)) {
+      throw new Error(`normal /cost-like output did not parse: ${q({ said, stdout: normal.stdout, stderr: normal.stderr })}`);
+    }
+    console.log(`PASS cost probe: timeout killed ${pids.length} recursive processes and ${orphanPids.length} orphan-pipe processes; normal output parsed: ${q(shown)}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function main() {
+  if (opt.costProbeSelfTest) return selfTestCostProbe(opt.costProbeSelfTest);
+  if (opt.costProbeEvidence) return recordCostProbe(opt.costProbeEvidence);
+  const cmd = launchCommand();
+  takeLock();
+  if (await portInUse(PORT)) throw new Error(`port ${PORT} is already taken; another e2e or ship dev run is still up`);
+  fs.rmSync(SHOTS, { recursive: true, force: true });
+  fs.mkdirSync(SHOTS, { recursive: true });
+  tmux(['kill-server']);
+  const stamp = Date.now();
+  const userData = `/tmp/flow-e2e-${stamp}`;
+  const stop = async (sig) => {
+    console.log(`FAIL interrupted by ${sig}`);
+    await cleanup(userData);
+    process.exit(1);
+  };
+  process.once('SIGINT', () => stop('SIGINT'));
+  process.once('SIGTERM', () => stop('SIGTERM'));
+  console.log(`e2e: ${cmd.label}`);
+  console.log(`e2e: FLOW_USER_DATA=${userData} FLOW_TMUX_SOCKET=${SOCKET} FLOW_CDP_PORT=${PORT}`);
+  try {
+    startSshWatch();
+    if (opt.smoke) await smoke(userData, stamp);
+    else await full(userData, stamp);
+  } finally {
+    await cleanup(userData);
+  }
+  const failed = results.filter((r) => !r.ok).length;
+  if (ownIds.length) console.log(`e2e: Claude Code sessions this run made itself: ${ownIds.join('; ')}`);
+  console.log(`e2e: ${results.length - failed} of ${results.length} passed; screenshots and logs in ${SHOTS}`);
+  return failed ? 1 : 0;
+}
+
+main().then(
+  (code) => process.exit(code),
+  (e) => {
+    console.log(`FAIL e2e: ${e && e.message ? e.message : e}`);
+    process.exit(1);
+  },
+);
+
+
+
+
