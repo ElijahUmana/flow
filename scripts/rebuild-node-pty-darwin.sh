@@ -27,3 +27,32 @@ assert.strictEqual(process.arch, "arm64");
 
 node "$ROOT/scripts/apply-node-pty-patch.cjs" "$ROOT"
 python3 -I "$ROOT/scripts/node-pty-darwin-cleanup.py" "$ROOT/node_modules/node-pty/src/unix/pty.cc" --expect pass
+
+export npm_config_runtime=electron
+export npm_config_target="$ELECTRON_VERSION"
+export npm_config_arch=arm64
+export npm_config_target_arch=arm64
+export npm_config_disturl=https://electronjs.org/headers
+export npm_config_build_from_source=true
+npm rebuild node-pty --build-from-source
+[ "$(sha256 "$ROOT/node_modules/node-pty/src/unix/pty.cc" | cut -d ' ' -f 1)" = 98745ebe4f278afeb528021060dfdf42ac4dfd820620afaca4824435d6f09422 ] \
+  || { echo "node-pty source changed during rebuild" >&2; exit 2; }
+
+mkdir -p "$ROOT/evidence"
+BINARY="$ROOT/node_modules/node-pty/build/Release/pty.node"
+[ -f "$BINARY" ] || { echo "node-pty rebuild did not make $BINARY" >&2; exit 2; }
+BINARY_FILE=$(file "$BINARY")
+printf '%s\n' "$BINARY_FILE" | tee "$ROOT/evidence/node-pty-binary-file.txt"
+case "$BINARY_FILE" in
+  *Mach-O*arm64*) ;;
+  *) echo "node-pty binary is not Mach-O arm64" >&2; exit 2 ;;
+esac
+[ "$(lipo -archs "$BINARY")" = arm64 ] || { echo "node-pty binary is not arm64" >&2; exit 2; }
+sha256 "$ROOT/node_modules/node-pty/src/unix/pty.cc" "$BINARY" | tee "$ROOT/evidence/node-pty-source-binary-sha256.txt"
+ELECTRON_RUN_AS_NODE=1 node "$ROOT/scripts/pty-lifecycle-watchdog.cjs" 120000 \
+  "$ELECTRON" "$ROOT/scripts/pty-native-lifecycle.cjs" "$ROOT/node_modules/node-pty" \
+  | tee "$ROOT/evidence/pty-native-lifecycle-new.txt"
+
+
+
+
