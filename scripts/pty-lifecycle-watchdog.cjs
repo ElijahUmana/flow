@@ -22,3 +22,27 @@ function stop() {
     if (err.code !== 'ESRCH') console.error(`pty lifecycle watchdog: could not stop child: ${err.message}`);
   }
 }
+const timer = setTimeout(() => {
+  console.error(`pty lifecycle watchdog: timed out after ${timeoutMs} ms`);
+  stop();
+  process.exit(124);
+}, timeoutMs);
+child.once('error', (err) => {
+  clearTimeout(timer);
+  console.error(`pty lifecycle watchdog: ${err.message}`);
+  process.exitCode = 127;
+});
+child.once('exit', (code, signal) => {
+  clearTimeout(timer);
+  process.exitCode = code === null ? 128 + (constants.signals[signal] || 0) : code;
+});
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    stop();
+    process.exit(128 + constants.signals[signal]);
+  });
+}
+
+
+
+
