@@ -85,3 +85,90 @@ function exitOf(term) {
 }
 
 async function settleTo(expected) {
+  // The native exit event can precede the last descriptor cleanup; require two consecutive baseline readings.
+  const want = expected.join(','), deadline = Date.now() + timeoutMs;
+  let consecutive = 0, delay = 40, last = [];
+  while (Date.now() < deadline) {
+    await sleep(delay);
+    last = masterFds();
+    if (last.join(',') === want) {
+      if (++consecutive === 2) return last;
+    } else consecutive = 0;
+    delay = Math.min(delay * 2, 400);
+  }
+  return last;
+}
+
+function spawn(command, args = []) {
+  return pty.spawn(command, args, {
+    name: 'xterm-256color', cols: 80, rows: 24, cwd: process.cwd(),
+    env: { ...process.env, TERM: 'xterm-256color' },
+  });
+}
+
+async function naturalExit(i, baseline) {
+  const term = spawn('/bin/sh', ['-c', i === 0 ? 'sleep 1; exit 0' : 'exit 0']);
+  if (i === 0) {
+    const live = masterFds();
+    assert.ok(live.some((fd) => !baseline.includes(fd)),
+      `descriptor detector did not see the live node-pty master; baseline ${JSON.stringify(baseline)}, live ${JSON.stringify(live)}`);
+  }
+  const event = await exitOf(term);
+  assert.strictEqual(event.exitCode, 0, `natural exit code ${event.exitCode}`);
+}
+
+async function killedExit() {
+  const term = spawn('/bin/sh', ['-c', `sleep ${holdSeconds}`]);
+  const exited = exitOf(term);
+  term.kill();
+  await exited;
+}
+
+async function destroyedExit() {
+  const term = spawn('/bin/sh', ['-c', `sleep ${holdSeconds}`]);
+  const exited = exitOf(term);
+  term.destroy();
+  await exited;
+}
+
+async function failedSpawn() {
+  const missing = path.join(process.cwd(), `.flow-missing-pty-command-${process.pid}`);
+  let term;
+  try {
+    term = spawn(missing);
+  } catch (err) {
+    assert.match(String(err && err.message), /posix_spawnp failed|ENOENT|No such file|not found/i,
+      'the synchronous failure should be the missing executable');
+    return;
+  }
+  const event = await exitOf(term);
+  assert.strictEqual(event.exitCode, 1, `missing executable exit code ${event.exitCode}`);
+  assert.strictEqual(event.signal, 0, `missing executable signal ${event.signal}`);
+}
+
+async function phase(name, operation) {
+  const start = masterFds();
+  for (let i = 0; i < cycles; i++) {
+    await operation(i, start);
+    const end = await settleTo(start);
+    assert.deepStrictEqual(end, start,
+      `${name} cycle ${i + 1}: PTY masters did not return to baseline ${JSON.stringify(start)}; now ${JSON.stringify(end)}`);
+  }
+  console.log(`ok ${name}: ${cycles} cycles, masters ${start.length} -> ${start.length}`);
+}
+
+(async () => {
+  console.log(`pty-native-lifecycle: pid ${process.pid}, platform ${platform}, node-pty ${nodePtyVersion}, cycles ${cycles}`);
+  await phase('natural exit', naturalExit);
+  await phase('kill', killedExit);
+  await phase('destroy', destroyedExit);
+  await phase('failed spawn', failedSpawn);
+  console.log('pty-native-lifecycle: all lifecycle phases passed');
+})().catch((err) => {
+  console.error(`FAIL pty-native-lifecycle: ${err.stack || err}`);
+  process.exitCode = 1;
+});
+
+
+
+
