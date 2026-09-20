@@ -53,3 +53,58 @@ function attach(h) {
     const cy = cycles.get(c.key);
     return cy && cy.last === sig(here) ? cy : { base: here, view: h.view(c.ws), step: 0 };
   }
+  function layoutOf(c, cy, way) {
+    if (way === 'yours') return { rects: cy.base, view: cy.view };
+    if (way === 'readable') return readable(c.ws, cy.base);
+    return { rects: h.arrange(c.ws, way, h.front(c.ws), cy.base), view: null };
+  }
+  /* Lays the space out one way; false when nothing, windows or view, would move. */
+  function put(c, cy, here, way) {
+    const { rects, view } = layoutOf(c, cy, way);
+    const after = { ...here, ...rects };
+    if (sig(after) === sig(here) && (!view || sameView(view, h.view(c.ws)))) return false;
+    h.apply(c.ws, rects, view);
+    cy.last = sig(after);
+    cycles.set(c.key, cy);
+    return true;
+  }
+
+  /* ⌃⌘A: the next way that moves something; after the last, the owner's own again. */
+  function press() {
+    const c = h.current();
+    if (!c) return false;
+    const here = now(c.ws);
+    if (!Object.keys(here).length) return false;
+    const cy = cycleOf(c, here);
+    for (let n = 0; n <= WAYS.length; n++) {
+      cy.step = (cy.step + 1) % (WAYS.length + 1);
+      if (put(c, cy, here, cy.step ? WAYS[cy.step - 1] : 'yours')) return true;
+    }
+    cycles.set(c.key, cy);
+    return false;
+  }
+
+  /* One way chosen by name from the dock's menu; ⌃⌘A goes on from it. */
+  function pick(way) {
+    const c = h.current();
+    if (!c || !ROWS.some((r) => r[0] === way)) return false;
+    const here = now(c.ws);
+    if (!Object.keys(here).length) return false;
+    const cy = cycleOf(c, here);
+    cy.step = Math.max(0, WAYS.indexOf(way) + 1);
+    const moved = put(c, cy, here, way);
+    cycles.set(c.key, cy);
+    return moved;
+  }
+
+  const menu = () => ROWS.map(([way, label, hint]) => ({ way, label, hint }));
+
+  return { press, pick, menu };
+}
+
+window.FlowArrange = { attach };
+})();
+
+
+
+
