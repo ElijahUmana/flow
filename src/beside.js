@@ -123,3 +123,128 @@ function attach(h) {
   const place = (p) => { plus.style.left = `${p.x}px`; plus.style.top = `${p.y}px`; };
   const show = (p) => {
     clearTimeout(timer); timer = 0;
+    if (!at || at.w !== p.w || at.side !== p.side) hideLines();
+    at = p;
+    place(p);
+    fade(true);
+  };
+  /* How far out from p's side a point is, in px. */
+  const off = (p, q) => { const r = p.el.getBoundingClientRect(); return p.side === 'left' ? r.left - q.x : p.side === 'right' ? q.x - r.right : p.side === 'above' ? r.top - q.y : q.y - r.bottom; };
+  /* DWELL after the pointer came by a side: up, unless in the last 60 ms it was still closing in on the border or
+     leaving it (more than 1.5 px), and then it looks again in 40 ms. */
+  function settle() {
+    wait = 0;
+    const q = trail[trail.length - 1], p = q && reach(q.x, q.y);
+    if (!p) { trail = []; return; }
+    const now = performance.now(), recent = trail.filter((o) => now - o.t <= 60);
+    if (recent.length > 1 && Math.abs(off(p, recent[0]) - off(p, q)) > 1.5) { wait = setTimeout(settle, 40); return; }
+    show(p);
+  }
+
+  function onMove(e) {
+    if (drag) return;
+    if (h.isBusy()) { if (shown) hide(); return; }
+    if (e.target === plus) { clearTimeout(timer); timer = 0; return; }
+    const p = reach(e.clientX, e.clientY);
+    if (!p) {
+      calm();
+      const f = at && at.el.getBoundingClientRect();
+      if (f && e.clientX > f.left && e.clientX < f.right && e.clientY > f.top && e.clientY < f.bottom) hide();
+      else linger();
+      return;
+    }
+    if (shown && at.w === p.w && at.side === p.side) { show(p); return; }
+    const now = performance.now();
+    trail = trail.filter((o) => now - o.t <= 100);
+    trail.push({ t: now, x: e.clientX, y: e.clientY });
+    if (!wait) wait = setTimeout(settle, DWELL);
+  }
+  // a page swallows the pointer: going into one is going away from the +
+  const onOut = (e) => { const to = e.relatedTarget; if (!drag && (!to || to.tagName === 'WEBVIEW' || to.tagName === 'IFRAME')) { calm(); linger(); } };
+
+  plus.addEventListener('pointerenter', () => {
+    if (drag || !at) return;
+    const r = h.beside(at.ws, at.w, at.side, false, true);
+    outline(at.ws, r ? [r.at] : []);
+  });
+  plus.addEventListener('pointerleave', () => { if (!drag) { hideLines(); linger(); } });
+
+  /* Into the window from the + 's edge, in px: below zero is outside it. */
+  const depth = (p, x, y) => {
+    const r = p.el.getBoundingClientRect();
+    return p.side === 'left' ? x - r.left : p.side === 'right' ? r.right - x : p.side === 'above' ? y - r.top : r.bottom - y;
+  };
+  const end = () => {
+    if (!drag) return;
+    const d = drag;
+    drag = null;
+    document.removeEventListener('keydown', d.key, true);
+    if (plus.hasPointerCapture(d.id)) plus.releasePointerCapture(d.id);
+    h.busy(false);
+    hide();
+    if (d.cancelled && d.had && d.had.isConnected) d.had.focus({ preventScroll: true });
+  };
+  plus.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || !at) return;
+    e.preventDefault();
+    e.stopPropagation();
+    clearTimeout(timer); timer = 0;
+    const p = at, split = h.beside(p.ws, p.w, p.side, true, true);
+    drag = { id: e.pointerId, p, mode: 'click', sx: e.clientX, sy: e.clientY, split, had: document.activeElement, key: (k) => {
+      if (k.key !== 'Escape') return;
+      k.preventDefault();
+      k.stopPropagation();
+      drag.cancelled = true;
+      end();
+    } };
+    plus.setPointerCapture(e.pointerId);
+    // the keys come here while the + is held, so Esc reaches it even from a page that had them
+    plus.focus({ preventScroll: true });
+    document.addEventListener('keydown', drag.key, true);
+    h.busy(true);
+    const same = h.beside(p.ws, p.w, p.side, false, true);
+    outline(p.ws, same ? [same.at] : []);
+  });
+  plus.addEventListener('pointermove', (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    if (drag.mode === 'click' && Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) < MOVE) return;
+    const { p } = drag, d = depth(p, e.clientX, e.clientY), v = vbox();
+    place({ x: e.clientX - v.left, y: e.clientY - v.top });
+    // a pull: the two halves once far enough in and the split is possible, else nothing to let go of
+    const r = p.el.getBoundingClientRect(), need = Math.min(SPLIT_IN, 0.3 * (p.side === 'left' || p.side === 'right' ? r.width : r.height));
+    const mode = d > need && drag.split ? 'split' : 'none';
+    if (mode === drag.mode) return;
+    drag.mode = mode;
+    if (mode === 'split') outline(p.ws, [drag.split.own, drag.split.at]);
+    else hideLines();
+  });
+  plus.addEventListener('pointerup', (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const { p, mode } = drag;
+    if (mode === 'none') drag.cancelled = true;
+    end();
+    if (mode !== 'none') h.open(p.ws, p.w, p.side, mode === 'split');   // 'click': the same size, 'split': the halves
+  });
+  plus.addEventListener('lostpointercapture', () => end());
+  // a double-click on the + is one click, not a second window
+  plus.addEventListener('dblclick', (e) => { e.preventDefault(); e.stopPropagation(); });
+
+  window.addEventListener('pointermove', onMove, { capture: true, passive: true });
+  document.addEventListener('pointerout', onOut, true);
+  window.addEventListener('blur', () => { if (!drag) hide(); });
+
+  return {
+    /* The keys' way: a window of the same size beside the one in front, on that side. */
+    key(side) {
+      const f = h.front();
+      if (f && h.canOpen(f.w)) h.open(f.ws, f.w, side, false);
+    },
+  };
+}
+
+window.FlowBeside = { attach };
+})();
+
+
+
+
