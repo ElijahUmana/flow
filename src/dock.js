@@ -59,3 +59,63 @@ function attach(dock) {
   const emptySpace = () => {
     if (!track) return false;
     const m = /translateX\((-?[\d.]+)%\)/.exec(track.style.transform || ''), i = m ? Math.round(-parseFloat(m[1]) / 100) : 0;
+    const sec = track.querySelectorAll('section.ws')[i];
+    return !!sec && ![...sec.querySelectorAll('.win')].some((w) => w.style.display !== 'none');
+  };
+  const check = () => {
+    const now = emptySpace();
+    if (now === bare) return;
+    bare = now;
+    if (bare) set(true);
+    else linger();
+  };
+
+  /* Over a window that reaches down here, only the strip at the very bottom brings it up, so it never pops over what
+     you are working in, and a window's resize grip never counts as that strip (its bottom grip reaches into it).
+     Not while a button is held either: dragging past it leaves it down.
+     A web page in a window above never reports the pointer to this document, not even that it left, so near its top
+     edge a move up that is about to carry the pointer out (two more steps like the last one) already starts the timer;
+     the next move here stops it. */
+  const onMove = (e) => {
+    const x = e.clientX, y = e.clientY, prevY = lastY;
+    lastY = y;
+    if (y < innerHeight - BAND) { linger(); return; }
+    const a = measure();
+    if (!a) return;
+    const near = (py, side, above) => x >= a.left - side && x <= a.right + side && py >= a.top - above && py <= a.bottom;
+    const next = y < a.top + TOP ? y + 2 * Math.min(0, y - prevY) : y;
+    if (shown) {
+      if (near(y, KEEP, KEEP_UP) && near(next, KEEP, KEEP_UP)) set(true);
+      else linger();
+    } else if (!e.buttons && near(y, NEAR, 0) && !(e.target.closest && e.target.closest('.rz')) && (y >= a.bottom - EDGE || (!(e.target.closest && e.target.closest('.win')) && !under()))) {
+      set(true);
+    }
+  };
+  /* Leaving the window, or going into a web page (its pointer moves never reach this document). */
+  const onOut = (e) => {
+    const to = e.relatedTarget;
+    if (!to || to.tagName === 'WEBVIEW' || to.tagName === 'IFRAME') linger();
+  };
+
+  window.addEventListener('pointermove', onMove, { capture: true, passive: true });
+  /* A press on a window's resize grip is aimed at that window: the dock gets out of the way of the edge being dragged. */
+  window.addEventListener('pointerdown', (e) => { if (shown && e.target.closest && e.target.closest('.rz')) set(false); }, true);
+  // a window made, closed or moved to another space, or another space shown: looked at once per frame at most
+  let pending = 0;
+  if (track) new MutationObserver(() => { if (!pending) pending = requestAnimationFrame(() => { pending = 0; check(); }); })
+    .observe(track, { subtree: true, childList: true, attributes: true, attributeFilter: ['style', 'class'] });
+  document.addEventListener('pointerout', onOut, true);
+  /* After the app has handled the click (and opened what it asked for). */
+  dock.addEventListener('click', (e) => { if (e.target.closest('button')) setTimeout(() => { if (shown && under()) set(false); }, 0); });
+  set(false, true);
+  check();
+
+  return { isShown: () => shown };
+}
+
+window.FlowDock = { attach };
+})();
+
+
+
+
