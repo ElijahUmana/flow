@@ -562,3 +562,190 @@ function mdRules(origin) {
 }
 
 /* A file's tab on screen re-renders when the file changes (an agent writing a plan, code or a log). A .md keeps the
+   block at the top of the view at the top; any other page keeps its scroll, as a reload does, and one read at its end
+   follows the end, as a log is. Its folder is watched, not the file, so an editor's or agent's replace-by-rename is
+   seen too. While text is selected in it (to clip or copy), the re-render waits until the selection is let go. */
+/* The reading place is the innermost block at the top of the view (a list item, not the whole list), found by what is
+   under a point near the top, and found again after the re-render by its text (nearest its old position). */
+const BLOCKS = "'h1,h2,h3,h4,h5,h6,p,li,pre,tr,hr,img,summary,dt,dd'";
+const PLACE = `(() => { if (!getSelection().isCollapsed) return { held: true }; const art = document.querySelector('article'); if (!art) return scrollY > 0 && innerHeight + scrollY >= document.documentElement.scrollHeight - 2 ? { end: true } : null; const x = art.getBoundingClientRect().left + 24; let el = null; for (let y = 2; y < innerHeight && !el; y += 6) { const hit = document.elementFromPoint(x, y); el = hit && hit.closest(${BLOCKS}); if (el && !art.contains(el)) el = null; } if (!el) return null; const els = [...art.querySelectorAll(${BLOCKS})]; return { i: els.indexOf(el), text: el.textContent.slice(0, 200), dy: el.getBoundingClientRect().top }; })()`;
+const RESTORE = `(at) => { if (at.end) { window.scrollTo(0, document.documentElement.scrollHeight); return; } const art = document.querySelector('article'); if (!art) return; const els = [...art.querySelectorAll(${BLOCKS})]; if (!els.length) return; let best = -1; for (let d = 0; d < els.length && best < 0; d++) for (const k of [at.i - d, at.i + d]) if (k >= 0 && k < els.length && els[k].textContent.slice(0, 200) === at.text) { best = k; break; } const el = els[best >= 0 ? best : Math.min(at.i, els.length - 1)]; window.scrollTo(0, el.getBoundingClientRect().top + window.scrollY - at.dy); }`;
+const live = new Map();   // webContents id -> Map(file -> { w, timer, last })
+const vmLive = new Map();   // webContents id -> Map(`${host}\0${path}` -> { timer, last }) of the VM files it shows
+const vmSizes = new Map();   // `${host}\0${path}` -> the size of a VM file when it was last shown
+const holding = new Map();   // webContents id -> the timer of its re-render, waiting for a selection to be let go
+
+function liveSet(sender, files) {
+  let mine = live.get(sender.id);
+  if (!mine) {
+    if (!files.size) return;
+    mine = new Map();
+    live.set(sender.id, mine);
+  }
+  for (const [f, x] of mine) {
+    if (files.has(f)) continue;
+    x.w.close();
+    clearTimeout(x.timer);
+    mine.delete(f);
+  }
+  for (const f of files) {
+    if (mine.has(f)) continue;
+    let w;
+    try {
+      w = fs.watch(path.dirname(f), { persistent: false });
+    } catch (e) {
+      console.warn(`[flow] files: could not watch ${f}: ${e.message}`);
+      continue;
+    }
+    const x = { w, timer: 0, last: 0 };
+    const name = path.basename(f);
+    w.on('change', (_type, n) => {
+      if (String(n) !== name || x.timer) return;
+      x.timer = setTimeout(() => {
+        x.timer = 0;
+        x.last = Date.now();
+        rerender(sender, f);
+      }, Math.max(LIVE_MS, x.last + gapOf(f) - Date.now()));
+    });
+    w.on('error', (e) => {
+      console.warn(`[flow] files: stopped watching ${f}: ${e.message}`);
+      w.close();
+      clearTimeout(x.timer);
+      if (mine.get(f) === x) mine.delete(f);
+    });
+    mine.set(f, x);
+    caughtUp(sender, f);
+  }
+}
+
+/* A file shown again after a time nothing watched it (its space, or Flow, was off screen) may have changed meanwhile:
+   a tab that loaded it before its last change re-renders. */
+async function caughtUp(sender, f) {
+  let st;
+  try {
+    st = await fs.promises.stat(f);
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn(`[flow] files: could not look at ${f}: ${e.message}`);
+    return;
+  }
+  if (sender.isDestroyed()) return;
+  for (const wc of pagesOf(sender)) {
+    if (!shows(wc, f)) continue;
+    let since;
+    try {
+      since = await wc.executeJavaScript('performance.timeOrigin');
+    } catch (e) {
+      console.warn(`[flow] files: could not read when ${wc.getURL()} loaded: ${e.message}`);
+      continue;
+    }
+    if (!wc.isDestroyed() && st.mtimeMs > since) keepPlace(wc);
+  }
+}
+
+const gapFor = (size) => Math.max(1000, Math.ceil(size / (1024 * 1024)) * 1000);
+
+function gapOf(file) {
+  let st = null;
+  try {
+    st = fs.statSync(file, { throwIfNoEntry: false });
+  } catch (e) {
+    console.warn(`[flow] files: could not read the size of ${file}: ${e.message}`);
+  }
+  return gapFor(st ? st.size : 0);
+}
+
+/* A VM file is paced as a Mac file is, by its size when it was last shown (vmfiles serves it through respond()). */
+function vmChanged(sender, host, p) {
+  let mine = vmLive.get(sender.id);
+  if (!mine) vmLive.set(sender.id, (mine = new Map()));
+  const k = `${host}\0${p}`;
+  let x = mine.get(k);
+  if (!x) mine.set(k, (x = { timer: 0, last: 0 }));
+  if (x.timer) return;
+  x.timer = setTimeout(() => {
+    x.timer = 0;
+    x.last = Date.now();
+    rerender(sender, p, host);
+  }, Math.max(0, x.last + gapFor(vmSizes.get(k) || 0) - Date.now()));
+}
+
+/* The tabs of this window showing that file (host: the VM it is on, none for this Mac) re-render. A tab still loading a
+   page may have been sent the file just before it changed, and has no address of its own until the page shows
+   (getURL() is the last page shown): it is looked at again then. */
+function rerender(sender, file, host) {
+  if (sender.isDestroyed()) return;
+  for (const wc of pagesOf(sender)) {
+    if (shows(wc, file, host)) keepPlace(wc);
+    else if (wc.isLoadingMainFrame()) lookAgain(wc, file, host);
+  }
+}
+
+const pagesOf = (sender) => webContents.getAllWebContents().filter((wc) => !wc.isDestroyed() && wc.getType() === 'webview' && wc.hostWebContents && wc.hostWebContents.id === sender.id);
+
+function shows(wc, file, host) {
+  const url = wc.getURL();
+  if (!url.startsWith(`${SCHEME}:`) || !URL.canParse(url)) return false;
+  const n = named(new URL(url));
+  return !!n && (host ? n.host === host && n.p === file : !n.host && n.file === file);
+}
+
+const loading = new Map();   // webContents id -> [{ file, host }] that changed while it was loading a page
+
+function lookAgain(wc, file, host) {
+  let files = loading.get(wc.id);
+  if (!files) {
+    loading.set(wc.id, (files = []));
+    const done = () => {
+      loading.delete(wc.id);
+      wc.off('did-navigate', shown);
+      wc.off('destroyed', done);
+    };
+    const shown = () => {
+      done();
+      if (files.some((f) => shows(wc, f.file, f.host))) keepPlace(wc);
+    };
+    wc.on('did-navigate', shown);
+    wc.on('destroyed', done);
+  }
+  if (!files.some((f) => f.file === file && f.host === host)) files.push({ file, host });
+}
+
+async function keepPlace(wc) {
+  let at = null;
+  try {
+    at = await wc.executeJavaScript(PLACE);
+  } catch (e) {
+    console.warn(`[flow] files: could not read the reading place in ${wc.getURL()}: ${e.message}`);
+  }
+  if (wc.isDestroyed()) return;
+  if (at && at.held) {
+    if (holding.has(wc.id)) return;
+    const url = wc.getURL();
+    holding.set(wc.id, setTimeout(() => {
+      holding.delete(wc.id);
+      if (!wc.isDestroyed() && wc.getURL() === url) keepPlace(wc);
+    }, HOLD_MS));
+    return;
+  }
+  if (at) {
+    wc.once('did-finish-load', () => {
+      if (wc.isDestroyed()) return;
+      wc.executeJavaScript(`(${RESTORE})(${JSON.stringify(at)})`).catch((e) => console.warn(`[flow] files: could not keep the reading place in ${wc.getURL()}: ${e.message}`));
+    });
+  }
+  wc.reload();
+}
+
+/* ses: the pages' session (persist:flow). */
+function serveOn(ses) {
+  ses.protocol.handle(SCHEME, (req) => serve(req).catch((e) => {
+    console.error(`[flow] files: could not serve ${req.url}: ${e.message}`);
+    return plain(500, e.message);
+  }));
+}
+
+module.exports = { init, privileges, serveOn, list, exist, watch, open, reveal, compare, kindOf, respond, urlOf, vmUrlOf, SCHEME };
+
+
+
+
