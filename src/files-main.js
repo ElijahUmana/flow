@@ -186,3 +186,191 @@ function watch(sender, dirs) {
   const id = sender.id;
   let mine = watched.get(id);
   if (!mine) {
+    mine = new Map();
+    watched.set(id, mine);
+    sender.once('destroyed', () => stopWatching(id));
+  }
+  const send = (host, dir) => { if (!sender.isDestroyed()) sender.send('files:changed', { host, dir }); };
+  const local = new Set();
+  const remote = [];
+  const shown = new Set();
+  for (const d of (Array.isArray(dirs) ? dirs : []).slice(0, MAX_WATCHED)) {
+    if (d && typeof d.file === 'string') {
+      if (d.host) remote.push({ host: String(d.host), file: d.file });
+      else if (absolute(d.file)) shown.add(d.file);
+      continue;
+    }
+    if (!d || typeof d.dir !== 'string') continue;
+    if (d.host) remote.push({ host: String(d.host), dir: d.dir });
+    else if (absolute(d.dir)) local.add(d.dir);
+  }
+  liveSet(sender, shown);
+  if (Array.isArray(dirs) && dirs.length > MAX_WATCHED) console.warn(`[flow] files: watching the first ${MAX_WATCHED} of ${dirs.length} folders shown`);
+  for (const [dir, x] of mine) {
+    if (local.has(dir)) continue;
+    x.w.close();
+    clearTimeout(x.timer);
+    mine.delete(dir);
+  }
+  for (const dir of local) {
+    if (mine.has(dir)) continue;
+    let w;
+    try {
+      w = fs.watch(dir, { persistent: false });
+    } catch (e) {
+      // The folder is gone or closed to Flow: its list says so when the window lists it again.
+      console.warn(`[flow] files: could not watch ${dir}: ${e.message}`);
+      send(null, dir);
+      continue;
+    }
+    const x = { w, timer: 0 };
+    w.on('change', () => {
+      if (!x.timer) x.timer = setTimeout(() => { x.timer = 0; send(null, dir); }, SETTLE_MS);
+    });
+    w.on('error', (e) => {
+      console.warn(`[flow] files: stopped watching ${dir}: ${e.message}`);
+      w.close();
+      clearTimeout(x.timer);
+      if (mine.get(dir) === x) mine.delete(dir);
+      send(null, dir);
+    });
+    mine.set(dir, x);
+  }
+  const paced = vmLive.get(id);
+  if (paced) for (const [k, x] of paced) if (!remote.some((r) => r.file && `${r.host}\0${r.file}` === k)) { clearTimeout(x.timer); paced.delete(k); }
+  if (vm) vm.watch(id, remote, (host, p, kind) => (kind === 'file' ? vmChanged(sender, host, p) : send(host, p)));
+  else if (remote.length) console.warn('[flow] files: folders on the VM are not watched (no VM module)');
+}
+
+/* ---------- opening: in Flow as a page where it can be shown, otherwise in the Mac's app ---------- */
+async function readHead(file) {
+  const fh = await fs.promises.open(file, 'r');
+  try {
+    const buf = Buffer.alloc(8192);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    return buf.subarray(0, bytesRead);
+  } finally {
+    await fh.close();
+  }
+}
+
+async function looksLikeText(file) {
+  const head = await readHead(file);
+  return !head.includes(0) && isUtf8(head);
+}
+
+/* An html file that names no charset (no byte order mark, no <meta charset> in its first 1024 bytes, where browsers
+   look) is read as UTF-8 when it starts as valid UTF-8, as Chrome reads a local file; one that names its own keeps it. */
+async function undeclaredUtf8(file) {
+  const head = await readHead(file);
+  if ((head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf) || (head[0] === 0xfe && head[1] === 0xff) || (head[0] === 0xff && head[1] === 0xfe)) return false;
+  if (/<meta[^>]+charset\s*=/i.test(head.subarray(0, 1024).toString('latin1'))) return false;
+  return isUtf8(head);
+}
+
+/* Valid UTF-8, allowing a character cut off at the end of the 8 KB read. */
+function isUtf8(b) {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(b, { stream: true });
+    return true;
+  } catch (e) {
+    if (e instanceof TypeError) return false;
+    throw e;
+  }
+}
+
+/* 'pdf' | 'image' | 'html' | 'text' (shown in Flow) or 'other' (the Mac's app). */
+async function kindOf(file, size) {
+  const type = TYPES[path.extname(file).slice(1).toLowerCase()];
+  if (type === 'application/pdf') return 'pdf';
+  if (type && type.startsWith('image/')) return 'image';
+  if (size > MAX_SHOWN) return 'other';
+  if (type === 'text/html') return 'html';
+  if (!(await looksLikeText(file))) return 'other';
+  return MD_RE.test(file) && size <= MAX_MD ? 'md' : 'text';
+}
+
+/* ---------- signed addresses ---------- */
+/* Every flow-file: address carries an HMAC of the file it names, made with a key only main holds, so a web page can
+   neither make one up nor include, frame or open a file with it. The key is kept in userData: a tab or a saved page
+   showing a file comes back after a restart. No webRequest listener is needed, which would slow every page's requests. */
+let key = null;
+function secret() {
+  if (key) return key;
+  const file = path.join(app.getPath('userData'), 'flow-file.key');
+  try {
+    const k = fs.readFileSync(file);
+    if (k.length === 32) return (key = k);
+    console.warn(`[flow] files: ${file} is not a 32-byte key, so a new one is made and file pages open from the sidebar again`);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+  const k = crypto.randomBytes(32);
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, k, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return (key = k);
+}
+const canon = (p) => '/' + p.split('/').filter(Boolean).join('/');
+const sign = (what) => crypto.createHmac('sha256', secret()).update(what).digest('base64url').slice(0, 22);
+const same = (a, b) => typeof a === 'string' && a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const encoded = (p) => p.split('/').filter(Boolean).map(encodeURIComponent).join('/');
+/* An .html file's address is signed for its folder, so a report's styles, scripts, pages and subfolders load with it;
+   nothing above that folder does. */
+const dirOf = (p) => path.posix.dirname(canon(p));
+const urlOf = (file) => `${SCHEME}://mac/${sign(HTML_RE.test(file) ? `macdir\0${dirOf(file)}` : `mac\0${canon(file)}`)}/${encoded(file)}`;
+/* A file the owner dropped on Flow from Finder opens wherever it is: its address is signed as that grant, for that file
+   alone (an .html one too, so nothing beside it loads with it). */
+const dropUrlOf = (file) => `${SCHEME}://mac/${sign(`drop\0${canon(file)}`)}/${encoded(file)}`;
+/* A VM file's address, made for the VM module: flow-file://vm/<signature>/<host>/<absolute path>. */
+const vmUrlOf = (host, p) => `${SCHEME}://vm/${sign(HTML_RE.test(p) ? `vmdir\0${host}\0${dirOf(p)}` : `vm\0${host}\0${canon(p)}`)}/${encodeURIComponent(host)}/${encoded(p)}`;
+
+/* What a signed address names: { file } on this Mac (dropped: true for one the owner dropped), { host, p } on the VM,
+   with scope: the folder it was signed for when it is a report's (under that folder), or null when this Flow did not
+   sign it or it does not decode. */
+function named(u) {
+  let parts;
+  try {
+    parts = u.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  } catch (e) {
+    if (e instanceof URIError) return null;
+    throw e;
+  }
+  const sig = parts.shift();
+  if (u.host === 'mac') {
+    const file = canon(parts.join('/'));
+    if (same(sig, sign(`mac\0${file}`))) return { file };
+    if (same(sig, sign(`drop\0${file}`))) return { file, dropped: true };
+    const scope = scopeOf(sig, file, (d) => `macdir\0${d}`);
+    return scope ? { file, scope } : null;
+  }
+  if (u.host === 'vm' && parts.length > 1) {
+    const host = parts.shift();
+    const p = canon(parts.join('/'));
+    if (same(sig, sign(`vm\0${host}\0${p}`))) return { host, p };
+    const scope = scopeOf(sig, p, (d) => `vmdir\0${host}\0${d}`);
+    return scope ? { host, p, scope } : null;
+  }
+  return null;
+}
+
+/* The folder of p's that sig was made for, if any (never / itself). */
+function scopeOf(sig, p, what) {
+  for (let d = path.posix.dirname(p); d !== '/'; d = path.posix.dirname(d)) if (same(sig, sign(what(d)))) return d;
+  return null;
+}
+
+/* { url } to open as a page, { app: true } when the Mac's app opened it, or { error }. */
+/* how: 'dropped' when the owner dropped the file on Flow from Finder, which opens it wherever it is. */
+async function open(host, file, how) {
+  if (host) return vm ? vm.open(host, file, vmFolders(host)) : { error: 'files on the VM are not set up' };
+  const dropped = how === 'dropped' && absolute(file);
+  if (!dropped && !shown(file)) return { error: 'not in a workspace folder' };
+  let st;
+  try {
+    st = await fs.promises.stat(file);
+  } catch (e) {
+    return { error: reason(e) };
+  }
+  if (st.isDirectory()) {
+    if (!PACKAGE_RE.test(file)) return { error: 'a folder' };
