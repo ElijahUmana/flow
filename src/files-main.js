@@ -374,3 +374,191 @@ async function open(host, file, how) {
   }
   if (st.isDirectory()) {
     if (!PACKAGE_RE.test(file)) return { error: 'a folder' };
+  } else if (!st.isFile()) {
+    return { error: 'not a file' };
+  } else if ((await kindOf(file, st.size)) !== 'other') {
+    return { url: dropped ? dropUrlOf(file) : urlOf(file) };
+  }
+  const err = await shell.openPath(file);
+  return err ? { error: err } : { app: true };
+}
+
+function reveal(file) {
+  if (!shown(file)) {
+    console.warn(`[flow] files: refused to show ${file} in Finder: not in a workspace folder`);
+    return;
+  }
+  shell.showItemInFolder(file);
+}
+
+/* ---------- the flow-file: scheme on the pages' session ---------- */
+const privileges = { scheme: SCHEME, privileges: { standard: true, secure: true, stream: true } };
+
+// Every answer is used only as the type it says: a text file never loads as a script or a style sheet.
+const STRICT = { 'x-content-type-options': 'nosniff' };
+const SCOPE_HEADER = 'x-flow-scope';
+const plain = (status, text) => new Response(text, { status, headers: { 'content-type': 'text/plain; charset=utf-8', 'content-security-policy': TEXT_CSP, ...STRICT } });
+
+/* A report page's policy: its inline code, and scripts, styles, images, fonts and media from under its own folder's
+   address; nothing from the network, no fetch, no frames, no workers, no forms. */
+function scopedCsp(origin) {
+  const base = origin.host
+    ? `${SCHEME}://vm/${sign(`vmdir\0${origin.host}\0${origin.scope}`)}/${encodeURIComponent(origin.host)}/${encoded(origin.scope)}/`
+    : `${SCHEME}://mac/${sign(`macdir\0${origin.scope}`)}/${encoded(origin.scope)}/`;
+  return `default-src 'none'; script-src 'unsafe-inline' ${base}; style-src 'unsafe-inline' ${base}; img-src data: blob: ${base}; `
+    + `font-src data: ${base}; media-src data: blob: ${base}; worker-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'; `
+    + 'sandbox allow-scripts allow-same-origin';
+}
+
+/* A report page leaves its flow-file: pages only when the owner clicks a link or presses a key in it, so a script there
+   cannot send the page, or anything it shows, to the network; the sandbox above already stops its popups, forms and
+   downloads. (WebRTC, which no page policy covers, is cut off by main.js for flow-file: html pages.) */
+let guarding = false;
+const OWNER_MS = 1000;
+const ownerAt = new WeakMap();   // webContents -> when the owner last pressed the mouse or a key in it
+function guardReports(wc) {
+  wc.on('before-mouse-event', (_event, m) => { if (m.type === 'mouseDown') ownerAt.set(wc, Date.now()); });
+  wc.on('before-input-event', (_event, i) => { if (i.type === 'keyDown') ownerAt.set(wc, Date.now()); });
+  wc.on('will-navigate', (event) => {
+    const from = wc.getURL();
+    if (!from.startsWith(`${SCHEME}:`) || event.url.startsWith(`${SCHEME}:`) || !URL.canParse(from)) return;
+    const n = named(new URL(from));
+    if (!n || !n.scope || Date.now() - (ownerAt.get(wc) || 0) < OWNER_MS) return;
+    event.preventDefault();
+    console.warn(`[flow] files: a report page went for ${event.url.slice(0, 120)} with no click or key from the owner; it stays`);
+  });
+}
+const escHTML = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+/* A text or code file as a page titled with its name, read as a .md is: the same dark page and colors, in the .md's
+   code font. */
+const TEXT_STYLE = ':root{color-scheme:dark}html{background:#0f0f11;color:#d9d9dd}body{margin:0;padding:16px 20px 48px}'
+  + 'pre{margin:0;white-space:pre-wrap;word-wrap:break-word;font:12px/1.55 "SF Mono",ui-monospace,Menlo,Monaco,Consolas,monospace}'
+  + '::selection{background:#4a3f66}';
+function textPage(file, text) {
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escHTML(path.basename(file))}</title>`
+    + `<style>${TEXT_STYLE}</style></head>`
+    + `<body><pre>${escHTML(text)}</pre></body></html>`;
+}
+
+/* A VM file goes to the VM module as flow-file://vm/<host>/<path>, its signature checked and taken off. */
+async function serve(req) {
+  const n = named(new URL(req.url));
+  if (!n) {
+    console.warn(`[flow] files: refused ${req.url}: not an address this Flow made`);
+    return plain(403, 'refused');
+  }
+  if (n.host) return vm ? vm.serve(new Request(`${SCHEME}://vm/${encodeURIComponent(n.host)}/${encoded(n.p)}`, n.scope ? { headers: { [SCOPE_HEADER]: n.scope } } : undefined), vmFolders(n.host)) : plain(404, 'not there');
+  const { file } = n;
+  if (!n.dropped && !shown(file)) return plain(403, 'not in a workspace folder');
+  let st;
+  try {
+    st = await fs.promises.stat(file);
+  } catch (e) {
+    return plain(e.code === 'ENOENT' ? 404 : 403, reason(e));
+  }
+  if (!st.isFile()) return plain(404, 'not a file');
+  return respond(file, st, n.scope ? { host: null, path: file, scope: n.scope } : undefined);
+}
+
+/* A local file as a page (a Mac file, or the VM module's copy of a VM file): its own type for a pdf, an image or html,
+   a text page for text, a .md rendered, refused for anything else. origin: where the file is ({ host, path }; a VM
+   copy's links resolve on the VM), this Mac's path by default; origin.scope: the report folder the page was asked for
+   under, if any. */
+async function respond(file, st, origin) {
+  if (origin && origin.host) {
+    const k = `${origin.host}\0${origin.path}`;
+    vmSizes.delete(k);
+    vmSizes.set(k, st.size);
+    if (vmSizes.size > VM_SIZES) vmSizes.delete(vmSizes.keys().next().value);
+  }
+  const scope = origin && origin.scope;
+  const raw = scope && SCOPED_TYPES[path.extname(file).slice(1).toLowerCase()];
+  if (raw) return new Response(Readable.toWeb(fs.createReadStream(file)), { headers: { 'content-type': raw, 'content-length': String(st.size), ...STRICT } });
+  const kind = await kindOf(file, st.size);
+  if (kind === 'other') return plain(415, 'flow does not show this kind of file');
+  if (kind === 'md') {
+    const text = await fs.promises.readFile(file, 'utf8');
+    const html = markdown.render(text, mdRules(origin || { host: null, path: file }));
+    return new Response(mdPage(file, html), { headers: { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': MD_CSP, ...STRICT } });
+  }
+  if (kind === 'text') {
+    const text = await fs.promises.readFile(file, 'utf8');
+    return new Response(textPage(file, text), { headers: { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': TEXT_CSP, ...STRICT } });
+  }
+  const headers = { 'content-type': TYPES[path.extname(file).slice(1).toLowerCase()], 'content-length': String(st.size), ...STRICT };
+  if (kind === 'html') {
+    headers['content-security-policy'] = scope ? scopedCsp(origin) : HTML_CSP;
+    headers['referrer-policy'] = 'no-referrer';
+    headers['x-dns-prefetch-control'] = 'off';
+    if (await undeclaredUtf8(file)) headers['content-type'] = 'text/html; charset=utf-8';
+  }
+  if (headers['content-type'] === 'image/svg+xml') headers['content-security-policy'] = "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
+  return new Response(Readable.toWeb(fs.createReadStream(file)), { headers });
+}
+
+/* ---------- a .md as the owner reads it: rendered in the look of a Flow note, and live while it shows ---------- */
+const MD_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src flow-file: https: data:";
+const MD_STYLE = ':root{color-scheme:dark}html{background:#0f0f11;color:#d9d9dd}'
+  + 'body{margin:0;padding:22px 28px 64px;font:13px/1.65 -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}'
+  + 'article{max-width:780px}article>:first-child{margin-top:0}'
+  + 'h1,h2,h3,h4,h5,h6{color:#f0f0f2;font-weight:600;line-height:1.3;margin:1.5em 0 .55em}h1{font-size:20px}h2{font-size:17px}h3{font-size:15px}h4,h5,h6{font-size:13px}'
+  + 'p,ul,ol,pre,blockquote,table,details{margin:0 0 .85em}ul,ol{padding-left:22px}li>p{margin:0 0 .4em}'
+  + 'li.task{list-style:none}li.task>input,li.task>p:first-child>input{margin:0 6px 0 -18px;accent-color:#d97757}'
+  + 'a{color:#8fb5f0;text-decoration:none}a:hover{text-decoration:underline}'
+  + 'code{font:12px/1.55 "SF Mono",ui-monospace,Menlo,Monaco,Consolas,monospace;background:#1c1c1f;border-radius:4px;padding:1px 4px}'
+  + 'pre{background:#161618;border:1px solid #26262a;border-radius:6px;padding:10px 12px;overflow:auto}pre code{background:none;padding:0}'
+  + 'blockquote{margin-left:0;padding-left:12px;border-left:2px solid #3a3a40;color:#a9a9b0}hr{border:0;border-top:1px solid #26262a;margin:1.5em 0}'
+  + 'table{border-collapse:collapse;display:block;overflow:auto}th,td{border:1px solid #26262a;padding:4px 10px}th{color:#f0f0f2;font-weight:600;background:#151517}'
+  + 'img{max-width:100%}kbd{font:11px "SF Mono",ui-monospace,Menlo,monospace;border:1px solid #3a3a40;border-bottom-width:2px;border-radius:4px;padding:0 4px}'
+  + 'summary{cursor:pointer}del{color:#8d8d93}::selection{background:#4a3f66}';
+const mdPage = (file, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${escHTML(path.basename(file))}</title>`
+  + `<style>${MD_STYLE}</style></head><body><article>${body}</article></body></html>`;
+
+/* Links and images in a .md: a web address as it is, an anchor in the page, and a path relative to the file by its
+   signed address when it names a file inside a workspace folder (on the VM: one of that host's workspace folders, by
+   the VM's path). Anything else, another scheme, a hidden name or a folder, stays text. */
+function mdRules(origin) {
+  const here = path.posix.dirname(origin.path);
+  function fileHref(raw, image) {
+    const hash = raw.indexOf('#');
+    const frag = hash >= 0 ? raw.slice(hash) : '';
+    let rel = (hash >= 0 ? raw.slice(0, hash) : raw).replace(/\?.*$/, '');
+    try {
+      rel = decodeURIComponent(rel);
+    } catch (e) {
+      if (e instanceof URIError) return null;
+      throw e;
+    }
+    if (!rel) return null;
+    if (rel.split('/').some((x) => x.startsWith('.') && x !== '.' && x !== '..')) return null;
+    const abs = path.posix.resolve(here, rel);
+    if (image && !(TYPES[path.extname(abs).slice(1).toLowerCase()] || '').startsWith('image/')) return null;
+    // On the VM the same rules as here, from the VM module, which knows how that host's workspace folders resolve, and
+    // knows a folder from its listings (kindAt); a link to a folder stays text, as the stat below keeps it here.
+    if (origin.host) return vm && vm.shown && vm.shown(origin.host, abs, vmFolders(origin.host)) && !(vm.kindAt && vm.kindAt(origin.host, abs) === 'dir') ? vmUrlOf(origin.host, abs) + frag : null;
+    if (!shown(abs)) return null;
+    try {
+      if (fs.statSync(abs).isDirectory()) return null;
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+    return urlOf(abs) + frag;
+  }
+  return {
+    link(href) {
+      const h = String(href).trim();
+      if (h.startsWith('#') || /^(https?|mailto):/i.test(h)) return h;
+      if (/^[a-z][a-z0-9+.-]*:/i.test(h) || h.startsWith('//')) return null;
+      return fileHref(h, false);
+    },
+    image(src) {
+      const h = String(src).trim();
+      if (/^https:/i.test(h) || /^data:image\/(png|jpe?g|gif|webp);/i.test(h)) return h;
+      if (/^[a-z][a-z0-9+.-]*:/i.test(h) || h.startsWith('//')) return null;
+      return fileHref(h, true);
+    },
+  };
+}
+
+/* A file's tab on screen re-renders when the file changes (an agent writing a plan, code or a log). A .md keeps the
