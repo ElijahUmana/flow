@@ -154,3 +154,159 @@ function mount(h) {
     const lift = here(ws).length ? (LABEL_PX / h.size().vh) * 100 * 2 : 0;
     h.frame(ws, { x: x0 - PAD, y: y0 - PAD - lift, w: x1 - x0 + 2 * PAD, h: y1 - y0 + 2 * PAD + lift });
     return true;
+  }
+  function rename(ws, g) {
+    const f = frames.get(g.id);
+    if (!f) return;
+    const el = f.label, was = g.name;
+    el.contentEditable = 'plaintext-only';
+    el.focus();
+    const r = document.createRange();
+    r.selectNodeContents(el);
+    const s = getSelection();
+    s.removeAllRanges();
+    s.addRange(r);
+    const done = (keep) => {
+      el.removeEventListener('keydown', key);
+      el.removeEventListener('blur', blur);
+      el.contentEditable = 'false';
+      const name = el.textContent.trim();
+      g.name = keep && name ? name : was;
+      el.textContent = g.name;
+      if (g.name !== was) h.changed(ws);
+    };
+    const key = (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); done(true); el.blur(); }
+      else if (e.key === 'Escape') { e.preventDefault(); done(false); el.blur(); }
+    };
+    const blur = () => done(true);
+    el.addEventListener('keydown', key);
+    el.addEventListener('blur', blur, { once: true });
+  }
+
+  /* ⌘G: the selected windows become one group (a window already in another group leaves it). */
+  function group(ws) {
+    const ids = [...selected].filter((id) => { const w = ws.windows.find((o) => o.id === id); return w && h.inSpace(ws, w); });
+    if (ids.length < 2) return false;
+    for (const g of groupsOf(ws)) g.ids = g.ids.filter((id) => !ids.includes(id));
+    prune(ws);
+    const n = groupsOf(ws).length + 1;
+    const g = { id: MARK + h.newId('g'), name: `group ${n}`, zone: h.space(ws) || null, ids };
+    groupsOf(ws).push(g);
+    clearSelection();
+    render();
+    h.changed(ws);
+    return g;
+  }
+  /* ⇧⌘G: the groups of the selection, or of the window in front, come apart; their windows stay where they are. */
+  function ungroup(ws, ids) {
+    const take = new Set(ids && ids.length ? ids : [...selected]);
+    const list = groupsOf(ws), gone = list.filter((g) => g.ids.some((id) => take.has(id)));
+    if (!gone.length) return false;
+    gone.forEach((g) => list.splice(list.indexOf(g), 1));
+    clearSelection();
+    render();
+    h.changed(ws);
+    return true;
+  }
+
+  /* Shift-click on a title bar toggles that window in the selection, and takes the press so it does not start a drag. */
+  window.addEventListener('pointerdown', (e) => {
+    const ws = h.current();
+    if (!ws || e.button !== 0) return;
+    const win = e.target.closest && e.target.closest('.win');
+    if (e.shiftKey && win && e.target.closest('.tb') && !e.target.closest('[data-l], button, .rz')) {
+      e.preventDefault();
+      e.stopPropagation();
+      const id = win.dataset.id;
+      if (selected.has(id)) selected.delete(id); else selected.add(id);
+      paintSelection();
+      render();
+      return;
+    }
+    if (e.shiftKey && !win && e.target.closest('.ws') && !e.target.closest('.gframe, .away, #dock, .ov')) { marquee(e, ws); return; }
+    if (!win && !e.target.closest('.gframe, .ctx, #dock, .ov') && !e.shiftKey) clearSelection();
+  }, true);
+
+  /* Shift-drag on bare board: a box, and every window it touches joins the selection. */
+  function marquee(e, ws) {
+    e.preventDefault();
+    e.stopPropagation();
+    const c = h.canvas(ws);
+    if (!c) return;
+    const rb = document.createElement('div');
+    rb.className = 'gmarq';
+    document.body.appendChild(rb);
+    const sx = e.clientX, sy = e.clientY;
+    const draw = (x, y) => Object.assign(rb.style, { left: Math.min(sx, x) + 'px', top: Math.min(sy, y) + 'px', width: Math.abs(x - sx) + 'px', height: Math.abs(y - sy) + 'px' });
+    draw(sx, sy);
+    const move = (ev) => draw(ev.clientX, ev.clientY);
+    const up = (ev) => {
+      window.removeEventListener('pointermove', move, true);
+      window.removeEventListener('pointerup', up, true);
+      rb.remove();
+      const a = h.nav.toSpace(ws, Math.min(sx, ev.clientX), Math.min(sy, ev.clientY)), b = h.nav.toSpace(ws, Math.max(sx, ev.clientX), Math.max(sy, ev.clientY));
+      if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 4) return;
+      h.windows(ws).forEach((w) => {
+        const g = h.geo(w);
+        if (g.x < b.x && g.x + g.w > a.x && g.y < b.y && g.y + g.h > a.y) selected.add(w.id);
+      });
+      paintSelection();
+      render();
+    };
+    window.addEventListener('pointermove', move, true);
+    window.addEventListener('pointerup', up, true);
+  }
+
+  /* ⌘G and ⇧⌘G group and ungroup, the Mac and Figma keys, from wherever the keys are. A terminal's or a page's open find
+     bar keeps them as find next and find previous, their Mac meaning there. Esc clears the selection only from the board,
+     where it means nothing else. */
+  const finding = (t) => {
+    const win = t && t.closest && t.closest('.win');
+    const bar = win && win.querySelector('.fterm-find, .pfind');
+    return !!(bar && !bar.hidden && getComputedStyle(bar).display !== 'none');
+  };
+  document.addEventListener('keydown', (e) => {
+    const ws = h.current();
+    if (!ws) return;
+    if (e.metaKey && !e.altKey && !e.ctrlKey && e.key.toLowerCase() === 'g') {
+      if (finding(e.target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.shiftKey) ungroup(ws, selected.size ? [] : h.front(ws) ? [h.front(ws).id] : []);
+      else group(ws);
+      return;
+    }
+    if (e.key === 'Escape' && selected.size && !h.editing(e.target)) { clearSelection(); render(); return; }
+    // ⇧1, the zoom-to-fit key of Figma and Miro, only from the board: in a terminal, a note or a field it types "!"
+    if (e.shiftKey && !e.metaKey && !e.altKey && !e.ctrlKey && e.code === 'Digit1' && !h.editing(e.target)) {
+      e.preventDefault();
+      e.stopPropagation();
+      seeAll(ws);
+    }
+  }, true);
+
+  /* What a window's right-click menu adds: group the selection when it is selected with others, else rename and ungroup
+     when it is in a group. */
+  function menuItems(ws, w) {
+    const items = [];
+    if (selected.has(w.id) && selected.size >= 2) items.push({ label: 'group', hint: '⌘G', run: () => group(ws) });
+    const g = groupOf(ws, w.id);
+    if (g) {
+      items.push({ label: 'go to group', hint: 'click its name', run: () => h.frame(ws, box(ws, g)) });
+      items.push({ label: 'rename group', hint: '', run: () => rename(ws, g) });
+      items.push({ label: 'ungroup', hint: '⇧⌘G', run: () => ungroup(ws, [w.id]) });
+    }
+    return items;
+  }
+
+  return { render, group, ungroup, menuItems, seeAll, select: (ids) => { ids.forEach((id) => selected.add(id)); paintSelection(); render(); },
+    selected: () => [...selected], clear: () => { clearSelection(); render(); }, box: (ws, g) => box(ws, g) };
+}
+
+window.FlowGroups = { mount };
+})();
+
+
+
+
