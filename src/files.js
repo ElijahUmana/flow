@@ -146,3 +146,151 @@
   function has(ws, zoneId) {
     const zn = zoneId ? zoneOf(ws, zoneId) : null;
     if (zoneId && !zn) return false;
+    return placesOf(ws, zn).length > 0 || downloadsOf(ws, zn).length > 0;
+  }
+  /* The sidebar draws a space's files from these (add is its row maker; open, its open pages { w, i, url }; zoneId, the
+     sub-workspace's id, none for the main space). Folded places cost one row and no listing. A file open as a page is
+     marked on its own row, as an open saved page is: ↗, and × closes it; it gets no row in browser, so nothing shows
+     twice or moves when a file opens. */
+  function rows(ws, add, open, zoneId) {
+    if (!flow.files) return;
+    const zn = zoneId ? zoneOf(ws, zoneId) : null;
+    if (zoneId && !zn) return;
+    const zone = zn ? zn.id : '';
+    if (!zn) noteVmPlaces(ws);
+    if (!frame) {
+      frame = [];
+      queueMicrotask(() => {
+        shownDirs = frame;
+        frame = null;
+        sync();
+      });
+    }
+    const want = [];
+    const opened = new Map();
+    (open || []).forEach((p) => { const k = fileOfPage(p.url); if (k && !opened.has(k)) opened.set(k, `${p.w.id}|${p.i}`); });
+    const fileRow = (depth, host, p, label) => {
+      const act = idOf({ t: 'file', ws, zone, host, path: p });
+      const at = opened.get(keyOf(host, p));
+      add('files', depth, at ? '↗' : '', label, '', act, { drag: act, close: at || '' });
+    };
+    const tree = (host, dir, level) => {
+      const depth = Math.min(level, DEEPEST);
+      const L = listing(host, dir);
+      // A VM folder that could not be listed stays watched: the VM side retries and says when it is back.
+      if (L.ok || (host && L.ok === false)) want.push({ host, dir });
+      const names = L.entries.filter((e) => !e.name.startsWith('.'));
+      const list = L.all ? names : names.slice(0, SHOW);
+      list.forEach((e) => {
+        const p = join(L.path || dir, e.name);
+        if (e.kind !== 'dir') {
+          fileRow(depth, host, p, e.name);
+          return;
+        }
+        const key = inSpace(zn, keyOf(host, p));
+        const down = unfolded(ws, key);
+        const sub = down ? listing(host, p) : null;
+        const act = idOf({ t: 'dir', ws, zone, host, path: p, key });
+        add('files', depth, down ? '▾' : '▸', e.name, sub && sub.ok === false ? sub.error : '', act, { dim: !!(sub && sub.ok === false), drag: act });
+        if (down) tree(host, p, level + 1);
+      });
+      // Past SHOW names a click draws the rest; past what main lists (5000) the folder opens in Finder.
+      const more = names.length > list.length ? names.length - list.length : L.total - L.entries.length;
+      if (more > 0) add('files', depth, '', `${more} more`, '', idOf({ t: 'more', ws, zone, host, path: dir }), { dim: true });
+    };
+    placesOf(ws, zn).forEach((pl) => {
+      const key = inSpace(zn, keyOf(pl.host, pl.path));
+      const down = unfolded(ws, key);
+      const L = down ? listing(pl.host, pl.path) : null;
+      const meta = [pl.where, L && L.ok === false ? L.error : ''].filter(Boolean).join(' · ');
+      const act = idOf({ t: 'dir', ws, zone, host: pl.host, path: pl.path, key });
+      add('files', 0, down ? '▾' : '▸', pl.label, meta, act, { dim: !!(L && L.ok === false), drag: act });
+      if (down) tree(pl.host, pl.path, 1);
+    });
+    const dls = downloadsOf(ws, zn);
+    if (dls.length) {
+      checkDownloads(ws);
+      const key = inSpace(zn, 'downloads');
+      const down = unfolded(ws, key);
+      add('files', 0, down ? '▾' : '▸', 'downloads', dls.length, idOf({ t: 'dls', ws, zone, host: null, path: '', key }));
+      if (down) {
+        dls.forEach((d) => fileRow(1, null, d.file, baseName(d.file)));
+        [...new Set(dls.map((d) => d.file.slice(0, d.file.lastIndexOf('/')) || '/'))].forEach((dir) => want.push({ host: null, dir, downloads: true }));
+      }
+    }
+    frame.push(...want);
+  }
+
+  /* ---------- a sub-workspace's own folder, for its heading's "folder" item ---------- */
+  /* The folder in use there, as shown: its own, else the workspace's (on the VM as typed). */
+  function folderOf(ws, zoneId) {
+    const zn = zoneOf(ws, zoneId);
+    if (ws.host) return (zn && zn.hostFolder) || ws.hostFolder || '~';
+    return A.tilde(A.expand((zn && zn.folder) || ws.folder || '~'));
+  }
+  /* On a Mac workspace the Mac's folder picker chooses it; false when nothing was chosen, or on the VM, whose folders
+     the picker cannot browse (the item types one there: setFolder). */
+  async function pickFolder(ws, zoneId) {
+    const zn = zoneOf(ws, zoneId);
+    if (!zn || ws.host) return false;
+    const p = await flow.pickFolder(A.expand(zn.folder || ws.folder || '~'));
+    if (!p) return false;
+    zn.folder = A.tilde(p);
+    A.renderSidebar();
+    A.save();
+    return true;
+  }
+  /* A typed folder: on the VM as the VM's shells read it ('~/x', 'x' from the home folder, '/x'); on the Mac only
+     '~', '~/x' or '/x'. '' goes back to the workspace's folder. */
+  function setFolder(ws, zoneId, typed) {
+    const zn = zoneOf(ws, zoneId);
+    if (!zn || typeof typed !== 'string') return false;
+    const v = typed.trim();
+    if (!ws.host && v && !(v === '~' || v.startsWith('~/') || v.startsWith('/'))) return false;
+    const k = ws.host ? 'hostFolder' : 'folder';
+    if (v) zn[k] = v;
+    else delete zn[k];
+    A.renderSidebar();
+    A.save();
+    return true;
+  }
+
+  /* ---------- downloads: each finished one is kept in the workspace whose page downloaded it, in its space ---------- */
+  function downloaded(ws, d, zoneId) {
+    if (!ws || !d || d.state !== 'completed' || !d.file) return;
+    const list = ws.downloads || (ws.downloads = []);
+    const i = list.findIndex((x) => x.file === d.file);
+    // main reports the same download again without the page's space (download:done after the page's onDownload): it keeps
+    // the space it was given
+    const zone = zoneId || (i >= 0 ? list[i].zone : '');
+    if (i >= 0) list.splice(i, 1);
+    list.unshift({ file: d.file, url: d.url || '', at: Date.now(), ...(zone ? { zone } : {}) });
+    checked.set(ws, list.map((x) => x.file).join('\n'));
+    A.renderSidebar();
+    A.save();
+  }
+  /* A download moved or trashed in Finder leaves the list. Checked when the list changes or the window comes back. */
+  const checked = new WeakMap();   // ws -> the downloads it was checked with
+  function checkDownloads(ws) {
+    const sig = ws.downloads.map((x) => x.file).join('\n');
+    if (checked.get(ws) === sig) return;
+    checked.set(ws, sig);
+    const files = ws.downloads.map((x) => x.file);
+    flow.files.exist(files).then((there) => {
+      const gone = new Set(files.filter((_f, i) => !there[i]));
+      if (!gone.size) return;
+      ws.downloads = (ws.downloads || []).filter((x) => !gone.has(x.file));
+      checked.set(ws, ws.downloads.map((x) => x.file).join('\n'));
+      A.renderSidebar();
+      A.save();
+    }, (e) => {
+      checked.delete(ws);
+      console.error(`files: could not check the downloads of ${ws.name}`, e);
+    });
+  }
+
+  /* ---------- watching: the folders shown in the sidebar, while it shows them ---------- */
+  let watching = '[[],[]]', syncing = false;
+  function syncSoon() {
+    if (syncing) return;
+    syncing = true;
