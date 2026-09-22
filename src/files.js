@@ -294,3 +294,149 @@
   function syncSoon() {
     if (syncing) return;
     syncing = true;
+    queueMicrotask(() => { syncing = false; sync(); });
+  }
+  /* The files a page tab shows in the space on screen (on this Mac or the VM): main re-renders such a tab when its file
+     changes. Not a pdf: its viewer would start again at the first page. */
+  const PDF_RE = /\.pdf$/i;
+  function shownFiles() {
+    const ws = A.WS[A.cur];
+    if (document.hidden || !ws) return [];
+    const zone = new URLSearchParams(location.hash.slice(1)).get('zone');
+    const at = zone || (ws.at && (ws.zones || []).some((z) => z.id === ws.at) ? ws.at : null);
+    const out = [];
+    ws.windows.forEach((w) => {
+      if (w.type !== 'page' || (w.zone || null) !== at) return;
+      const tabs = Array.isArray(w.tabs) && w.tabs.length ? w.tabs : null;
+      const n = tabs ? null : ws.notes.find((x) => x.id === w.noteId);
+      const k = fileOfPage(tabs ? (tabs[w.tab] || tabs[0]).url : n && n.url);
+      const [host, file] = k ? k.split('\n') : [];
+      if (k && !PDF_RE.test(file) && !out.some((x) => x.file === file && x.host === (host || null))) out.push({ host: host || null, file });
+    });
+    return out;
+  }
+  function sync() {
+    const { sb, sblist, q } = A.els;
+    const onScreen = !document.hidden && !sb.classList.contains('hide') && !q.value.trim() && !!sblist.querySelector('.tr[data-act^="files|"]');
+    const dirs = onScreen ? shownDirs.map((d) => ({ host: d.host, dir: d.dir })) : [];
+    const files = shownFiles();
+    const next = JSON.stringify([dirs, files]);
+    if (next === watching) return;
+    // A folder no longer watched may change unseen: it is listed again the next time it shows.
+    const kept = new Set(dirs.map((d) => keyOf(d.host, d.dir)));
+    JSON.parse(watching)[0].forEach((d) => {
+      const L = listings.get(keyOf(d.host, d.dir));
+      if (L && !kept.has(keyOf(d.host, d.dir))) L.stale = true;
+    });
+    watching = next;
+    flow.files.watch([...dirs, ...files]);
+    dirs.forEach((d) => {
+      const L = listings.get(keyOf(d.host, d.dir));
+      if (L && L.stale && !L.loading) load(d.host, d.dir, L);
+    });
+  }
+  function changed({ host, dir }) {
+    const L = listings.get(keyOf(host, dir));
+    if (L) {
+      L.stale = true;
+      if (!L.loading) load(host, dir, L);
+    }
+    if (!host && shownDirs.some((d) => d.downloads && d.dir === dir)) {
+      const ws = A.WS[A.cur];
+      if (ws) checked.delete(ws);
+      A.renderSidebar();
+    }
+  }
+
+  /* ---------- what a row does ---------- */
+  async function openFile(ws, n, at) {
+    const name = baseName(n.path);
+    let r;
+    try {
+      r = await flow.files.open(n.host, n.path);
+    } catch (e) {
+      console.error(`files: could not open ${n.path}`, e);
+      A.toast(`could not open ${name}`, 4000);
+      return;
+    }
+    if (r && r.url) A.openUrl(ws, r.url, at);
+    else if (r && r.error) A.toast(`${name}: ${r.error}`, 4000);
+  }
+  function perform(ws, act) {
+    const n = nodeOf(act);
+    if (!n) return;
+    if (n.t === 'dir') toggle(ws, n.key);
+    else if (n.t === 'dls') toggle(ws, n.key);
+    else if (n.t === 'file') openFile(ws, n);
+    else if (n.t === 'more') {
+      const L = listings.get(keyOf(n.host, n.path));
+      if (L && !L.all && L.entries.filter((e) => !e.name.startsWith('.')).length > SHOW) {
+        L.all = true;
+        A.renderSidebar();
+      } else if (!n.host) {
+        flow.files.reveal(n.path);
+      }
+    }
+  }
+  /* Right-click: only "show in Finder", which hands every other file action to Finder. */
+  function menu(ws, act) {
+    const n = nodeOf(act);
+    if (!n || n.host || (n.t !== 'dir' && n.t !== 'file')) return [];
+    return [{ label: flow.platform === 'darwin' ? 'show in Finder' : 'show in its folder', hint: '', run: () => flow.files.reveal(n.path) }];
+  }
+  /* A row dragged onto a terminal types its path there (term.js; vmfiles carries it to the other machine); onto a
+     note, the path as text. A VM folder asked for as '~' is dragged as the path its listing gave, since a quoted '~'
+     does not expand. */
+  function dragStart(e, act) {
+    const n = nodeOf(act);
+    if (!n || (n.t !== 'dir' && n.t !== 'file')) {
+      e.preventDefault();
+      return;
+    }
+    const own = n.host ? listings.get(keyOf(n.host, n.path)) : null;
+    const p = own && own.ok ? own.path : n.path;
+    carried = { ...n, path: p };
+    e.dataTransfer.setData('application/x-flow-files', JSON.stringify([{ host: n.host || null, path: p }]));
+    e.dataTransfer.setData('text/plain', p);
+    e.dataTransfer.effectAllowed = 'copy';
+  }
+  function dragEnd() { carried = null; }
+  const dragging = () => carried;
+  /* A file dropped on bare board opens once, at the final world point captured after edge-pan. Directories still drag to
+     terminals, but a board drop does nothing: it never starts a transfer or creates a duplicate page. */
+  function dropOnBoard(ws, at) {
+    const n = carried;
+    carried = null;
+    if (!n || n.t !== 'file') return false;
+    openFile(ws, n, at);
+    return true;
+  }
+
+  /* app: { WS, cur, els: { sb, sblist, q }, save, renderSidebar, toast, expand, tilde, openUrl(ws, url) }. */
+  function mount(app) {
+    A = app;
+    if (!flow || !flow.files) {
+      console.error('files: window.flow.files is missing, so the sidebar shows no files (main.js and preload.js register it)');
+      return;
+    }
+    flow.files.onChanged(changed);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        const ws = A.WS[A.cur];
+        if (ws) checked.delete(ws);
+      }
+      sync();
+    });
+    new MutationObserver(syncSoon).observe(A.els.sb, { attributes: true, attributeFilter: ['class'] });
+    A.els.q.addEventListener('input', syncSoon);
+    // a VM folder that says it is not reachable lists again as soon as the Mac's network or Flow's window is back
+    window.addEventListener('online', () => flow.files.retry && flow.files.retry());
+    window.addEventListener('focus', () => flow.files.retry && flow.files.retry());
+  }
+
+  window.FlowFiles = { mount, rows, has, perform, menu, dragStart, dragEnd, dragging, dropOnBoard, downloaded, folderOf, pickFolder, setFolder };
+})();
+
+
+
+
