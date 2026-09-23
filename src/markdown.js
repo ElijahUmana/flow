@@ -217,3 +217,221 @@ function render(source, o) {
     for (let k = 0; k < 8 && s.includes('\uE000'); k++) s = s.replace(/\uE000(\d+)\uE001/g, (_, n) => held[+n]);
     return s;
   }
+
+  function links(s, hold, held) {
+    let outS = '';
+    let k = 0;
+    while (k < s.length) {
+      const img = s[k] === '!' && s[k + 1] === '[';
+      if (s[k] !== '[' && !img) { outS += s[k++]; continue; }
+      const open = img ? k + 1 : k;
+      // the matching ]
+      let depth = 0, end = -1;
+      for (let j = open; j < s.length; j++) {
+        if (s[j] === '[') depth++;
+        else if (s[j] === ']' && --depth === 0) { end = j; break; }
+      }
+      if (end < 0) { outS += s[k++]; continue; }
+      const label = s.slice(open + 1, end);
+      let dest = null, title = '', after = end + 1;
+      if (s[end + 1] === '(') {
+        const r = destination(s, end + 2);
+        if (r) { dest = r.href; title = r.title; after = r.end; }
+      }
+      if (dest === null) {
+        let ref = label;
+        if (s[end + 1] === '[') {
+          const close = s.indexOf(']', end + 2);
+          if (close > 0) { const r2 = s.slice(end + 2, close); if (r2.trim()) ref = r2; after = close + 1; }
+        }
+        const d = defs.get(norm(ref.replace(/\uE000\d+\uE001/g, '')));
+        if (d) { dest = d.href; title = d.title; } else after = end + 1;
+      }
+      if (dest === null) { outS += s[k++]; continue; }
+      const t = title ? ` title="${esc(title)}"` : '';
+      if (img) {
+        const src = image(dest);
+        const alt = label.replace(/\uE000\d+\uE001/g, '');
+        outS += src ? hold(`<img src="${esc(src)}" alt="${esc(alt)}"${t}>`) : hold(esc(alt));
+      } else {
+        const href = link(dest);
+        const inner = inline(label, held);
+        outS += href ? hold(`<a href="${esc(href)}"${t}>${inner}</a>`) : hold(inner);
+      }
+      k = after;
+    }
+    return outS;
+  }
+  /* (dest "title") from just after the "(": { href, title, end } or null. */
+  function destination(s, k) {
+    while (s[k] === ' ' || s[k] === '\n') k++;
+    let href = '';
+    if (s[k] === '<') {
+      const close = s.indexOf('>', k);
+      if (close < 0) return null;
+      href = s.slice(k + 1, close);
+      k = close + 1;
+    } else {
+      let depth = 0;
+      while (k < s.length && !/[\s]/.test(s[k])) {
+        if (s[k] === '(') depth++;
+        else if (s[k] === ')') { if (depth === 0) break; depth--; }
+        href += s[k++];
+      }
+    }
+    while (s[k] === ' ' || s[k] === '\n') k++;
+    let title = '';
+    if (s[k] === '"' || s[k] === "'" || s[k] === '(') {
+      const q = s[k] === '(' ? ')' : s[k];
+      const close = s.indexOf(q, k + 1);
+      if (close < 0) return null;
+      title = s.slice(k + 1, close);
+      k = close + 1;
+      while (s[k] === ' ' || s[k] === '\n') k++;
+    }
+    if (s[k] !== ')') return null;
+    return { href: href.replace(/\uE000(\d+)\uE001/g, ''), title, end: k + 1 };
+  }
+
+  /* ---------- blocks ---------- */
+  function blocks(ls, tight) {
+    const html = [];
+    let i = 0;
+    const para = (body) => html.push(tight ? inline(body) : `<p>${inline(body)}</p>`);
+    while (i < ls.length) {
+      const line = ls[i];
+      if (line === '\u0000def' || isBlank(line)) { i++; continue; }
+      let m;
+      if ((m = FENCE.exec(line))) {
+        const ind = m[1].length, fence = m[2], info = m[3].trim().split(/\s+/)[0];
+        const body = [];
+        i++;
+        while (i < ls.length) {
+          const c = FENCE.exec(ls[i]);
+          if (c && c[2][0] === fence[0] && c[2].length >= fence.length && !c[3]) { i++; break; }
+          body.push(dedent(ls[i], ind));
+          i++;
+        }
+        html.push(`<pre><code${info ? ` data-lang="${esc(info)}"` : ''}>${esc(body.join('\n'))}${body.length ? '\n' : ''}</code></pre>`);
+        continue;
+      }
+      if ((m = ATX.exec(line))) {
+        const n = m[1].length, inner = inline(m[2] || '');
+        html.push(`<h${n} id="${esc(slug(inner))}">${inner}</h${n}>`);
+        i++;
+        continue;
+      }
+      if (HR.test(line)) { html.push('<hr>'); i++; continue; }
+      if (QUOTE.test(line)) {
+        const inner = [];
+        while (i < ls.length && !isBlank(ls[i])) {
+          const q = /^ {0,3}> ?(.*)$/.exec(ls[i]);
+          if (q) inner.push(q[1]);
+          else if (inner.length && !interrupts(ls, i)) inner.push(ls[i]);
+          else break;
+          i++;
+        }
+        html.push(`<blockquote>${blocks(inner, false)}</blockquote>`);
+        continue;
+      }
+      if (itemStart(line)) { i = list(ls, i, html); continue; }
+      if (htmlBlockStart(line) || lonelyTag(line)) {
+        const body = [];
+        while (i < ls.length && !isBlank(ls[i])) body.push(ls[i++]);
+        html.push(inline(body.join('\n')));
+        continue;
+      }
+      if (tableStart(ls, i)) { i = table(ls, i, html); continue; }
+      if (indentOf(line) >= 4) {
+        const body = [];
+        while (i < ls.length && (indentOf(ls[i]) >= 4 || isBlank(ls[i]))) body.push(dedent(ls[i++], 4));
+        while (body.length && isBlank(body[body.length - 1])) body.pop();
+        html.push(`<pre><code>${esc(body.join('\n'))}\n</code></pre>`);
+        continue;
+      }
+      // a paragraph, or a setext heading; a line keeps its trailing spaces (two make a hard break) until the end
+      const body = [line.replace(/^[ \t]+/, '')];
+      i++;
+      let setext = 0;
+      while (i < ls.length && !isBlank(ls[i]) && ls[i] !== '\u0000def') {
+        const st = SETEXT.exec(ls[i]);
+        if (st) { setext = st[1][0] === '=' ? 1 : 2; i++; break; }
+        if (interrupts(ls, i)) break;
+        body.push(ls[i].replace(/^[ \t]+/, ''));
+        i++;
+      }
+      const text = body.join('\n').replace(/[ \t]+$/, '');
+      if (setext) {
+        const inner = inline(text);
+        html.push(`<h${setext} id="${esc(slug(inner))}">${inner}</h${setext}>`);
+      } else {
+        para(text);
+      }
+    }
+    return html.join('\n');
+  }
+
+  function list(ls, i, html) {
+    const first = itemStart(ls[i]);
+    const items = [];
+    let loose = false;
+    while (i < ls.length) {
+      const s = itemStart(ls[i]);
+      if (!s || s.ordered !== first.ordered || s.marker !== first.marker) break;
+      const body = [s.rest];
+      i++;
+      let blank = false;
+      while (i < ls.length) {
+        const l = ls[i];
+        if (isBlank(l)) { body.push(''); blank = true; i++; continue; }
+        if (indentOf(l) >= s.indent) { body.push(dedent(l, s.indent)); blank = false; i++; continue; }
+        if (blank || itemStart(l) || interrupts(ls, i)) break;
+        body.push(l.replace(/^[ \t]+/, ''));
+        i++;
+      }
+      let trailing = 0;
+      while (body.length && isBlank(body[body.length - 1])) { body.pop(); trailing++; }
+      if (body.slice(0, -1).some((x, n) => isBlank(x) && !isBlank(body[n + 1] || ''))) loose = true;
+      items.push(body);
+      if (trailing && i < ls.length && itemStart(ls[i]) && itemStart(ls[i]).ordered === first.ordered && itemStart(ls[i]).marker === first.marker) loose = true;
+    }
+    const tag = first.ordered ? 'ol' : 'ul';
+    const start = first.ordered && first.start !== 1 ? ` start="${first.start}"` : '';
+    html.push(`<${tag}${start}>`);
+    for (const body of items) {
+      const task = /^\[([ xX])\][ \t]+/.exec(body[0] || '');
+      if (task) body[0] = body[0].slice(task[0].length);
+      const inner = blocks(body, !loose);
+      // A task's box goes at the start of its text: inside the first paragraph when the list is loose, as GitHub does.
+      const box = task ? `<input type="checkbox" disabled${task[1] === ' ' ? '' : ' checked'}> ` : '';
+      html.push(task ? `<li class="task">${inner.startsWith('<p>') ? `<p>${box}${inner.slice(3)}` : box + inner}</li>` : `<li>${inner}</li>`);
+    }
+    html.push(`</${tag}>`);
+    return i;
+  }
+
+  function table(ls, i, html) {
+    const head = splitRow(ls[i]);
+    const align = splitRow(ls[i + 1]).map((c) => (/^:-+:$/.test(c) ? 'center' : /^-+:$/.test(c) ? 'right' : /^:-+$/.test(c) ? 'left' : ''));
+    const cell = (tag, c, n) => `<${tag}${align[n] ? ` style="text-align:${align[n]}"` : ''}>${inline(c)}</${tag}>`;
+    const rows = [`<thead><tr>${head.map((c, n) => cell('th', c, n)).join('')}</tr></thead>`, '<tbody>'];
+    i += 2;
+    while (i < ls.length && !isBlank(ls[i]) && ls[i].includes('|') && !FENCE.test(ls[i]) && !ATX.test(ls[i])) {
+      const cells = splitRow(ls[i]);
+      rows.push(`<tr>${head.map((_, n) => cell('td', cells[n] || '', n)).join('')}</tr>`);
+      i++;
+    }
+    rows.push('</tbody>');
+    html.push(`<table>${rows.join('')}</table>`);
+    return i;
+  }
+
+  out.push(blocks(lines, false));
+  return out.join('\n');
+}
+
+module.exports = { render };
+
+
+
+
