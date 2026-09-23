@@ -388,3 +388,198 @@ function textMap(root) {
   const text = parts.join('');
   const lower = text.toLowerCase();
   return { text, lower: lower.length === text.length ? lower : '', nodes, runStart, runNode, runOff };
+}
+
+// Text node and offset of character i of the map's text.
+function spot(map, i) {
+  let lo = 0;
+  let hi = map.runStart.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (map.runStart[mid] <= i) lo = mid;
+    else hi = mid - 1;
+  }
+  return [map.nodes[map.runNode[lo]], map.runOff[lo] + (i - map.runStart[lo])];
+}
+
+function locate(map, quote) {
+  const needle = String(quote || '').replace(/\s+/g, '');
+  if (needle.length < 2) return null;
+  let i = map.text.indexOf(needle);
+  if (i < 0 && map.lower) {
+    // text-transform shows a page's words in other case than its DOM has them
+    const low = needle.toLowerCase();
+    if (low.length === needle.length) i = map.lower.indexOf(low);
+  }
+  if (i < 0) return null;
+  const [sn, so] = spot(map, i);
+  const [en, eo] = spot(map, i + needle.length - 1);
+  const r = document.createRange();
+  r.setStart(sn, so);
+  r.setEnd(en, eo + 1);
+  return r;
+}
+
+// The host draws ↗ only beside the quotes the page has (notes), so it hears which ones each time that changes.
+const tellFound = () => ipcRenderer.sendToHost('flow:marks-found', marks.map((m) => m.text));
+
+function show() {
+  if (marks.length) {
+    markStyle();
+    CSS.highlights.set(MARK, new Highlight(...marks.map((m) => m.range)));
+  } else CSS.highlights.delete(MARK);
+}
+
+function paint() {
+  const map = textMap(document.body || document.documentElement);
+  marks = [];
+  for (const q of wanted) {
+    const r = locate(map, q.text);
+    if (r) marks.push({ text: q.text, range: r });
+  }
+  show();
+  tellFound();
+  if (marks.length < wanted.length && Date.now() < watchUntil) watch();
+  else unwatch();
+}
+
+// A quote still missing is looked for only in what the page added or changed since the last look (at most every
+// 400 ms): a page that changes all the time costs what it changes, not a walk of everything.
+function watch() {
+  if (watcher) return;
+  changed = new Set();
+  watcher = new MutationObserver((records) => {
+    for (const rec of records) {
+      if (rec.type === 'characterData') changed.add(rec.target.parentNode);
+      else for (const n of rec.addedNodes) changed.add(n.nodeType === 3 ? n.parentNode : n);
+    }
+    if (!rescan && changed.size) rescan = setTimeout(lookAgain, 400);
+  });
+  watcher.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+}
+function unwatch() {
+  if (!watcher) return;
+  watcher.disconnect();
+  watcher = null;
+  clearTimeout(rescan);
+  rescan = 0;
+  changed = new Set();
+}
+function lookAgain() {
+  rescan = 0;
+  if (Date.now() >= watchUntil) {
+    unwatch();
+    return;
+  }
+  const roots = [...changed].filter((n) => n && n.isConnected && n.nodeType === 1);
+  changed = new Set();
+  // Many changes at once: one walk of the page costs less than sorting them out.
+  const outer = roots.length > 300 ? [document.body || document.documentElement] : roots.filter((n) => !roots.some((o) => o !== n && o.contains(n)));
+  let found = false;
+  for (const root of outer) {
+    const missing = wanted.filter((q) => !marks.some((m) => m.text === q.text));
+    if (!missing.length) break;
+    const map = textMap(root);
+    if (!map.text) continue;
+    for (const q of missing) {
+      const r = locate(map, q.text);
+      if (r) {
+        marks.push({ text: q.text, range: r });
+        found = true;
+      }
+    }
+  }
+  if (found) {
+    show();
+    tellFound();
+  }
+  if (marks.length >= wanted.length) unwatch();
+}
+
+function markAt(x, y) {
+  const p = document.caretPositionFromPoint(x, y);
+  if (!p || !p.offsetNode) return null;
+  for (const m of marks) {
+    if (!m.range.isPointInRange(p.offsetNode, p.offset)) continue;
+    // The caret position is the nearest one: the pointer must also be over the mark's own text.
+    for (const r of m.range.getClientRects()) if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return m;
+  }
+  return null;
+}
+
+ipcRenderer.on('flow:marks', (_event, list) => {
+  wanted = (Array.isArray(list) ? list : []).filter((m) => m && typeof m.text === 'string' && m.text.trim());
+  watchUntil = Date.now() + 15000;
+  hovered = null;
+  unwatch();
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', paint, { once: true });
+  else paint();
+});
+
+ipcRenderer.on('flow:find-quote', (_event, { id, text }) => {
+  const m = marks.find((x) => x.text === text);
+  const range = m ? m.range : locate(textMap(document.body || document.documentElement), text);
+  if (!range) {
+    ipcRenderer.sendToHost('flow:find-quote', { id, found: false });
+    return;
+  }
+  const el = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
+  placeStopped = true;
+  if (el) el.scrollIntoView({ block: 'center' });
+  markStyle();
+  CSS.highlights.set(FLASH, new Highlight(range));
+  setTimeout(() => CSS.highlights.delete(FLASH), 1200);
+  ipcRenderer.sendToHost('flow:find-quote', { id, found: true });
+});
+
+let hoverFrame = 0;
+window.addEventListener('mousemove', (e) => {
+  if (!marks.length || hoverFrame) return;
+  const x = e.clientX;
+  const y = e.clientY;
+  hoverFrame = requestAnimationFrame(() => {
+    hoverFrame = 0;
+    const m = markAt(x, y);
+    if (m === hovered) return;
+    hovered = m;
+    if (!m) {
+      ipcRenderer.sendToHost('flow:mark-hover', null);
+      return;
+    }
+    const b = m.range.getBoundingClientRect();
+    ipcRenderer.sendToHost('flow:mark-hover', { text: m.text, x: b.left, y: b.top, w: b.width, h: b.height });
+  });
+}, { capture: true, passive: true });
+
+window.addEventListener('mouseout', (e) => {
+  if (e.relatedTarget || !hovered) return;
+  hovered = null;
+  ipcRenderer.sendToHost('flow:mark-hover', null);
+}, { capture: true, passive: true });
+
+window.addEventListener('click', (e) => {
+  if (!marks.length || !e.isTrusted || e.button !== 0 || !getSelection().isCollapsed) return;
+  const m = markAt(e.clientX, e.clientY);
+  if (m) ipcRenderer.sendToHost('flow:mark-click', { text: m.text });
+}, { capture: true, passive: true });
+
+// A page brought back (back or forward, a reload, a tab after a restart) gets its old scroll offset from Chromium, again
+// once it has loaded. A web font that arrives after that still moved the text: scroll anchoring kept in view what the
+// fallback font had at that offset (rfc9110 came back 101 px off, another paragraph at the top). So the page keeps the
+// offset, with no scroll anchoring, until the owner scrolls, types or clicks there, or 10 s after it loaded.
+const arrival = performance.getEntriesByType('navigation')[0]?.type;
+if (arrival === 'back_forward' || arrival === 'reload') {
+  const INPUT = ['wheel', 'keydown', 'pointerdown', 'touchstart'];
+  const key = webFrame.insertCSS('html{overflow-anchor:none !important}');
+  let timer = 0;
+  let on = true;
+  const anchorAgain = () => {
+    if (!on) return;
+    on = false;
+    clearTimeout(timer);
+    for (const type of INPUT) window.removeEventListener(type, anchorAgain, true);
+    webFrame.removeInsertedCSS(key);
+  };
+  for (const type of INPUT) window.addEventListener(type, anchorAgain, { capture: true, passive: true });
+  window.addEventListener('load', () => { timer = setTimeout(anchorAgain, 10000); }, { once: true });
+}
