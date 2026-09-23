@@ -583,3 +583,197 @@ if (arrival === 'back_forward' || arrival === 'reload') {
   for (const type of INPUT) window.addEventListener(type, anchorAgain, { capture: true, passive: true });
   window.addEventListener('load', () => { timer = setTimeout(anchorAgain, 10000); }, { once: true });
 }
+
+// A page that moves itself before the owner has done anything in it (location.replace or assign, a meta refresh, a form
+// that submits itself, an SPA's pushState or replaceState to another path) tells the host 'flow:moved-self' { from, to,
+// same }, so a name or note kept under the old address can follow it (page.js onRedirect). Reload, back and forward
+// never count, nor a change of the hash alone, nor any move once the page has had a press, a key, a wheel or a touch.
+let usedYet = false;
+for (const type of ['pointerdown', 'keydown', 'wheel', 'touchstart']) {
+  window.addEventListener(type, (e) => { if (e.isTrusted) usedYet = true; }, { capture: true, passive: true });
+}
+navigation.addEventListener('navigate', (e) => {
+  if (!e.isTrusted || e.userInitiated || usedYet || navigator.userActivation.hasBeenActive) return;
+  if ((e.navigationType !== 'push' && e.navigationType !== 'replace') || e.hashChange || e.downloadRequest !== null) return;
+  const from = location.href;
+  const to = e.destination.url;
+  if (to === from) return;
+  if (!e.destination.sameDocument) {
+    setTimeout(() => { if (!e.defaultPrevented) ipcRenderer.sendToHost('flow:moved-self', { from, to, same: false }); }, 0);
+    return;
+  }
+  if (new URL(to).pathname === location.pathname) return;
+  navigation.addEventListener('currententrychange', () => {
+    if (location.href === to) ipcRenderer.sendToHost('flow:moved-self', { from, to, same: true });
+  }, { once: true });
+});
+
+// Whether the page has a selection, so page.js shows ✂ only then: 'flow:selection' true or false to the host, each
+// time that changes. Text selected in a text field counts, as the clip reads it; a selection inside a frame or a PDF
+// does not reach here (Clip to Note in the right-click menu clips it).
+let selected = false;
+let selFrame = 0;
+document.addEventListener('selectionchange', () => {
+  if (selFrame) return;
+  selFrame = requestAnimationFrame(() => {
+    selFrame = 0;
+    const a = document.activeElement;
+    const s = getSelection();
+    const field = !!a && (a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' && /^(text|search|url|tel)$/i.test(a.type)));
+    const now = (!!s && !s.isCollapsed) || (field && a.selectionEnd > a.selectionStart);
+    if (now === selected) return;
+    selected = now;
+    ipcRenderer.sendToHost('flow:selection', now);
+  });
+}, { capture: true, passive: true });
+
+// At quit page.js keeps where this page is scrolled (Chromium records a scroll in the page's history only about a
+// second after it ends) and gives it back after a restart: the page goes there once loaded, unless the owner has done
+// anything in it by then or the page restores its own scroll (history.scrollRestoration 'manual'). Item 16's rule
+// above then keeps it there while late fonts come in.
+// A page that scrolls inside boxes of its own (an editor, a board and its columns, a sheet's scrollbars beside its
+// canvas) keeps those places too: the boxes it has scrolled, which a scroll listener in the capture phase sees, and the
+// scrolled boxes around the middle of the view; at most four, the largest first. The main one, the scrollable box
+// around the middle of the view, also keeps the text at its top edge, which finds the place again when what is above
+// it arrives late or changes. A box is found again by its id, or by its tag and classes and its place among the
+// elements that match them.
+const scrolledBoxes = new Set();
+document.addEventListener('scroll', (e) => { if (e.target instanceof Element) scrolledBoxes.add(e.target); }, { capture: true, passive: true });
+const away = (e) => e.scrollTop > 0 || e.scrollLeft > 0;
+const scrollRange = (e) => e.scrollHeight - e.clientHeight + e.scrollWidth - e.clientWidth;
+function mainScroller() {
+  for (let e = document.elementFromPoint(innerWidth / 2, innerHeight / 2); e && e !== document.body && e !== document.documentElement; e = e.parentElement) {
+    if (e.clientHeight < innerHeight * 0.4 || (e.scrollHeight <= e.clientHeight + 1 && e.scrollWidth <= e.clientWidth + 1)) continue;
+    const s = getComputedStyle(e);
+    if (/auto|scroll|overlay/.test(s.overflowY) || /auto|scroll|overlay/.test(s.overflowX)) return e;
+  }
+  return null;
+}
+const flatText = (s) => s.replace(/\s+/g, ' ').trim();
+// The words of the element at the box's top edge, its own (a box of other elements there, a board of cards, has
+// none of its own and is passed over), so lineIn finds them again as they are.
+function topLine(box) {
+  const r = box.getBoundingClientRect();
+  for (let dy = 2; dy < Math.min(r.height, 240); dy += 10) {
+    const e = document.elementFromPoint(r.left + r.width / 2, r.top + dy);
+    if (!e || e === box || !box.contains(e)) continue;
+    const own = [...e.childNodes].find((n) => n.nodeType === Node.TEXT_NODE && flatText(n.data).length >= 8);
+    if (own) return { text: flatText(own.data).slice(0, 80), off: Math.round(e.getBoundingClientRect().top - r.top) };
+  }
+  return null;
+}
+// The element in a box whose own words start with a kept top line, if the page has it now.
+function lineIn(box, text) {
+  const walk = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
+  for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+    if (flatText(n.data).startsWith(text)) return n.parentElement;
+  }
+  return null;
+}
+function boxKey(e) {
+  if (e.id && document.querySelectorAll(`#${CSS.escape(e.id)}`).length === 1) return { sel: `#${CSS.escape(e.id)}`, nth: 0 };
+  const sel = e.tagName.toLowerCase() + [...e.classList].slice(0, 3).map((c) => `.${CSS.escape(c)}`).join('');
+  return { sel, nth: [...document.querySelectorAll(sel)].indexOf(e) };
+}
+function boxPlaces() {
+  const main = mainScroller();
+  const boxes = [...scrolledBoxes].filter((e) => e.isConnected && away(e));
+  for (let e = document.elementFromPoint(innerWidth / 2, innerHeight / 2); e && e !== document.body && e !== document.documentElement; e = e.parentElement) {
+    if (away(e) && !boxes.includes(e)) boxes.push(e);
+  }
+  return boxes.sort((a, b) => scrollRange(b) - scrollRange(a)).slice(0, 4)
+    .map((e) => ({ ...boxKey(e), top: Math.round(e.scrollTop), left: Math.round(e.scrollLeft), ...(e === main ? topLine(e) || {} : {}) }));
+}
+// The owner went somewhere in the page through Flow (a find, a quote from notes): a place still being put back stops.
+let placeStopped = false;
+ipcRenderer.on('flow:stop-restore', () => { placeStopped = true; });
+// One box per task, with a pause: a sheet keeps only one of its two scrollbars when both are set in the same task.
+// Each waits (up to 10 s in all) until its box is there and long enough for its place, or its kept line is there. Then
+// it is held: put back when it moves without the owner, until those 10 s are up or 5 s after the last box is placed:
+// a page that sets its own place once its data is in (Notion, about a second after it shows) would take it away
+// again. A box placed by its offsets moves to its kept line when that arrives.
+function placeBoxes(list) {
+  const end = Date.now() + 10000;
+  const left = list.slice();
+  const held = [];
+  let holdUntil = end;
+  const byOffsets = new Set();
+  const find = (at) => document.querySelectorAll(at.sel)[at.nth];
+  // Puts a box at its place (its kept line when the page has it, else its offsets); false when it is there already or
+  // cannot move any nearer (its page is shorter now). One whose kept line is not there yet goes by its offsets once and
+  // is not held there: what arrives above it meanwhile moves it on purpose (scroll anchoring).
+  const put = (at, e) => {
+    const line = at.text ? lineIn(e, at.text) : null;
+    if (at.text && !line) {
+      if (byOffsets.has(at)) return false;
+      byOffsets.add(at);
+    }
+    const dy = line ? line.getBoundingClientRect().top - e.getBoundingClientRect().top - at.off : at.top - e.scrollTop;
+    if (Math.abs(dy) <= 2 && Math.abs(at.left - e.scrollLeft) <= 2) return false;
+    const top = e.scrollTop;
+    const x = e.scrollLeft;
+    e.scrollTop += dy;
+    e.scrollLeft = at.left;
+    return e.scrollTop !== top || e.scrollLeft !== x;
+  };
+  const step = () => {
+    if (usedYet || placeStopped || navigator.userActivation.hasBeenActive) return;
+    for (const at of held) {
+      const e = find(at);
+      if (e && put(at, e)) {
+        setTimeout(step, 100);
+        return;
+      }
+    }
+    const at = left[0];
+    const e = at && Date.now() <= end ? find(at) : null;
+    if (e && ((at.text && lineIn(e, at.text)) || (e.scrollHeight - e.clientHeight >= at.top - 1 && e.scrollWidth - e.clientWidth >= at.left - 1))) {
+      put(at, e);
+      held.push(left.shift());
+      holdUntil = Math.max(holdUntil, Date.now() + 5000);
+      setTimeout(step, 100);
+      return;
+    }
+    if (Date.now() < holdUntil) setTimeout(step, 250);
+  };
+  step();
+}
+// A PDF: page.js has main set its viewer up (thumbnails closed, a place kept from before a restart).
+window.addEventListener('DOMContentLoaded', () => {
+  if (document.contentType === 'application/pdf') ipcRenderer.sendToHost('flow:pdf');
+}, { once: true });
+ipcRenderer.on('flow:scroll-now', (_event, id) => ipcRenderer.sendToHost('flow:scroll-now', { id, x: scrollX, y: scrollY, boxes: boxPlaces() }));
+// The same place, sent by the page itself 150 ms after any scroll in it comes to rest ('flow:scrolled' { x, y, boxes }):
+// a quit whose read above comes too late for page.js (a busy renderer) still has where the owner left the page.
+let restTimer = 0;
+document.addEventListener('scroll', () => {
+  clearTimeout(restTimer);
+  restTimer = setTimeout(() => ipcRenderer.sendToHost('flow:scrolled', { x: scrollX, y: scrollY, boxes: boxPlaces() }), 150);
+}, { capture: true, passive: true });
+ipcRenderer.on('flow:restore-scroll', (_event, at) => {
+  if (!at || !Number.isFinite(at.x) || !Number.isFinite(at.y)) return;
+  const go = () => requestAnimationFrame(() => {
+    if (usedYet || placeStopped || navigator.userActivation.hasBeenActive) return;
+    if (history.scrollRestoration === 'auto') window.scrollTo({ left: at.x, top: at.y, behavior: 'instant' });
+    if (Array.isArray(at.boxes) && at.boxes.length) placeBoxes(at.boxes);
+  });
+  if (document.readyState === 'complete') go();
+  else window.addEventListener('load', go, { once: true });
+});
+
+// A drag over this page (a file from Finder) shows the host none of its events, so the host is told when the drag is
+// done with the page, 'flow:drag-done': dropped here, or gone from the page or let go where the page took nothing
+// (Chromium then fires dragleave at the element the drag last entered; leaving one element for another fires dragenter
+// at the new one first, and an element the page removed mid-drag gets no dragleave here).
+let dragAt = null;
+const dragDone = () => {
+  dragAt = null;
+  ipcRenderer.sendToHost('flow:drag-done');
+};
+window.addEventListener('dragenter', (e) => { if (e.isTrusted) dragAt = e.target; }, { capture: true, passive: true });
+window.addEventListener('dragleave', (e) => { if (e.isTrusted && e.target === dragAt) dragDone(); }, { capture: true, passive: true });
+window.addEventListener('drop', (e) => { if (e.isTrusted) dragDone(); }, { capture: true, passive: true });
+
+
+
+
