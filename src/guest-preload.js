@@ -193,3 +193,198 @@ function* elements(roots) {
       if (seen.has(el)) continue;
       seen.add(el);
       yield el;
+    }
+  }
+}
+function look(whole) {
+  const items = elements(whole ? null : added);
+  added = [];
+  if (whole && document.documentElement) adds.observe(document.documentElement, { childList: true, subtree: true });
+  walking = items;
+  let spent = 0;
+  const step = (deadline) => {
+    if (walking !== items) return;
+    const start = performance.now();
+    const until = start + Math.max(deadline.timeRemaining(), 4);
+    let hit = false;
+    for (let it = items.next(); !it.done; it = items.next()) {
+      if (scrollerX(it.value)) {
+        hit = true;
+        break;
+      }
+      if (performance.now() > until) {
+        spent += performance.now() - start;
+        requestIdleCallback(step, { timeout: 1000 });
+        return;
+      }
+    }
+    spent += performance.now() - start;
+    walking = null;
+    nextAt = performance.now() + 100 * spent;
+    if (whole || hit) found = hit;
+    if (found) {
+      adds.disconnect();
+      added = [];
+      return;
+    }
+    soon();
+  };
+  requestIdleCallback(step, { timeout: 1000 });
+}
+window.addEventListener('load', () => look(true));
+window.addEventListener('resize', () => look(true));
+
+// nav gives each wheel gesture one owner, decided by its first 4 px of travel (nav.js take()), so a scroll that starts
+// vertical stays with the page even if it drifts sideways. Only what that needs is sent (a fast scroll is 60 to 120
+// wheels a second): every event until the gesture is decided, every mostly sideways one, and one per 100 ms to keep the
+// gesture open (nav ends it after 220 ms without one, by event time). The timeout reads defaultPrevented after the
+// page's own listeners have run.
+// A page can also scroll with its own code, which the event does not show: a Sheet's grid is a canvas, and its wheel
+// listener moves a scroller beside it without preventDefault. So a gesture whose wheels go on while something in the page
+// scrolls sideways is the page's (scroll events reach the document's capture listener from any element). On a page where
+// something can scroll sideways (found above) or has (moved), sideways wheels are held until that is known, each keeping
+// its own time; any other page sends them at once, so switching over it is as quick as ever. A busy page answers late,
+// and it is late to handle the wheel too: a real Sheet, from no CPU throttling to 6x, handled the first wheel 28 to
+// 1000 ms after it was made and answered 46 to 688 ms after that. So the hold is HOLD_MS plus how late the first held
+// wheel reached the page, at most HOLD_MAX_MS, and a scroll counts for a gesture until GAP_MS plus that lateness after
+// the page handled its last wheel (by the wheels' own times it would come too late).
+const GAP_MS = 220;
+const DECIDE_PX = 4;
+const KEEP_MS = 100;
+const HOLD_MS = 80;
+const HOLD_MAX_MS = 600;
+let gesture = null;   // { last, seen, late, travel, sent, used, open, held, timer }: event times in epoch ms; seen: when
+                      //   the page handled its last wheel (performance.now()), late: how long after it was made
+let moved = false;
+const lefts = new WeakMap();   // element -> its scrollLeft at its last scroll event
+const send = (m) => ipcRenderer.sendToHost('flow:wheel', m);
+function settle(g) {
+  clearTimeout(g.timer);
+  g.open = false;
+  for (const m of g.held.splice(0)) send({ ...m, used: g.used });
+}
+document.addEventListener('scroll', (e) => {
+  const el = e.target === document ? document.scrollingElement : e.target;
+  if (!el || el.nodeType !== 1) return;
+  const before = lefts.get(el);
+  const left = el.scrollLeft;
+  lefts.set(el, left);
+  if (before === undefined ? left === 0 : left === before) return;
+  moved = true;
+  const g = gesture;
+  if (!g || g.used || performance.now() - g.seen > GAP_MS + g.late) return;
+  g.used = true;
+  if (g.open) settle(g);
+}, { capture: true, passive: true });
+// A two-finger double tap on the trackpad (src/touch.js 'flow:double-tap'), then a swipe sideways over this page within
+// TURN_MS, goes back (the fingers move right) or forward (left), once, as Chrome's two-finger page swipe does; the
+// swipe is the page's, so the board does not move with it. A double tap that came while this page was being scrolled
+// (two quick flicks, not taps) does nothing.
+const TURN_MS = 1500;
+let turnUntil = 0;
+let lastWheel = -Infinity;
+ipcRenderer.on('flow:double-tap', (_event, { t }) => {
+  if (Number.isFinite(t) && t - lastWheel > 2 * GAP_MS) turnUntil = t + TURN_MS;
+});
+window.addEventListener('wheel', (e) => {
+  if (e.ctrlKey || !e.isTrusted) return;
+  const t = performance.timeOrigin + e.timeStamp;
+  lastWheel = t;
+  const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerWidth : 1;
+  const dx = e.deltaX * k;
+  const dy = e.deltaY * k;
+  if (!gesture || t - gesture.last > GAP_MS) gesture = { last: t, seen: 0, late: 0, travel: 0, sent: -Infinity, used: false, open: true, held: [], timer: 0, turn: t <= turnUntil };
+  if (gesture.turn && gesture.travel + Math.abs(dx) + Math.abs(dy) >= DECIDE_PX && Math.abs(dx) > Math.abs(dy)) {
+    gesture.turn = false;
+    turnUntil = 0;
+    gesture.used = true;
+    if (dx < 0) history.back();
+    else history.forward();
+  }
+  gesture.last = Math.max(gesture.last, t);
+  gesture.seen = performance.now();
+  const late = Math.max(0, performance.timeOrigin + gesture.seen - t);
+  gesture.late = late;
+  const deciding = gesture.travel < DECIDE_PX;
+  gesture.travel += Math.abs(dx) + Math.abs(dy);
+  const sideways = Math.abs(dx) > Math.abs(dy);
+  if (!deciding && !sideways && t - gesture.sent < KEEP_MS) return;
+  gesture.sent = t;
+  let could = false;
+  if (sideways) {
+    const path = e.composedPath();
+    if (document.scrollingElement && !path.includes(document.scrollingElement)) path.push(document.scrollingElement);
+    could = scrollsX(path, dx > 0 ? 1 : -1);
+  }
+  const g = gesture;
+  setTimeout(() => {
+    if (could || e.defaultPrevented) g.used = true;
+    if (g.open && !g.used && (g.held.length || (sideways && (found || moved)))) {
+      g.held.push({ dx, dy, t });
+      if (!g.timer) g.timer = setTimeout(() => settle(g), Math.min(HOLD_MAX_MS, HOLD_MS + late));
+      return;
+    }
+    if (g.open) settle(g);
+    send({ dx, dy, t, used: g.used });
+  }, 0);
+}, { capture: true, passive: true });
+
+// Marks: sentences the owner quoted in this page's note, painted with the CSS Custom Highlight API, so the site's DOM
+// never changes (page.js asks, notes.js decides what). From the host: 'flow:marks' [{ text }], the whole set ([] clears),
+// and 'flow:find-quote' { id, text }. To the host: 'flow:mark-hover' { text, x, y, w, h } or null (CSS px in this page's
+// viewport), 'flow:mark-click' { text }, 'flow:find-quote' { id, found }. A quote is matched with all whitespace ignored
+// (a quote can span elements and lines), its first occurrence only; one that is not on the page is skipped, and for 15 s
+// after the marks arrive one is still looked for in what the page adds or changes (only there, so a busy page stays
+// cheap).
+const MARK = 'flow-mark';
+const FLASH = 'flow-mark-flash';
+const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|TEXTAREA|TEMPLATE)$/;
+let wanted = [];          // the quotes the host asked for
+let marks = [];           // [{ text, range }] found on this page
+let styled = false;
+let watcher = null;
+let watchUntil = 0;
+let rescan = 0;
+let changed = new Set();  // nodes the page added or changed since the last look
+let hovered = null;
+
+function markStyle() {
+  if (styled) return;
+  styled = true;
+  webFrame.insertCSS(`::highlight(${MARK}){background-color:rgba(255,213,74,.5)}::highlight(${FLASH}){background-color:rgba(255,170,0,.85)}`);
+}
+
+// The text under root without whitespace, kept as runs: each run of non-space characters remembers its text node and
+// where it starts there, so a match maps back to the page.
+function textMap(root) {
+  const nodes = [];
+  const runStart = [];
+  const runNode = [];
+  const runOff = [];
+  const parts = [];
+  let length = 0;
+  if (root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (n.parentNode && SKIP.test(n.parentNode.nodeName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+    });
+    const run = /\S+/g;
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const d = n.data;
+      let k = -1;
+      run.lastIndex = 0;
+      for (let m = run.exec(d); m; m = run.exec(d)) {
+        if (k < 0) {
+          k = nodes.length;
+          nodes.push(n);
+        }
+        runStart.push(length);
+        runNode.push(k);
+        runOff.push(m.index);
+        parts.push(m[0]);
+        length += m[0].length;
+      }
+    }
+  }
+  const text = parts.join('');
+  const lower = text.toLowerCase();
+  return { text, lower: lower.length === text.length ? lower : '', nodes, runStart, runNode, runOff };
