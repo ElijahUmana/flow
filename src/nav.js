@@ -976,3 +976,329 @@
         const r = X ? { x: n.x + n.w + GAP_X, y: clamp(n.y, top, bot - H0), w: W0, h: H0 } : { x: clamp(n.x, L, R - W0), y: n.y + n.h + GAP_Y, w: W0, h: H0 };
         const fits = X ? r.x >= L - 0.01 && r.x + r.w <= R + 0.01 : r.y >= top - 0.01 && r.y + r.h <= bot + 0.01;
         const past = wins.filter((g) => r.x < g.x + g.w + GAP_X - 0.05 && g.x < r.x + r.w + GAP_X - 0.05 && r.y < g.y + g.h + GAP_Y - 0.05 && g.y < r.y + r.h + GAP_Y - 0.05)
+          .every((g) => (X ? g.x >= n.x + n.w - 0.05 : g.y >= n.y + n.h - 0.05));
+        const keep = here(ws).find((o) => { const g = h.geo(o); return g.x === n.x && g.y === n.y && g.w === n.w && g.h === n.h; });
+        const Rg = fits && past ? makeRoom(ws, r, keep, X ? 'x' : 'y', X ? 'x' : 'y') : null;
+        if (Rg && Rg.ok) return dry ? r : settle4(ws, Rg, r);
+      }
+      /* let go over a window (lead 19:2x, batch 9): the row keeps its order. The hand on its right half: beside it on the
+         right; on its left half: in its place, it moving right. Level with it and as wide as the view allows, down to the
+         smallest of use; it and what is past it in its way move right, all that way, and a row below reaching under it
+         moves down, so nothing jumps over the new window. Only where nothing above reaches into it; beside it that
+         failing, in its place; else the push. */
+      const U = !bare && typeof h.moveWindows === 'function' && wins.find((g) => pt.x > g.x && pt.x < g.x + g.w && pt.y > g.y && pt.y < g.y + g.h);
+      if (U) {
+        const y = clamp(U.y, top, bot - H0), keepU = here(ws).find((o) => { const g = h.geo(o); return g.x === U.x && g.y === U.y && g.w === U.w && g.h === U.h; });
+        const at2 = (x) => ({ x, y, w: Math.min(W0, R - x), h: H0 }), its = [at2(Math.max(L, U.x)), null, Math.max(L, U.x)];
+        for (const [r, keep, from] of pt.x >= U.x + U.w / 2 ? [[at2(U.x + U.w + GAP_X), keepU, U.x + U.w], its] : [its]) {
+          const inWay = wins.filter((g) => r.x < g.x + g.w + GAP_X - 0.05 && g.x < r.x + r.w + GAP_X - 0.05 && r.y < g.y + g.h + GAP_Y - 0.05 && g.y < r.y + r.h + GAP_Y - 0.05);
+          /* it, or past where the new one starts: right; else, under its top (a row below reaching under it): down; else no way */
+          const dir = (g) => (g === U || g.x >= from - 0.05 ? 'x' : g.y >= r.y + 0.05 ? 'y' : null);
+          if (r.w < mw - 0.01 || !inWay.every(dir)) continue;
+          const Ru = makeRoom(ws, r, keep, 'x', dir, 'one');
+          if (Ru.ok) return dry ? r : settle4(ws, Ru, r);
+        }
+      }
+      /* on bare desktop with no room at the hand for even the smallest window (lead 18:0x, batch 9): the nearest open place
+         in view, sized to it down to the smallest of use, and nothing moves; a place past the view does not count */
+      if (bare) {
+        let close = null;
+        clearings(ws, null, L, R, top, vr.y + bottom() * k).forEach((c) => {
+          const cw = Math.min(W0, c.R - c.L), ch = Math.min(H0, c.B - c.T);
+          if (cw < mw - 0.01 || ch < mh - 0.01) return;
+          const x = clamp(spot.x, c.L, c.R - cw), y = clamp(spot.y, c.T, c.B - ch);
+          const off = Math.hypot((Math.max(0, x - p.x, p.x - (x + cw)) / 100) * vw, (Math.max(0, y - p.y, p.y - (y + ch)) / 100) * vh), area = cw * vw * ch * vh;
+          if (!close || off < close.off - 0.5 || (off < close.off + 0.5 && area > close.area)) close = { r: { x, y, w: cw, h: ch }, off, area };
+        });
+        if (close) return close.r;
+      }
+      /* what is directly in its way makes way, right or down; the window itself at the space's start when what it would
+         leave there is under half the smallest window, a sliver nothing can use */
+      if (typeof h.moveWindows === 'function') {
+        const r = { ...spot, x: spot.x - L < (MIN_W / 2 / vw) * 100 * k ? L : spot.x, y: spot.y - top < (MIN_H / 2 / vh) * 100 * k ? top : spot.y };
+        let Rm = makeRoom(ws, r, null, null, null, 'rd');
+        if (!Rm.ok) Rm = makeRoom(ws, r, null, null);
+        if (!Rm.ok) Rm = makeRoom(ws, r, null, 'y', 'y');
+        if (Rm.ok) return dry ? r : settle4(ws, Rm, r);
+      }
+      return openSpot(ws, w, hh, true);
+    }
+    /* The windows in the way of a rect at (a new window, or one just resized or let go) make way, each its own way by just
+       enough to stand the usual gap off it: right for one to its right, down for one below it, never up or left (lead,
+       batch 7); one that is neither goes def ('x' or 'y'; none: the shorter way), and with only every one goes that way
+       (only a function: the way it gives each). Any ways: a window goes one way only. ways 'four': each goes the shortest of its four ways out, up and left too, so what is pushed moves away from where
+       it is pushed (lead 16:1x: a resize let go). ways 'rd' (lead 17:15: a drop or "new ... here"): right or down only;
+       of the two, one that keeps its title bar in view if it was and either does, then its own shorter one, unless the
+       other moves less than half as much in all (it and what it then runs into), so a whole row is not pushed a page
+       width when moving the one down will do. What a moved window then runs into goes the same way by the same amount,
+       so rows and columns keep their shape. keep never moves. from: where keep stood before a resize; a window it did not
+       come nearer to is left as it is (lead 18:5x: only what this resize newly crowds). ok: nothing is left under at,
+       nothing runs into keep, nothing lands on another, nothing is pushed two ways. slide: does it. */
+    function makeRoom(ws, at, keep, def, only, ways, from) {
+      const four = ways === 'four';
+      const { vw, vh } = size(), all = here(ws, keep ? keep.zone || null : undefined).filter((o) => o !== keep), geo = new Map(all.map((o) => [o, h.geo(o)])), kg = keep && h.geo(keep);
+      const hit = (p, q) => p.x < q.x + q.w - 0.05 && q.x < p.x + p.w - 0.05 && p.y < q.y + q.h - 0.05 && q.y < p.y + p.h - 0.05;
+      const pad = (p, q) => p.x < q.x + q.w + GAP_X - 0.05 && q.x < p.x + p.w + GAP_X - 0.05 && p.y < q.y + q.h + GAP_Y - 0.05 && q.y < p.y + p.h + GAP_Y - 0.05;
+      const apart = (p, q) => Math.max(((q.x - p.x - p.w) / 100) * vw, ((p.x - q.x - q.w) / 100) * vw, ((q.y - p.y - p.h) / 100) * vh, ((p.y - q.y - q.h) / 100) * vh);
+      const asIs = (o) => !!from && apart(at, geo.get(o)) >= apart(from, geo.get(o)) - 0.5;
+      const needX = (q) => at.x + at.w + GAP_X - q.x, needY = (q) => at.y + at.h + GAP_Y - q.y;
+      const dirOf = (q) => (typeof only === 'function' ? only(q) : only) || (q.y >= at.y + at.h / 2 ? 'y' : q.x >= at.x + at.w / 2 ? 'x' : def || ((needX(q) / 100) * vw <= (needY(q) / 100) * vh ? 'x' : 'y'));
+      /* four ways: the move that takes q out of at's way, the gap kept, the shortest on screen */
+      const out4 = (q) => [[needX(q), 0], [-(q.x + q.w + GAP_X - at.x), 0], [0, needY(q)], [0, -(q.y + q.h + GAP_Y - at.y)]]
+        .reduce((b, m) => (Math.abs(m[0] / 100) * vw + Math.abs(m[1] / 100) * vh < Math.abs(b[0] / 100) * vw + Math.abs(b[1] / 100) * vh ? m : b));
+      const moves = new Map(), after = (o) => { const q = geo.get(o), d = moves.get(o); return d ? { ...q, x: q.x + d.dx, y: q.y + d.dy } : q; };
+      let torn = false;
+      const more = (a, b) => (Math.abs(a) > Math.abs(b) + 0.01 ? a : b);
+      /* four ways or right-or-down: a window goes one way only; pushed two ways (or along both axes), there is no such room */
+      const push = (o, dx, dy) => {
+        const c = moves.get(o) || { dx: 0, dy: 0 };
+        if ((dx && c.dx && Math.sign(dx) !== Math.sign(c.dx)) || (dy && c.dy && Math.sign(dy) !== Math.sign(c.dy))) { torn = true; return false; }
+        if (ways && ((dx && c.dy) || (dy && c.dx))) { torn = true; return false; }
+        const n = { dx: more(dx, c.dx), dy: more(dy, c.dy) };
+        if (Math.abs(n.dx - c.dx) < 0.01 && Math.abs(n.dy - c.dy) < 0.01) return false;
+        moves.set(o, n);
+        return true;
+      };
+      /* right or down: what moving o alone that way moves in all, in px on screen (it and what it then runs into) */
+      const drag = (o, dx, dy) => {
+        const set = new Set([o]);
+        for (let grew = true; grew;) {
+          grew = false;
+          [...set].forEach((p) => {
+            const P0 = geo.get(p), P = { ...P0, x: P0.x + dx, y: P0.y + dy };
+            all.forEach((n) => { const q = geo.get(n); if (set.has(n) || hit(P0, q) || !pad(P, q) || (dx > 0 ? q.x < P0.x : q.y < P0.y)) return; set.add(n); grew = true; });
+          });
+        }
+        return set.size * ((dx / 100) * vw + (dy / 100) * vh);
+      };
+      const vr = visible(ws), k = 1 / vr.z, tb = (30 / vh) * 100 * k, x0 = vr.x, x1 = vr.x + vr.w, y1 = vr.y + (vr.h * bottom()) / 100;
+      const seen = (r) => r.y >= vr.y - 0.05 && r.y + tb <= y1 + 0.05 && Math.min(r.x + r.w, x1) - Math.max(r.x, x0) >= Math.min(r.w, (120 / vw) * 100 * k) - 0.05;
+      const rd = (q, o) => {
+        const opts = [[needX(q), 0], [0, needY(q)]].filter(([dx, dy]) => dx > 0.01 || dy > 0.01).map(([dx, dy]) => ({ dx, dy, in: seen({ ...q, x: q.x + dx, y: q.y + dy }), cost: drag(o, dx, dy) }));
+        const pool = seen(q) && opts.some((m) => m.in) ? opts.filter((m) => m.in) : opts;
+        /* its own shorter move, unless the other drags less than half as much in all (a row pushed a page width) */
+        const own = pool.reduce((b, m) => (!b || (m.dx / 100) * vw + (m.dy / 100) * vh < (b.dx / 100) * vw + (b.dy / 100) * vh ? m : b), null);
+        return pool.find((m) => m !== own && m.cost < own.cost / 2) || own;
+      };
+      all.filter((o) => pad(at, geo.get(o)) && !asIs(o)).forEach((o) => {
+        const q = geo.get(o);
+        if (four) { const [dx, dy] = out4(q); if (Math.abs(dx) + Math.abs(dy) > 0.01) push(o, dx, dy); return; }
+        if (ways === 'rd') { const m = rd(q, o); if (m) push(o, m.dx, m.dy); return; }
+        const X = dirOf(q) === 'x', need = X ? needX(q) : needY(q);
+        if (need > 0) push(o, X ? need : 0, X ? 0 : need);
+      });
+      for (let grew = true; grew && !torn;) {
+        grew = false;
+        [...moves.keys()].forEach((p) => {
+          const d = moves.get(p), P = after(p), p0 = geo.get(p);
+          all.forEach((o) => {
+            const q = geo.get(o);
+            if (o === p || hit(p0, q) || !pad(P, after(o))) return;
+            const dx = (d.dx > 0 && q.x >= p0.x) || (d.dx < 0 && q.x + q.w <= p0.x + p0.w) ? d.dx : 0;
+            const dy = (d.dy > 0 && q.y >= p0.y) || (d.dy < 0 && q.y + q.h <= p0.y + p0.h) ? d.dy : 0;
+            if (push(o, dx, dy)) grew = true;
+          });
+        });
+      }
+      const mvd = [...moves.keys()];
+      const ok = !torn && !mvd.some((o) => (kg && hit(after(o), kg)) || hit(after(o), at)) && !all.some((o) => !moves.has(o) && !asIs(o) && hit(at, geo.get(o)))
+        && !mvd.some((o) => all.some((p) => p !== o && hit(after(o), after(p)) && !hit(geo.get(o), geo.get(p))));
+      const slide = () => {
+        const groups = new Map();
+        moves.forEach((d, o) => { const k = `${d.dx.toFixed(3)},${d.dy.toFixed(3)}`; if (!groups.has(k)) groups.set(k, { d, list: [] }); groups.get(k).list.push(o); });
+        groups.forEach(({ d, list }) => h.moveWindows(ws, list, d.dx, d.dy, true));
+      };
+      return { moves, ok, slide };
+    }
+    /* After w is resized (or let go), the windows it now covers or comes within the usual gap of make way, w staying as it
+       is (lead, batch 7: "the never-cover rule applies when you let go"): what you push moves away from the edge you push,
+       on all four edges (lead 16:1x, batch 8), each by just enough and what it runs into the same way (makeRoom, four
+       ways), the space growing at its start where that goes past it (room), nothing else moving on screen. Where that
+       cannot clear w, right or down as before; else they all go down past it. from: w before the resize, so only what it
+       came nearer to moves. Returns how many moved; dry: only counts. */
+    function clear(ws, w, dry, from) {
+      if (typeof h.moveWindows !== 'function') return 0;
+      const r = h.geo(w), at = { x: r.x, y: r.y, w: r.w, h: r.h };
+      let R = makeRoom(ws, at, w, null, null, 'four', from);
+      if (!R.ok) R = makeRoom(ws, at, w, null, null, null, from);
+      if (!R.ok) R = makeRoom(ws, at, w, 'y', 'y', null, from);
+      if (!R.ok) return 0;
+      if (!dry) settle4(ws, R, at, w.zone || null);
+      return R.moves.size;
+    }
+    /* Does R's moves, after growing the space at its start (left or top) by what any of them, or the rect at, goes past it:
+       every window of the space and the view move by that much together, so nothing moves on screen; then the moved
+       windows slide. sid: the space, the one on screen unless given (clear: its window's own). Returns at where it is
+       after the growing. */
+    function settle4(ws, R, at, sid = h.space(ws)) {
+      const ends = [...R.moves].map(([o, d]) => { const g = h.geo(o); return { x: g.x + d.dx, y: g.y + d.dy }; }).concat(at ? [at] : []);
+      const gx = Math.max(0, SIDE - Math.min(SIDE, ...ends.map((e) => e.x))), gy = Math.max(0, TOP - Math.min(TOP, ...ends.map((e) => e.y)));
+      if (!gx && !gy) { R.slide(); return at; }
+      // a space not on screen keeps its view in its zone (the main space: in ws.mainPan)
+      const on = (sid || null) === h.space(ws), zn = !on && zoneOf(ws, sid), [o, kx, ky] = on ? [ws, 'pan', 'panY'] : zn ? [zn, 'pan', 'panY'] : [ws, 'mainPan', 'mainPanY'];
+      o[kx] = (o[kx] || 0) + gx;
+      o[ky] = (o[ky] || 0) + gy;
+      h.moveWindows(ws, [...ws.windows, ...ws.closed].filter((w) => inSpace(w, sid)), gx, gy, false);
+      /* the moved windows slide once the held move has drawn without sliding */
+      requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(R.slide)));
+      return at && { ...at, x: at.x + gx, y: at.y + gy };
+    }
+    /* A new window beside w (owner 12:39, "add a new page just like side by side to it"; lead 13:1x), on side 'right',
+       'left', 'above' or 'below'. split: the two share w's own rectangle, half each, and nothing else moves; null when a
+       half would be under MIN_W (a page: PAGE_W) x MIN_H at actual size.
+       Otherwise it is w's size, flush on that side the usual gap away. Only the windows in its way make way, each its
+       own way by just enough (makeRoom: right or down, never up or left), and what they run into the same way; w never
+       moves. Where the new window or they would go left of the space's start or above its top, the space grows there by
+       what is missing. Returns { at, own }: where the new window goes
+       and, for a split, w's. dry: only says where, moving nothing; its at is where the new window shows before the view
+       comes to it, in the coordinates of now (the same as at unless the space grows). dims: the new window's own size
+       ({ w, h } in %) for one that is not w's size, such as a page opened from a terminal's link (lead, batch 7). */
+    function beside(ws, w, side, split, dry, dims) {
+      const r0 = h.geo(w), g = { x: r0.x, y: r0.y, w: r0.w, h: r0.h }, X = side === 'left' || side === 'right', fwd = side === 'right' || side === 'below', { vw, vh } = size();
+      const G = X ? GAP_X : GAP_Y, a0 = X ? g.x : g.y, len = X ? g.w : g.h, put = (r, a, l) => (X ? { ...r, x: a, w: l } : { ...r, y: a, h: l });
+      if (split) {
+        const half = (len - G) / 2;
+        if ((half / 100) * (X ? vw : vh) < (X ? (w.type === 'page' ? PAGE_W : MIN_W) : MIN_H)) return null;
+        const first = put(g, a0, half), second = put(g, a0 + half + G, half);
+        return fwd ? { at: second, own: first } : { at: first, own: second };
+      }
+      /* dims: a size of its own ({ w, h } in %) instead of w's, its top (or left side) level with w's */
+      const sz = dims ? { w: dims.w, h: dims.h } : { w: g.w, h: g.h }, nl = X ? sz.w : sz.h;
+      const at = { ...put(g, fwd ? a0 + len + G : a0 - G - nl, nl), ...(X ? { h: sz.h } : { w: sz.w }) }, all = here(ws).filter((o) => o !== w);
+      /* the way for one in the way that is neither right of it nor below it: along the side (right beside it, down under
+         it; for the left side down, for the top right, as back toward w is no way) */
+      const R = makeRoom(ws, at, w, side === 'right' || side === 'above' ? 'x' : 'y'), moves = R.moves, mvd = [...moves.keys()];
+      if (!R.ok) return { at: makeWay(ws, { ...at, x: Math.max(SIDE, at.x), y: Math.max(TOP, at.y) }, dry), moved: all.length };
+      const gx = Math.max(0, SIDE - at.x), gy = Math.max(0, TOP - at.y);
+      const to = { ...at, x: at.x + gx, y: at.y + gy }, v = view(ws);
+      /* The space grows as room at the left does: the view moves with it, so nothing moves on screen until the view comes
+         to the new window. At actual size the view cannot sit lower than the space reaches, so where the space is too
+         short below, what is there slides down instead. */
+      const low = Math.max(100, Math.max(to.y + to.h, ...here(ws).map((o) => { const q = h.geo(o), d = moves.get(o); return q.y + q.h + (d ? d.dy : 0) + gy; })) + 100 - bottom());
+      const holdY = gy > 0 && (v.z !== 1 || (v.y / vh) * 100 + gy <= Math.max(0, low - 100 / v.z) + 0.01);
+      /* moved: how many windows move (all of them when the space grows), so a caller can pick the side that moves none */
+      if (dry) return { at: { ...at, y: holdY || !gy ? at.y : to.y }, moved: gx || gy ? all.length + 1 : mvd.length };
+      const slide = R.slide;
+      if (gx || gy) {
+        const ho = holderOf(ws, h.space(ws));
+        if (gx && ho.roomRight) ho.roomRight += gx;
+        if (gx) ws.pan = (ws.pan || 0) + gx;
+        if (holdY) ws.panY = (ws.panY || 0) + gy;
+        const held = gx > 0 || holdY;
+        h.moveWindows(ws, [...ws.windows, ...ws.closed].filter((o) => inSpace(o, h.space(ws))), gx, gy, !held);
+        /* the windows in the way slide once the held move has drawn without sliding */
+        if (mvd.length && held) requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(slide)));
+        else slide();
+      } else slide();
+      return { at: to };
+    }
+    /* The windows of the space on screen in one of the arranging styles (owner 14:03: "one thing for dynamic arranging
+       things ... different dynamic styles that make stuff look nice"; lead 14:5x): a rect for each window id, in %, none
+       over another and none under MIN_W x MIN_H at actual size. Each is made from base, the owner's own layout ("yours",
+       id -> rect; where the windows are now for any it leaves out), so going through the styles never drifts. tidy:
+       yours with sizes and order kept, each window lined up the usual gap from the ones before it where that is a small
+       move. kind, focus and grid fill one view at actual size, the one the owner is looking at (centred on it when
+       zoomed), and go on below it only where the windows would be too small: kind a strip per kind (agents and
+       shells, pages, notes) as wide as its share, tiled; focus front large on the left and the rest beside it; grid
+       even rows across the view. Windows keep their reading order. */
+    function arrange(ws, style, front, base) {
+      const { vw, vh } = size(), wins = here(ws), out = {};
+      if (!wins.length) return out;
+      const g = new Map(wins.map((o) => { const r = (base && base[o.id]) || h.geo(o); return [o, { x: r.x, y: r.y, w: r.w, h: r.h }]; }));
+      const mw = (MIN_W / vw) * 100, mh = (MIN_H / vh) * 100;
+      const order = [...wins].sort((a, b) => { const p = g.get(a), q = g.get(b); return Math.abs(p.y - q.y) > 8 ? p.y - q.y : p.x - q.x; });
+      if (style === 'tidy') {
+        /* in reading order each window goes to the nearest place that lines up with one placed before it (level, flush
+           or the usual gap past it) when that is within SNAP of where it is, else it stays; where it would be over or
+           against one placed before it, the nearest such place, else under them all */
+        const SNAP = 5, placed = [];
+        const pad = (r, q) => r.x < q.x + q.w + GAP_X - 0.05 && q.x < r.x + r.w + GAP_X - 0.05 && r.y < q.y + q.h + GAP_Y - 0.05 && q.y < r.y + r.h + GAP_Y - 0.05;
+        const dist = (c, o) => Math.hypot(((c.x - o.x) / 100) * vw, ((c.y - o.y) / 100) * vh);
+        order.forEach((o) => {
+          const r = g.get(o), own = { ...r, x: Math.max(SIDE, r.x), y: Math.max(TOP, r.y) };
+          const xs = [SIDE, ...placed.flatMap((q) => [q.x, q.x + q.w + GAP_X, q.x + q.w - r.w])], ys = [TOP, ...placed.flatMap((q) => [q.y, q.y + q.h + GAP_Y, q.y + q.h - r.h])];
+          const cand = xs.flatMap((x) => ys.map((y) => ({ ...r, x, y }))).filter((c) => c.x >= SIDE - 0.01 && c.y >= TOP - 0.01 && !placed.some((q) => pad(c, q)));
+          cand.sort((p, q) => dist(p, own) - dist(q, own));
+          const free = !placed.some((q) => pad(own, q)), snap = cand[0];
+          const at = snap && (!free || dist(snap, own) <= (SNAP / 100) * vw) ? snap : free ? own : { ...r, x: SIDE, y: Math.max(TOP, ...placed.map((q) => q.y + q.h + GAP_Y)) };
+          placed.push(at);
+          out[o.id] = { x: at.x, y: at.y, w: r.w, h: r.h };
+        });
+        return out;
+      }
+      /* the part of the view the owner sees (visible(): what no sidebar covers), at actual size, around its middle, never
+         before the space's start */
+      const vis = visible(ws), cx = vis.x + vis.w / 2, cy = vis.y + vis.h / 2, aw = vis.w * vis.z, ah = vis.h * vis.z;
+      const X0 = Math.max(SIDE, cx - aw / 2 + SIDE), Y0 = Math.max(TOP, cy - ah / 2 + TOP), W = aw - 2 * SIDE, H = bottom() - TOP;
+      /* list in rows across x0..x0+w from y0, the tiles of a row even: the number of rows whose tiles come closest to the
+         view's own shape, none under the smallest of use; with too many for that, rows of the smallest go on below */
+      const rows = (list, x0, y0, w, hh) => {
+        const n = list.length, aspect = vw / vh;
+        let best = null;
+        for (let r = 1; r <= n; r++) {
+          const per = Array.from({ length: r }, (_, i) => Math.floor(n / r) + (i < n % r ? 1 : 0));
+          const th = (hh - (r - 1) * GAP_Y) / r;
+          if (th < mh - 0.01) break;
+          if (per.some((c) => (w - (c - 1) * GAP_X) / c < mw - 0.01)) continue;
+          const cost = per.reduce((a, c) => { const tw = (w - (c - 1) * GAP_X) / c; return a + c * Math.abs(Math.log(((tw / 100) * vw) / ((th / 100) * vh) / aspect)); }, 0) / n;
+          if (!best || cost < best.cost) best = { per, th, cost };
+        }
+        if (!best) {
+          const c = Math.max(1, Math.floor((w + GAP_X) / (mw + GAP_X))), r = Math.ceil(n / c), fit = Math.max(1, Math.min(r, Math.floor((hh + GAP_Y) / (mh + GAP_Y))));
+          best = { per: Array.from({ length: r }, (_, i) => Math.min(c, n - i * c)), th: Math.max(mh, (hh - (fit - 1) * GAP_Y) / fit) };
+        }
+        let k = 0;
+        best.per.forEach((c, i) => {
+          const tw = (w - (c - 1) * GAP_X) / c;
+          for (let j = 0; j < c; j++, k++) out[list[k].id] = { x: x0 + j * (tw + GAP_X), y: y0 + i * (best.th + GAP_Y), w: tw, h: best.th };
+        });
+      };
+      if (style === 'kind') {
+        /* agents and shells, then pages, then notes, then the rest: a strip each, as wide as its share of the windows and
+           never under the smallest of use, tiled in rows; where the view is too narrow for a strip each (a pop-out), a
+           band each, top to bottom, as tall as its share */
+        const kindOf = (o) => (o.type === 'term' || o.type === 'team' ? 0 : o.type === 'page' ? 1 : o.type === 'note' ? 2 : 3);
+        const kinds = [0, 1, 2, 3].map((kd) => order.filter((o) => kindOf(o) === kd)).filter((l) => l.length);
+        const across = kinds.length * mw + (kinds.length - 1) * GAP_X <= W + 0.01, G = across ? GAP_X : GAP_Y, m = across ? mw : mh;
+        const room = (across ? W : H) - (kinds.length - 1) * G, share = kinds.map((l) => Math.max(m, (room * l.length) / order.length));
+        const over = share.reduce((a, b) => a + b, 0) - room, spare = share.map((x) => x - m), all = spare.reduce((a, b) => a + b, 0);
+        if (over > 0.01 && all > 0) share.forEach((x, i) => { share[i] = Math.max(m, x - (Math.min(over, all) * spare[i]) / all); });
+        let at = across ? X0 : Y0;
+        kinds.forEach((l, i) => { if (across) rows(l, at, Y0, share[i], H); else rows(l, X0, at, W, share[i]); at += share[i] + G; });
+        return out;
+      }
+      if (style === 'focus') {
+        /* front large on the left, full height; the rest beside it in rows */
+        const f = wins.includes(front) ? front : order[0], rest = order.filter((o) => o !== f);
+        if (!rest.length) { out[f.id] = { x: X0, y: Y0, w: W, h: H }; return out; }
+        const fw = Math.max(mw, Math.min(W * 0.62, W - mw - GAP_X));
+        out[f.id] = { x: X0, y: Y0, w: fw, h: H };
+        rows(rest, X0 + fw + GAP_X, Y0, Math.max(mw, W - fw - GAP_X), H);
+        return out;
+      }
+      if (style !== 'grid') throw new Error(`arrange: no style ${style}`);
+      rows(order, X0, Y0, W, H);
+      return out;
+    }
+    /* The second press of a double-click between two windows. Let go: the far one (right, or lower) makes way by its own
+       width or height, so a window like it fits between them. Held and dragged: the room follows the pointer, wider or
+       back down to the usual gap, and stays where you let go. */
+    function startRoom(e, ws, sec) {
+      if (typeof h.moveWindows !== 'function') return false;
+      const p = toSpace(ws, e.clientX, e.clientY), b = between(ws, p);
+      if (!b) return false;
+      const X = b.axis === 'x', m = inWay(ws, b.axis, X ? p.x : p.y, 1, X ? p.y : p.x, X ? p.y : p.x);
+      if (!m.length) return false;
+      e.preventDefault();
+      stopFling();
+      const a0 = (r) => (X ? r.x : r.y), a1 = (r) => (X ? r.x + r.w : r.y + r.h);
+      const b0 = (r) => (X ? r.y : r.x), b1 = (r) => (X ? r.y + r.h : r.x + r.w);
+      let least = Infinity;
+      m.forEach((q) => here(ws).forEach((s) => {
+        if (m.includes(s)) return;
+        const Q = h.geo(q), S = h.geo(s);
+        if (a1(S) <= a0(Q) + 0.05 && b0(S) < b1(Q) - 0.05 && b0(Q) < b1(S) - 0.05) least = Math.min(least, a0(Q) - a1(S) - (X ? GAP_X : GAP_Y));
+      }));
+      const lo = -Math.max(0, least === Infinity ? 0 : least), z = view(ws).z, sx = e.clientX, sy = e.clientY, id = e.pointerId;
+      let d = 0, pulled = false;
+      h.busy(true);
