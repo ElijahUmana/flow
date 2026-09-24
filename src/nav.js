@@ -1302,3 +1302,329 @@
       const lo = -Math.max(0, least === Infinity ? 0 : least), z = view(ws).z, sx = e.clientX, sy = e.clientY, id = e.pointerId;
       let d = 0, pulled = false;
       h.busy(true);
+      if (e.isTrusted) sec.setPointerCapture(id);
+      const move = (ev) => {
+        if (ev.pointerId !== id) return;
+        const px = X ? ev.clientX - sx : ev.clientY - sy;
+        if (!pulled && px === 0) return;
+        if (!pulled) sec.style.cursor = X ? 'col-resize' : 'row-resize';
+        pulled = true;
+        const nd = Math.max(lo, (px / z / (X ? size().vw : size().vh)) * 100);
+        if (Math.abs(nd - d) < 0.01) return;
+        h.moveWindows(ws, m, X ? nd - d : 0, X ? 0 : nd - d);
+        d = nd;
+      };
+      const up = (ev) => {
+        if (ev.pointerId !== id) return;
+        sec.removeEventListener('pointermove', move);
+        sec.removeEventListener('pointerup', up);
+        sec.removeEventListener('pointercancel', up);
+        sec.removeEventListener('lostpointercapture', up);
+        sec.style.cursor = '';
+        h.busy(false);
+        if (!pulled && ev.type === 'pointerup') h.moveWindows(ws, m, X ? b.far.w + GAP_X : 0, X ? 0 : b.far.h + GAP_Y, true);
+        sizeCanvas(ws);
+        h.changed(ws);
+      };
+      sec.addEventListener('pointermove', move);
+      sec.addEventListener('pointerup', up);
+      sec.addEventListener('pointercancel', up);
+      sec.addEventListener('lostpointercapture', up);
+      return true;
+    }
+
+    /* ---------- three fingers: the next or previous space; four: the next or previous workspace ---------- */
+    /* A sideways swipe moves what is on screen and what is beside it with the fingers, as macOS moves its Spaces
+       (owner, Nov 2 14:1x): every step of the fingers' travel 1:1 on screen, the momentum after they lift too. With
+       three fingers (the trackpad's touch count, fingers()) that is the space on screen and the one beside it in its
+       workspace; with four it is the strip of workspaces. Let go (the fingers lift, or no travel for SWIPE_END_MS, or a
+       forward flick's momentum dies out), it
+       completes past half the view, or after a flick of FLICK or faster not pulled back, going on at the speed it
+       had; else it goes back. Reaching the next one completes it at once. At the first or last one, and in a pop-out
+       of one (sub-)workspace, it pulls at most SWIPE_RUB and goes back. One step at most per gesture; a gesture that
+       goes on by event time after it went back picks up again. The space beside is drawn where its own view shows it,
+       one view to the side, each space only inside its own view (app.js peek lays it out, a frame after the first
+       step, so that step is handled at once). */
+    let slide = null, touch = { n: 0, t: -Infinity, travel: false, was: 0, pinchBy: '' }, touchHeld = false, touchFree = 0;
+    const warned = new Set();
+    const warnOnce = (k, msg) => { if (!warned.has(k)) { warned.add(k); console.error(msg); } };
+    const strip = () => (typeof h.track === 'function' ? h.track() : null);
+    const ease = (p) => 1 - Math.pow(1 - p, 3);
+    const boxOf = (el) => ({ x: parseFloat(el.style.left) || 0, y: parseFloat(el.style.top) || 0, w: parseFloat(el.style.width) || 0, h: parseFloat(el.style.height) || 0 });
+    /* The part of a window (b, in its space's px) outside view v, as a clip-path. */
+    function clipTo(b, v) {
+      const { vw, vh } = size();
+      return `inset(${Math.max(0, v.y - b.y)}px ${Math.max(0, b.x + b.w - v.x - vw / v.z)}px ${Math.max(0, b.y + b.h - v.y - vh / v.z)}px ${Math.max(0, v.x - b.x)}px)`;
+    }
+    /* kind: 'space' (two fingers) or 'ws' (three). */
+    function slideStart(ws, kind) {
+      const order = kind === 'ws' ? h.workspaces() : h.spaces(ws), from = kind === 'ws' ? ws : h.space(ws);
+      slide = { kind, ws, from, order, i: order.indexOf(from), gest, dir: 0, to: undefined, off: 0, shown: 0, v: 0, fwd: 0, lt: 0, late: 0, dying: 0, timer: 0, raf: 0, peekRaf: 0, going: false, own: [], peek: [] };
+      // the same gesture again after a let-go that took it back (its wheels came late): its last event time and speed go on
+      if (gest && gest.carry) Object.assign(slide, gest.carry);
+      const el = kind === 'ws' ? strip() : h.canvas(ws);
+      if (el) el.style.willChange = 'transform';
+      if (kind === 'space' && typeof h.peek !== 'function') warnOnce('peek', 'app.js does not pass peek, so a swipe cannot show the space beside');
+      if (kind === 'ws' && (typeof h.goWs !== 'function' || !strip())) warnOnce('goWs', 'app.js does not pass track and goWs, so three fingers cannot move the workspaces');
+    }
+    /* Toward dir: the one beside that way; for a space, laid out and drawn one view to the side, the one on screen kept to its view. */
+    function slideAim(s, dir) {
+      slideUnpeek(s);
+      s.dir = dir;
+      if (s.kind === 'ws') {
+        s.to = dir && !h.solo && s.i >= 0 && typeof h.goWs === 'function' && strip() ? s.order[s.i + dir] : undefined;
+        return;
+      }
+      s.to = dir && h.solo !== 'zone' && s.i >= 0 && typeof h.peek === 'function' ? s.order[s.i + dir] : undefined;
+      if (s.to === undefined) return;
+      const c = h.canvas(s.ws), v0 = view(s.ws);
+      s.own = here(s.ws).filter((w) => !winAway(s.ws, w)).map((w) => c && c.querySelector(`:scope > .win[data-id="${CSS.escape(w.id)}"]`)).filter(Boolean);
+      s.own.forEach((el) => { el.style.clipPath = clipTo(boxOf(el), v0); });
+      s.peekRaf = requestAnimationFrame(() => { if (slide === s && s.dir === dir) slidePeek(s); });
+    }
+    function slidePeek(s) {
+      const { vw } = size(), v0 = view(s.ws), v1 = viewIn(s.ws, s.to);
+      s.peek = (h.peek(s.ws, s.to) || []).map((o) => o.el).filter(Boolean);
+      s.peek.forEach((el) => {
+        const b = boxOf(el), x = ((b.x - v1.x) * v1.z + s.dir * vw) / v0.z + v0.x, y = ((b.y - v1.y) * v1.z) / v0.z + v0.y;
+        Object.assign(el.style, { transformOrigin: '0 0', transform: `translate(${x - b.x}px, ${y - b.y}px) scale(${v1.z / v0.z})`, clipPath: clipTo(b, v1) });
+      });
+    }
+    function slideUnpeek(s) {
+      cancelAnimationFrame(s.peekRaf);
+      s.own.forEach((el) => { el.style.clipPath = ''; });
+      s.own = [];
+      const peeked = s.peek.length > 0;
+      s.peek.forEach((el) => Object.assign(el.style, { transform: '', transformOrigin: '', clipPath: '' }));
+      s.peek = [];
+      if (peeked) h.peek(s.ws, undefined);
+    }
+    /* Where it is drawn: a space by the canvas's x offset, the workspaces by the strip's. */
+    function slidePaint(s) {
+      if (s.kind === 'ws') {
+        const t = strip();
+        if (t) { t.style.transition = 'none'; t.style.transform = `translateX(calc(${-s.i * 100}% + ${-s.shown}px))`; }
+        return;
+      }
+      rubber = -s.shown;
+      show(s.ws, false, true);
+    }
+    function slideDraw(s) {
+      const { vw } = size(), a = Math.abs(s.off);
+      s.shown = s.to === undefined ? (Math.sign(s.off) * SWIPE_RUB * a) / (a + SWIPE_RUB * 1.5) : clamp(s.off, -vw, vw);
+      slidePaint(s);
+    }
+    /* One step of the swipe: dx px at event time t. lifted: the touch stream says the fingers came off (three fingers). */
+    function slideMove(s, dx, t) {
+      if (s.going) return;
+      const dt = s.lt ? t - s.lt : 0;
+      s.lt = t;
+      s.late = Math.max(0, performance.now() - t);
+      if (dt > 0) { const v = dx / Math.max(dt, 4); s.v = s.v ? 0.5 * s.v + 0.5 * v : v; }
+      s.off += dx;
+      const dir = Math.sign(s.off);
+      if (dir && dir !== s.dir) slideAim(s, dir);
+      if (Math.sign(s.v) === s.dir) s.fwd = Math.max(s.fwd, Math.abs(s.v));
+      else if (Math.abs(s.v) > 0.05) { s.fwd = 0; s.dying = 0; }
+      if (s.to !== undefined && Math.abs(s.off) >= size().vw) { slideGo(s, true); return; }
+      slideDraw(s);
+      clearTimeout(s.timer);
+      /* by event time: the latest step coming late (a loaded machine) gives it as much longer, not the gesture's latest
+         ever (lead, Nov 2 19:1x: that held the board up to a second after the fingers lifted), and it is checked in a
+         frame, before which the page is handed any wheels already waiting; fingers still down hold it (their lift lets
+         go, as in macOS Spaces) */
+      const at = s.lt;
+      s.timer = setTimeout(() => requestAnimationFrame(() => { if (s.lt === at && !(s.byTouch && touch.n >= 3)) slideLetGo(s, s.fwd >= FLICK); }), SWIPE_END_MS + Math.min(s.late, 1000));
+      /* a forward flick slowing to nothing: its momentum dying out, or fingers about to come back; after DYING_MS of
+         event time without coming back, it was the momentum, and the switch goes on from here */
+      if (s.to !== undefined && s.fwd >= FLICK && Math.abs(s.v) < FLICK / 6 && !(s.byTouch && touch.n >= 3)) {
+        if (!s.dying) s.dying = t;
+        else if (t - s.dying >= DYING_MS) slideLetGo(s, true);
+      } else s.dying = 0;
+    }
+    /* Let go: on past half the view, or after a flick not pulled back since (flicked), else back. */
+    function slideLetGo(s, flicked) {
+      if (slide !== s || s.going) return;
+      slideGo(s, s.to !== undefined && (Math.abs(s.off) >= size().vw / 2 || flicked));
+    }
+    /* On to the one beside (done) or back, from where it is drawn at the speed it had; the rest of the gesture's
+       steps go nowhere while it moves. */
+    function slideGo(s, done) {
+      clearTimeout(s.timer);
+      s.going = true;
+      s.goingOn = done;
+      if (s.gest) s.gest.done = true;
+      const from = s.shown, to = done ? s.dir * size().vw : 0, dist = Math.abs(to - from);
+      const ms = dist < 0.5 ? 0 : clamp((3 * dist) / Math.max(Math.abs(s.v), 0.8), 140, done ? 380 : 320), t0 = performance.now();
+      const frame = (now) => {
+        if (slide !== s) return;
+        if (h.current() !== s.ws || (s.kind === 'space' && h.space(s.ws) !== s.from)) { slideEnd(s, false); return; }
+        const p = ms ? clamp((now - t0) / ms, 0, 1) : 1;
+        s.shown = from + (to - from) * ease(p);
+        slidePaint(s);
+        if (p < 1) s.raf = requestAnimationFrame(frame);
+        else slideEnd(s, done);
+      };
+      s.raf = requestAnimationFrame(frame);
+    }
+    /* The one beside becomes the one on screen exactly where it is drawn, or the one on screen is alone again. */
+    function slideEnd(s, done) {
+      cancelAnimationFrame(s.raf);
+      clearTimeout(s.timer);
+      if (slide === s) slide = null;
+      const g = s.gest;
+      if (g) {
+        if (done) { g.switched = true; g.last = Math.max(g.last, performance.now()); } else if (!g.switched) { g.done = false; g.carry = { lt: s.lt, v: s.v, fwd: s.fwd }; }
+      }
+      if (s.kind === 'ws') {
+        const t = strip();
+        if (t) t.style.willChange = '';
+        if (typeof h.goWs === 'function') h.goWs(done ? s.i + s.dir : s.i, { still: true });
+        return;
+      }
+      rubber = 0;
+      const c = h.canvas(s.ws);
+      if (c) c.style.willChange = '';
+      if (done) {
+        cancelAnimationFrame(s.peekRaf);
+        s.own.forEach((el) => { el.style.clipPath = ''; });
+        h.showSpace(s.ws, s.to, { still: true });
+        show(s.ws, false);
+        s.peek.forEach((el) => Object.assign(el.style, { transform: '', transformOrigin: '', clipPath: '' }));
+      } else {
+        slideUnpeek(s);
+        show(s.ws, false);
+      }
+    }
+    /* Anything else that takes the space (a press, a pinch) ends a swipe where it is going. */
+    function slideStop() {
+      const s = slide;
+      if (!s) return;
+      slideEnd(s, s.going && s.to !== undefined && Math.abs(s.shown) > size().vw / 2);
+    }
+    /* The trackpad's touch count from the native stream: while three or more fingers are down, pages are covered so
+       their wheels come here and nothing scrolls under them; the fingers lifting let a swipe go at once. travel: the
+       touches' own sideways px since the last report, which the fingers then follow instead of the wheels. Three move
+       the spaces of the workspace, WS_FINGERS the workspaces. pinch: three fingers spread (above 1) or closed by that
+       ratio since the last report, at x, y (the pointer, in this window's px); it zooms the space there as a pinch's
+       wheels would. A touch's pinch is the stream's or the wheels', whichever came first (pinchBy), never both, and a
+       touch that pinched steps nothing after. */
+    function fingers(n, t, travel, pinch, x, y) {
+      const was = touch.n, same = n >= 3 && was >= 3;
+      touch = { n, t, travel: Number.isFinite(travel), was: n >= 3 ? n : was >= 3 ? was : 0, pinchBy: same ? touch.pinchBy : '' };
+      _counts.push({ n, t });
+      while (_counts.length && t - _counts[0].t > 600) _counts.shift();
+
+      if (n >= 3) {
+        clearTimeout(touchFree);
+        if (!touchHeld) { touchHeld = true; h.busy(true); }
+        if (pinch > 0) {
+          // a two-finger pinch is marked 'win' so it becomes no step, though its wheels, not its touches, do the zooming
+          const kind = pinchKind(t);
+          if (kind === 'win') touch.pinchBy = 'win';
+          else {
+            if (!touch.pinchBy) touch.pinchBy = 'stream';
+            if (touch.pinchBy === 'stream') zoomAt(-100 * Math.log(pinch), x, y, t, 'stream');
+          }
+        } else if (Number.isFinite(travel) && travel && !touch.pinchBy) takeFingers(n >= WS_FINGERS ? 'ws' : 'space', travel, t);
+      } else if (was >= 3) {
+        if (slide && slide.byTouch) slideLetGo(slide, slide.fwd >= FLICK);
+        touchFree = setTimeout(() => { if (touchHeld && touch.n < 3) { touchHeld = false; h.busy(false); } }, GAP_MS);
+      }
+    }
+    /* A step of a three- or four-finger swipe (kind 'space' or 'ws'): dx px at time t, from the touches or (with no
+       travel in the stream) the wheels. A change in the count mid-swipe starts the other kind. */
+    function takeFingers(kind, dx, t) {
+      if (!gest || t - gest.last > GAP_MS || gest.owner !== 'fingers' || gest.kind !== kind) {
+        if (slide) slideStop();
+        gest = { start: t, last: t, sx: 0, sy: 0, travel: 0, owner: 'fingers', kind, acc: 0, done: false, switched: false, bare: false };
+      }
+      gest.last = Math.max(gest.last, t);
+      if (gest.done) return;
+      stopFling();
+      if (!slide && h.current()) { slideStart(h.current(), kind); slide.byTouch = true; }
+      if (slide && slide.kind === kind) slideMove(slide, dx, t);
+    }
+    /* macOS's own swipe (Electron's 'swipe', passed on by touch.js), dir 'left' or 'right'. With Swipe between pages on
+       two or three fingers it comes once at the end of a quick three-finger flick, and macOS keeps the third finger
+       from the touch stream (MAC_NOTES 32), so on such a Mac this is all Flow sees of three fingers: one step to the
+       space beside, as three fingers moving would. With Flow's trackpad settings on (touch.js: macOS's three-finger
+       swipes off) it does not come at all. It also comes at the end of some two-finger swipes (owner, Nov 7, 01/14:
+       two fingers switched workspaces; 10 of the 79 in the owner's run 3, MAC_NOTES 28): one within GAP_MS of two
+       fingers that moved TWO_PX is theirs, and does nothing. */
+    function systemSwipe(dir, t) {
+      if (gest && gest.owner !== 'fingers' && t - gest.last <= GAP_MS && gest.travel >= TWO_PX) return;
+      // the end of a swipe the touch stream already followed (three or four fingers it saw): that gesture's own end
+      if (touch.n >= 3 || (t - touch.t <= GAP_MS && touch.was >= 3)) return;
+      const ws = h.current();
+      if (!ws || h.solo === 'zone') return;
+      stopFling();
+      slideStop();
+      gest = null;
+      slideStart(ws, 'space');
+      const s = slide;
+      slideAim(s, dir);
+      if (s.to === undefined) {
+        // at the first or last space it pulls a little and comes back, as a swipe there does
+        s.shown = (dir * SWIPE_RUB) / 3;
+        slidePaint(s);
+      }
+      slideGo(s, s.to !== undefined);
+    }
+    /* Two fingers (wheels) are one gesture with one owner, chosen at its start: three or more fingers down (the touch
+       stream) give it to them; else the board (pan), when it started over bare desktop or moves mostly sideways over
+       something that cannot scroll that way; else content (a terminal, page or note scrolls as before). The board moves
+       with the fingers 1:1 in any direction, and macOS's momentum after they lift carries it on. Steadied: a gesture
+       that starts AXIS times more along one axis than the other keeps to that axis, so a hand's wobble does not shake
+       the board, until a step moves more across it than along it (the fingers turned); over a window only its sideways
+       part moves the board, so up and down stay the window's. The gap that ends a gesture is measured by
+       event time, so events that waited behind a slow one stay part of it. bare: the gesture's first event was over
+       bare desktop. late: a page's wheel, whose page can tell it used the wheel only after (it scrolled something
+       beside the wheel's path, as a spreadsheet does); such a wheel hands the gesture back to the page. Returns whether
+       nav took this event. */
+    function take(dx, dy, t, canScroll, bare, late) {
+      if (touch.n >= 3) {
+        if (!touch.travel && !touch.pinchBy && Math.abs(dx) >= Math.abs(dy)) takeFingers(touch.n >= WS_FINGERS ? 'ws' : 'space', dx, t);
+        return true;
+      }
+      if (!gest || t - gest.last > GAP_MS || gest.owner === 'fingers') {
+        if (slide && !slide.going) slideStop();
+        gest = { start: t, last: t, sx: 0, sy: 0, travel: 0, owner: '', axis: '', acc: 0, done: false, switched: false, bare: !!bare };
+      }
+      gest.last = Math.max(gest.last, t);
+      gest.travel += Math.abs(dx) + Math.abs(dy);
+      if (!gest.owner) {
+        gest.sx += dx;
+        gest.sy += dy;
+        if (Math.abs(gest.sx) + Math.abs(gest.sy) < DECIDE_PX) return Math.abs(dx) > Math.abs(dy) || gest.bare;
+        const side = Math.abs(gest.sx) > Math.abs(gest.sy);
+        gest.owner = gest.bare || (side && !canScroll(gest.sx > 0 ? 1 : -1)) ? 'pan' : 'content';
+        if (gest.owner === 'content') return false;
+        stopFling();
+        gest.axis = !gest.bare ? 'x' : Math.abs(gest.sx) > AXIS * Math.abs(gest.sy) ? 'x' : Math.abs(gest.sy) > AXIS * Math.abs(gest.sx) ? 'y' : '';
+        dx = gest.sx;
+        dy = gest.sy;
+      }
+      if (gest.owner === 'pan' && late && canScroll(dx > 0 ? 1 : -1)) gest.owner = 'content';
+      if (gest.owner !== 'pan') return false;
+      // a step that moves more across a kept axis than along it, by DECIDE_PX or more, is the fingers turning: free
+      const across = gest.axis === 'x' ? dy : dx, along = gest.axis === 'x' ? dx : dy;
+      if (gest.bare && gest.axis && Math.abs(across) > Math.abs(along) && Math.abs(across) >= DECIDE_PX) gest.axis = '';
+      panBy(gest.axis === 'y' ? 0 : dx, gest.axis === 'x' ? 0 : dy);
+      return true;
+    }
+
+    let _counts = [];   // { n, t } of the last 600 ms of counts, for a pinch's start (pinchKind)
+    /* What a pinch at t (performance clock) is for, decided once, at its first event: 'space' when three or more fingers
+       were down as it began, 'win' under two. His two fingers land one after the other and a third one brushes in
+       mid-pinch for a moment, which used to flip a page pinch into a workspace zoom (owner, Nov 8), so it is decided
+       once and latched for the whole pinch: only no wheel for GAP_MS starts another. Three fingers are looked for a
+       moment back too (PINCH_START_MS), in case the third touch reaches here after the pinch's first wheel. With no
+       touch stream at all (no module), touch.n stays 0 and every pinch is the window's, as it was without the counts. */
+    let pinchK = null;   // { kind, last }
+    function pinchKind(t) {
+      if (pinchK && t - pinchK.last <= GAP_MS) { pinchK.last = Math.max(pinchK.last, t); return pinchK.kind; }
+      let peak = touch.n;
+      for (const c of _counts) if (t - c.t <= PINCH_START_MS && c.n > peak) peak = c.n;
+      pinchK = { kind: peak >= 3 ? 'space' : 'win', last: t };
+      return pinchK.kind;
