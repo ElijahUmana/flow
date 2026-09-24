@@ -324,3 +324,329 @@
     /* What green fills: the view, inside its margins. */
     function fillRect(ws) {
       const vr = visible(ws), k = 1 / vr.z;
+      return { x: vr.x + 0.6 * k, y: vr.y + 4.6 * k, w: 98.8 * k, h: (bottom() - 4.6) * k };
+    }
+    /* Pans the space on screen just enough that a window is in view, as much of it as fits: past the right side its
+       right edge comes in, past the left side (or wider than the view) its left edge. What was in view stays in view as
+       far as it can, so a fork that lands beside its parent leaves the parent in view. The zoom stays as it is: making or
+       going to a window far out never brings the space back to 100% (owner, Nov 2 14:03). */
+    function reveal(ws, g) {
+      const vr = visible(ws), { vw, vh } = size(), k = 1 / vr.z;
+      let x = vr.x, y = vr.y;
+      if (g.x + g.w > vr.x + vr.w) x = g.x + g.w + SIDE * k - vr.w;
+      if (g.x < x) x = g.x - SIDE * k;
+      if (g.y + g.h > vr.y + vr.h) y = g.y + g.h + (100 - bottom()) * k - vr.h;
+      // the top bar lies over the view's top: a bar under it is not in view (sidebar, Nov 2 17:4x)
+      const bar = document.querySelector('.menubar'), under = bar ? ((bar.getBoundingClientRect().bottom - vp.getBoundingClientRect().top) / vh) * 100 : 0;
+      if (g.y < y + Math.max(0, under) * k) y = g.y - TOP * k;
+      if (x !== vr.x || y !== vr.y) setView(ws, { x: (x / 100) * vw, y: (y / 100) * vh, z: vr.z }, true);
+    }
+    /* The first-run layout is drawn so its bottom row ends at 88.4% of the height: this stretches it to end at the
+       bottom on whatever screen it opens on. Windows you moved are restored where you left them, untouched. */
+    function fitStart(list) {
+      const k = (bottom() - TOP) / (88.4 - TOP), fy = (y) => TOP + (y - TOP) * k;
+      list.forEach((ws) => ws.windows.forEach((r) => { const b = fy(r.y + r.h); r.y = fy(r.y); r.h = b - r.y; }));
+    }
+    /* On load: a window dragged past the left edge before that was stopped comes back into reach. A view comes back
+       exactly as it was left, wherever that is (the edge glows point to the windows). Returns how many. Only at Flow's
+       start: a pop-out leaves the saved state as it is, room added and not used yet included. */
+    function recover(list) {
+      if (h.solo) return 0;
+      let n = converted;
+      list.forEach((ws) => {
+        [...ws.windows, ...ws.closed].forEach((w) => { if (w.x < 0) { w.x = SIDE; n++; } });
+        [null, ...(ws.zones || []).map((zn) => zn.id)].forEach((sid) => {
+          const zn = zoneOf(ws, sid), [o, k] = sid === h.space(ws) ? [ws, 'pan', 'zoom'] : zn ? [zn, 'pan', 'zoom'] : [ws, 'mainPan', 'mainZoom'];
+          const ho = holderOf(ws, sid), l = ho.roomLeft || 0, here = [...ws.windows, ...ws.closed].filter((w) => inSpace(w, sid));
+          if (l && !here.some((w) => w.x < l)) {
+            here.forEach((w) => { w.x -= l; if (w.max) w.max.x -= l; });
+            o[k] = Math.max(0, (o[k] || 0) - l);
+            n++;
+          }
+          if (l || ho.roomRight) { delete ho.roomLeft; delete ho.roomRight; n++; }
+        });
+      });
+      return n;
+    }
+    /* The overview's click or drag (src/overview.js): the view centered on x, y (% of the space on screen), at its zoom.
+       Along a side where all of the space is in view already, the view stays. */
+    function goTo(ws, x, y, animate) {
+      stopFling();
+      const { vw, vh } = size(), v = view(ws);
+      const fitsX = (spaceEnd(ws) / 100) * vw <= vw / v.z, fitsY = (spaceBottom(ws) / 100) * vh <= vh / v.z;
+      setView(ws, { x: fitsX ? v.x : (x / 100) * vw - vw / v.z / 2, y: fitsY ? v.y : (y / 100) * vh - vh / v.z / 2, z: v.z }, animate);
+    }
+
+    /* ---------- drag the empty desktop, and let it glide ---------- */
+    /* While the desktop is held or glides, the canvas is a layer of its own, so a frame only moves it. */
+    function showPan(ws, x, y, z) {
+      const c = h.canvas(ws);
+      if (c && c.style.willChange !== 'transform') c.style.willChange = 'transform';
+      setView(ws, { x, y, z }, false, 0, true);
+    }
+    function settle(ws) {
+      const c = h.canvas(ws);
+      if (c) c.style.willChange = '';
+      rubber = 0;
+      show(ws, false);
+      h.changed(ws);
+    }
+    function stopFling() {
+      if (!fling) return;
+      const f = fling;
+      fling = null;
+      cancelAnimationFrame(f.raf);
+      settle(f.ws);
+    }
+    /* A glide ends by itself when the workspace or space changes, or anything else pans or zooms the space. A release
+       below the shared animation cutoff still glides once, visibly, then settles: the cutoff is held to a quarter of
+       the actual release speed so a one-pixel flick travels a fraction of its direction before stopping. */
+    function startFling(ws, x, y, vx, vy) {
+      const z = view(ws).z, end = Math.min(FLING_END, Math.hypot(vx, vy) * z * 0.25);
+      let last = performance.now();
+      const frame = (now) => {
+        const dt = Math.min(250, Math.max(0, now - last));
+        last = now;
+        const v0 = view(ws);
+        if (h.current() !== ws || h.space(ws) !== fling.space || v0.z !== z || Math.abs(v0.x - fling.x) > 0.5 || Math.abs(v0.y - fling.y) > 0.5) { stopFling(); return; }
+        const speed = Math.hypot(vx, vy) * z;
+        const q = clamp(speed / FLING_MAX, 0, 1);
+        const decay = FLING_DECAY_SLOW + (FLING_DECAY_FAST - FLING_DECAY_SLOW) * q;
+        vx *= Math.pow(decay, dt);
+        vy *= Math.pow(decay, dt);
+        x += vx * dt;
+        y += vy * dt;
+        showPan(ws, x, y, z);
+        const v1 = view(ws);
+        fling.x = v1.x;
+        fling.y = v1.y;
+        if (Math.hypot(vx, vy) * z < end) { stopFling(); return; }
+        fling.raf = requestAnimationFrame(frame);
+      };
+      const v = view(ws);
+      fling = { ws, space: h.space(ws), x: v.x, y: v.y, raf: requestAnimationFrame(frame) };
+    }
+    /* A drag that starts while the space is still sliding somewhere starts from where it is on screen. */
+    function freeze(ws) {
+      const c = h.canvas(ws);
+      if (!c) return;
+      const m = new DOMMatrixReadOnly(getComputedStyle(c).transform), v = view(ws);
+      const x = -m.m41 / m.a, y = -m.m42 / m.a;
+      if (Math.abs(x - v.x) > 0.5 || Math.abs(y - v.y) > 0.5) setView(ws, { x, y, z: v.z }, false, 0);
+    }
+    function startPan(e, ws, sec) {
+      e.preventDefault();
+      const a = document.activeElement;
+      if (a && a !== document.body && a.blur) a.blur();
+      freeze(ws);
+      const id = e.pointerId;
+      let v0 = view(ws), sx = e.clientX, sy = e.clientY, lx = sx, ly = sy;
+      let x = v0.x, y = v0.y, sampled = { x: sx, y: sy, t: e.timeStamp }, moved = false, lastDx = 0, lastDy = 0, recentSpeed = 0, lastMove = e.timeStamp;
+      const sample = (c) => {
+        const dx = c.clientX - sampled.x, dy = c.clientY - sampled.y;
+        if (!dx && !dy) return;
+        const distance = Math.hypot(dx, dy), dt = clamp(c.timeStamp - sampled.t, VEL_MIN_MS, VEL_MS);
+        moved = true;
+        lastDx = dx;
+        lastDy = dy;
+        recentSpeed = distance / dt;
+        lastMove = c.timeStamp;
+        sampled = { x: c.clientX, y: c.clientY, t: c.timeStamp };
+      };
+      /* A pinch while the desktop is held: the drag goes on from the new zoom, under the same point. */
+      grab = { ws, rebase: () => {
+        v0 = view(ws);
+        sx = lx;
+        sy = ly;
+        x = v0.x;
+        y = v0.y;
+        sampled = { x: lx, y: ly, t: performance.now() };
+        lastDx = 0;
+        lastDy = 0;
+        recentSpeed = 0;
+        lastMove = -Infinity;
+      } };
+      h.busy(true);
+      vp.classList.add('panning');
+      if (e.isTrusted) sec.setPointerCapture(id);
+      const move = (ev) => {
+        if (ev.pointerId !== id) return;
+        const all = ev.getCoalescedEvents ? ev.getCoalescedEvents() : [];
+        (all.length ? all : [ev]).forEach(sample);
+        lx = ev.clientX;
+        ly = ev.clientY;
+        x = v0.x - (ev.clientX - sx) / v0.z;
+        y = v0.y - (ev.clientY - sy) / v0.z;
+        showPan(ws, x, y, v0.z);
+      };
+      const up = (ev) => {
+        if (ev.pointerId !== id) return;
+        if (ev.type === 'pointerup' && (ev.clientX !== lx || ev.clientY !== ly)) move(ev);
+        sec.removeEventListener('pointermove', move);
+        sec.removeEventListener('pointerup', up);
+        sec.removeEventListener('pointercancel', up);
+        sec.removeEventListener('lostpointercapture', up);
+        grab = null;
+        vp.classList.remove('panning');
+        h.busy(false);
+        click = ev.type === 'pointerup' && !moved ? { t: ev.timeStamp, x: ev.clientX, y: ev.clientY } : null;
+        const direction = Math.hypot(lastDx, lastDy), speed = Math.min(recentSpeed, FLING_MAX);
+        if (ev.type === 'pointerup' && moved && ev.timeStamp - lastMove < STILL_MS && direction > 0 && h.current() === ws) {
+          const k = speed / direction / v0.z;
+          startFling(ws, x, y, -lastDx * k, -lastDy * k);
+        } else settle(ws);
+      };
+      sec.addEventListener('pointermove', move);
+      sec.addEventListener('pointerup', up);
+      sec.addEventListener('pointercancel', up);
+      sec.addEventListener('lostpointercapture', up);
+    }
+    /* The second press of a double-click between two windows opens room there (startRoom); any other press pans. press:
+       where the last press on the desktop was, so a double-click counts only where it was let go (not a pull). */
+    let click = null, press = null;
+    vp.addEventListener('pointerdown', (e) => {
+      stopFling();
+      slideStop();
+      if (e.button !== 0 || !e.target.closest) return;
+      const grip = e.target.closest('.win .rz');
+      const blank = e.target.matches('.win > .nd, .win .pgc, .win .npane');
+      if (!grip && e.target.closest('.win, .away') && !blank) return;
+      const sec = e.target.closest('.ws');
+      const ws = h.current();
+      if (!sec || !ws || sec.dataset.id !== ws.id) return;
+      const c = click, again = !!c && e.timeStamp - c.t < DBL_MS && Math.hypot(e.clientX - c.x, e.clientY - c.y) < 6;
+      click = null;
+      press = { x: e.clientX, y: e.clientY };
+      /* Two close windows' resize grips can cover the whole gap between them: a double-click there still opens room,
+         and a press that is not one resizes as before. */
+      if (grip) {
+        if (again && !inBand(e.clientX, e.clientY) && between(ws, toSpace(ws, e.clientX, e.clientY)) && startRoom(e, ws, sec)) { e.stopPropagation(); return; }
+        if (e.altKey && startSpace(e, ws, sec, true)) { e.stopPropagation(); return; }
+        const x0 = e.clientX, y0 = e.clientY;
+        window.addEventListener('pointerup', (u) => { click = u.clientX === x0 && u.clientY === y0 ? { t: u.timeStamp, x: u.clientX, y: u.clientY } : null; }, { once: true, capture: true });
+        return;
+      }
+      if (again && !inBand(e.clientX, e.clientY) && startRoom(e, ws, sec)) return;
+      if (e.altKey && !e.target.closest('.win') && startSpace(e, ws, sec)) return;
+      startPan(e, ws, sec);
+    }, true);
+
+    /* While a dragged window is near a side of the view, its space pans that way and the window goes along: moved(dx, dy)
+       gets each step in px at zoom 1; at the bottom that grows the space down. grow(dx), asked first for each step to
+       the left, opens room there instead when the window is at the space's own left side (owner, 22:50) and says whether
+       it did. cx null stops it. */
+    function edgePan(ws, cx, moved, grow, cy) {
+      const r = vp.getBoundingClientRect();
+      const near = (c, lo, hi) => (c == null ? 0 : c < lo + EDGE_PX ? (c - lo - EDGE_PX) / EDGE_PX : c > hi - EDGE_PX ? (c - hi + EDGE_PX) / EDGE_PX : 0);
+      const depth = near(cx, r.left, r.right), depthY = cx == null ? 0 : near(cy, r.top, r.bottom);
+      if (!depth && !depthY) {
+        if (edgeLoop) { cancelAnimationFrame(edgeLoop.raf); edgeLoop = null; }
+        return;
+      }
+      if (edgeLoop) { Object.assign(edgeLoop, { depth, depthY, moved, grow }); return; }
+      let last = performance.now();
+      const frame = (now) => {
+        const dt = Math.min(250, Math.max(0, now - last));
+        last = now;
+        const v = view(ws), step = (clamp(edgeLoop.depth, -1, 1) * 0.9 * dt) / v.z, down = (clamp(edgeLoop.depthY, -1, 1) * 0.9 * dt) / v.z;
+        sizeCanvas(ws);
+        // left of or above the space's start the board grows there under the held window instead (app.js: the others move)
+        const grew = step < 0 && edgeLoop.grow && edgeLoop.grow(-step, 0), grewY = down < 0 && edgeLoop.grow && edgeLoop.grow(0, -down);
+        setView(ws, { x: grew ? v.x : v.x + step, y: grewY ? v.y : v.y + down, z: v.z }, false);
+        const d = view(ws).x - v.x, dy = view(ws).y - v.y;
+        if (d || dy) edgeLoop.moved(d, dy);
+        edgeLoop.raf = requestAnimationFrame(frame);
+      };
+      edgeLoop = { depth, depthY, moved, grow, raf: requestAnimationFrame(frame) };
+    }
+
+    /* ---------- room (owner, 21:50 and 22:50) ---------- */
+    /* The windows that make way when room opens at a line of the space on screen: those entirely past it on side (1
+       right or below, -1 left) that are in its way along [from, to] (the stretch of the line that opens, in the other
+       axis), and the ones in their way or sitting against them (ATTACH or closer), on and on. They all move by the same
+       amount, so their arrangement is kept and no window ends up over another. axis 'x': a line down the space at x =
+       line; 'y': across it at y = line. closed: closed windows too (only with the whole line). */
+    function inWay(ws, axis, line, side, from, to, closed) {
+      const X = axis === 'x', sid = h.space(ws), all = [...ws.windows, ...(closed ? ws.closed : [])].filter((w) => inSpace(w, sid));
+      const g = (w) => (ws.windows.includes(w) ? h.geo(w) : w);
+      const a0 = (r) => (X ? r.x : r.y), a1 = (r) => (X ? r.x + r.w : r.y + r.h);
+      const b0 = (r) => (X ? r.y : r.x), b1 = (r) => (X ? r.y + r.h : r.x + r.w);
+      const over = (p0, p1, q0, q1) => p0 < q1 - 0.05 && q0 < p1 - 0.05;
+      const past = all.filter((w) => (side > 0 ? a0(g(w)) >= line : a1(g(w)) <= line));
+      const moving = new Set(past.filter((w) => b0(g(w)) <= to + 0.05 && from - 0.05 <= b1(g(w))));
+      for (let grew = true; grew;) {
+        grew = false;
+        past.forEach((w) => {
+          if (moving.has(w)) return;
+          const r = g(w);
+          if ([...moving].some((m) => { const q = g(m);
+            return over(b0(r), b1(r), b0(q), b1(q)) || (over(a0(r), a1(r), a0(q), a1(q)) && Math.max(b0(r), b0(q)) - Math.min(b1(r), b1(q)) <= ATTACH); })) {
+            moving.add(w);
+            grew = true;
+          }
+        });
+      }
+      return [...moving];
+    }
+    /* Room opens at a line across the space on screen, along axis ('x': a vertical line at line % of the width, 'y': a
+       horizontal one at line % of the height): the windows, open or closed, entirely past it on side (1 right or down,
+       -1 left or up) move away from it by amount %, all together, so their arrangement is kept and nothing overlaps; the
+       rest stays and so does the view. Left and up keep x, y >= 0 the other way round: the rest and the view move
+       instead, so nothing on screen moves. With nothing past the line nothing moves. Returns how many windows lie past. */
+    function room(ws, axis, line, side, amount) {
+      const sid = h.space(ws), all = [...ws.windows, ...ws.closed].filter((w) => inSpace(w, sid)), X = axis === 'x';
+      const past = inWay(ws, axis, line, side, -Infinity, Infinity, true);
+      if (!past.length) return 0;
+      if (side > 0) h.moveWindows(ws, past, X ? amount : 0, X ? 0 : amount);
+      else {
+        if (X) ws.pan = (ws.pan || 0) + amount; else ws.panY = (ws.panY || 0) + amount;
+        h.moveWindows(ws, all.filter((w) => !past.includes(w)), X ? amount : 0, X ? 0 : amount);
+      }
+      return past.length;
+    }
+    /* A double-click on the bare desktop at an edge of the view, any of the four (owner, Nov 1 21:50 and 22:50, "even for
+       like below as well"; lead, Nov 2 14:4x), moves the windows lying entirely past that edge one view on (ADD, at
+       actual size, whatever the zoom), so a drag shows a view of room there next to what is in view. Nothing on screen
+       moves. At the right with nothing past it, the space itself gets a view more there (extendRight). */
+    function addRoom(ws, axis, side) {
+      stopFling();
+      const { vw, vh } = size(), v = view(ws), X = axis === 'x';
+      const line = X ? ((side > 0 ? v.x + vw / v.z : v.x) / vw) * 100 : ((side > 0 ? v.y + vh / v.z : v.y) / vh) * 100;
+      if (!room(ws, axis, line, side, ADD)) {
+        if (X && side > 0) extendRight(ws);
+        return;
+      }
+      sizeCanvas(ws);
+      h.changed(ws);
+    }
+    /* More workspace at the right with nothing dragged there (owner, Nov 7, 03/1): the space's right end moves one view on
+       (ADD) and the view glides over so the new room is in sight. */
+    function extendRight(ws) {
+      stopFling();
+      const { vw } = size(), v = view(ws), ho = holderOf(ws, h.space(ws)), end = spaceEnd(ws);
+      remember(ws, [], 0, 0, ho);
+      ho.roomRight = end + ADD;
+      sizeCanvas(ws);
+      setView(ws, { ...v, x: Math.max(v.x, ((end + ADD) / 100) * vw - vw / v.z) }, true);
+      h.changed(ws);
+    }
+
+    /* ---------- space at a point: cut it out or add it (owner, Nov 7: 02/6, 03/5, 03/9) ---------- */
+    /* "cut out spaces at different points" and "add just a specific amount of space at a certain point", seeing what it
+       does to everything around it. A line across the space (a vertical one at x for axis 'x', a horizontal one at y for
+       'y'): the windows entirely past it move together, by the same amount, as room() moves them, so their arrangement
+       is kept; the rest never moves. Cutting stops where a moving window would come closer than the usual gap to one
+       that stays level with it, or to the space's own start. */
+    function spaceAt(ws, axis, line) {
+      const X = axis === 'x', moving = inWay(ws, axis, line, 1, -Infinity, Infinity, true);
+      const open = moving.filter((w) => ws.windows.includes(w)), stay = here(ws).filter((w) => !moving.includes(w));
+      const a0 = (r) => (X ? r.x : r.y), a1 = (r) => (X ? r.x + r.w : r.y + r.h), b0 = (r) => (X ? r.y : r.x), b1 = (r) => (X ? r.y + r.h : r.x + r.w);
+      let lo = open.length ? -Infinity : 0;
+      open.forEach((m) => {
+        const M = h.geo(m);
+        lo = Math.max(lo, (X ? SIDE : TOP) - a0(M));
+        stay.forEach((s) => { const S = h.geo(s); if (b0(S) < b1(M) - 0.05 && b0(M) < b1(S) - 0.05) lo = Math.max(lo, a1(S) + (X ? GAP_X : GAP_Y) - a0(M)); });
+      });
+      // nothing past a line down the space: what can go is room added at its right end, back to its windows
+      if (!open.length && X) { const ho = holderOf(ws, h.space(ws)); lo = ho.roomRight ? Math.max(100, contentEnd(ws) + SIDE) - ho.roomRight : 0; }
+      return { moving, open, lo: Math.min(0, lo) };
