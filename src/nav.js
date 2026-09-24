@@ -650,3 +650,329 @@
       // nothing past a line down the space: what can go is room added at its right end, back to its windows
       if (!open.length && X) { const ho = holderOf(ws, h.space(ws)); lo = ho.roomRight ? Math.max(100, contentEnd(ws) + SIDE) - ho.roomRight : 0; }
       return { moving, open, lo: Math.min(0, lo) };
+    }
+    /* One step back for ⌘Z: the last change of space, while the windows it moved are still where it left them and no
+       other board action came after it (app.js asks with spaceUndo(t), t its own last step's time). */
+    let lastSpace = null;
+    function remember(ws, moving, dx, dy, ho) {
+      lastSpace = { ws, sid: h.space(ws), ho, roomRight: ho.roomRight, moving, dx, dy, at: moving.map((w) => [w.x, w.y]), t: performance.now() };
+    }
+    function spaceUndoReady(after) {
+      const u = lastSpace;
+      return !!u && u.t > (after || -Infinity) && h.current() === u.ws && h.space(u.ws) === u.sid
+        && u.moving.every((w, i) => Math.abs(w.x - u.at[i][0]) < 0.01 && Math.abs(w.y - u.at[i][1]) < 0.01);
+    }
+    function undoSpace(after) {
+      if (!spaceUndoReady(after)) return false;
+      const u = lastSpace;
+      lastSpace = null;
+      stopFling();
+      if (u.roomRight === undefined) delete u.ho.roomRight; else u.ho.roomRight = u.roomRight;
+      if (u.moving.length) h.moveWindows(u.ws, u.moving, -u.dx, -u.dy, true);
+      sizeCanvas(u.ws);
+      h.changed(u.ws);
+      return true;
+    }
+    /* Moves what lies past the line by d % (d < 0 cuts, at most down to spaceAt's lo) and remembers it for ⌘Z; past the
+       last window, added space across is more room at the right. Returns the amount it moved by. */
+    function shiftAt(ws, axis, line, d, slide) {
+      const at = spaceAt(ws, axis, line), X = axis === 'x', by = Math.max(at.lo, d), ho = holderOf(ws, h.space(ws));
+      if (!at.moving.length) {
+        if (!X || Math.abs(by) < 0.01) return 0;
+        remember(ws, [], 0, 0, ho);
+        ho.roomRight = by < 0 ? ho.roomRight + by : Math.max(spaceEnd(ws), line + by);
+        return by;
+      }
+      if (Math.abs(by) < 0.01) return 0;
+      h.moveWindows(ws, at.moving, X ? by : 0, X ? 0 : by, slide);
+      remember(ws, at.moving, X ? by : 0, X ? 0 : by, ho);
+      return by;
+    }
+    /* The empty space at a point (the desktop's right-click), cut out down to the usual gap: the gap across (between
+       windows side by side) where there is one, else the gap down. Returns whether anything moved. */
+    function cutAt(ws, p) {
+      stopFling();
+      const axis = spaceAt(ws, 'x', p.x).lo < -0.05 ? 'x' : spaceAt(ws, 'y', p.y).lo < -0.05 ? 'y' : null;
+      if (!axis || !shiftAt(ws, axis, axis === 'x' ? p.x : p.y, -Infinity, true)) return false;
+      sizeCanvas(ws);
+      h.changed(ws);
+      return true;
+    }
+    const canCut = (ws, p) => spaceAt(ws, 'x', p.x).lo < -0.05 || spaceAt(ws, 'y', p.y).lo < -0.05;
+    /* d % more across the space at p (the desktop's right-click: one view, ADD). */
+    function addAt(ws, p, d) {
+      stopFling();
+      if (!shiftAt(ws, 'x', p.x, d, true)) return false;
+      sizeCanvas(ws);
+      h.changed(ws);
+      return true;
+    }
+    /* Option-drag on bare desktop: the space tool. From the press point, drag right (or down) and space opens there by
+       exactly the amount dragged; drag left (or up) and the space there closes up by that much, down to the usual gap.
+       The windows that will move light up as the drag starts and follow the pointer the whole way; a band over the
+       stretch shows its size in px at actual size, green while adding, red while cutting. The first 4 px pick across or
+       down. Let go: done (⌘Z takes it back); Esc: everything back where it was. */
+    /* Two windows a usual gap apart are all resize grip on screen: an Option-press on a grip is the space tool's. Half a
+       grip lies over its window's edge: a press there puts the line just outside that edge, so the window itself never
+       counts as past it; anywhere else the line is where the press was. */
+    function gapLine(ws, p, axis) {
+      const X = axis === 'x', c = X ? p.x : p.y, o = X ? p.y : p.x;
+      const r = here(ws).map((w) => h.geo(w)).find((g) => (X ? g.x < c && c < g.x + g.w && g.y <= o && o <= g.y + g.h : g.y < c && c < g.y + g.h && g.x <= o && o <= g.x + g.w));
+      if (!r) return c;
+      const a0 = X ? r.x : r.y, a1 = X ? r.x + r.w : r.y + r.h;
+      return c - a0 < a1 - c ? a0 - 0.01 : a1 + 0.01;
+    }
+    function startSpace(e, ws, sec, grip) {
+      if (typeof h.moveWindows !== 'function') return false;
+      e.preventDefault();
+      stopFling();
+      const p = toSpace(ws, e.clientX, e.clientY), z = view(ws).z, sx = e.clientX, sy = e.clientY, id = e.pointerId, { vw, vh } = size();
+      let axis = null, at = null, d = 0, done = false, end0 = 0;
+      const c = h.canvas(ws), band = document.createElement('div'), label = document.createElement('span');
+      band.className = 'spaceband';
+      band.appendChild(label);
+      const lit = (on) => at && at.open.forEach((w) => { const el = c && c.querySelector(`:scope > .win[data-id="${CSS.escape(w.id)}"]`); if (el) el.classList.toggle('spacemove', on); });
+      const paint = () => {
+        // room taken back at the right end is drawn where that room is
+        const X = axis === 'x', line = X && !at.moving.length && d < 0 ? Math.min(p.x, end0) : X ? p.x : p.y, k = X ? vw : vh, v = view(ws);
+        const from = (Math.min(line, line + d) / 100) * k, len = (Math.abs(d) / 100) * k;
+        band.classList.toggle('cut', d < 0);
+        Object.assign(band.style, X
+          ? { left: from + 'px', width: len + 'px', top: v.y + 'px', height: vh / v.z + 'px' }
+          : { left: v.x + 'px', width: vw / v.z + 'px', top: from + 'px', height: len + 'px' });
+        label.style.fontSize = 12 / v.z + 'px';
+        label.textContent = len >= 0.5 ? `${d > 0 ? '+' : '\u2212'}${Math.round(len)} px` : '';
+      };
+      h.busy(true);
+      if (e.isTrusted) sec.setPointerCapture(id);
+      const move = (ev) => {
+        if (ev.pointerId !== id) return;
+        const dx = ev.clientX - sx, dy = ev.clientY - sy;
+        if (!axis) {
+          if (Math.hypot(dx, dy) < 4) return;
+          axis = Math.abs(dx) >= Math.abs(dy) ? 'x' : 'y';
+          if (grip) p[axis] = gapLine(ws, p, axis);
+          at = spaceAt(ws, axis, axis === 'x' ? p.x : p.y);
+          end0 = spaceEnd(ws);
+          sec.style.cursor = axis === 'x' ? 'col-resize' : 'row-resize';
+          if (c) c.appendChild(band);
+          lit(true);
+        }
+        const X = axis === 'x', want = ((X ? dx : dy) / z / (X ? vw : vh)) * 100;
+        // nothing past a line down the space: adding across is room at the right, cutting takes back room added there
+        const nd = at.moving.length || X ? Math.max(at.lo, want) : 0;
+        if (at.moving.length && Math.abs(nd - d) >= 0.01) h.moveWindows(ws, at.moving, X ? nd - d : 0, X ? 0 : nd - d);
+        d = nd;
+        paint();
+      };
+      const end = (ev, cancel) => {
+        if (done || (ev && ev.pointerId !== id)) return;
+        done = true;
+        sec.removeEventListener('pointermove', move);
+        sec.removeEventListener('pointerup', end);
+        sec.removeEventListener('pointercancel', end);
+        sec.removeEventListener('lostpointercapture', end);
+        window.removeEventListener('keydown', esc, true);
+        lit(false);
+        band.remove();
+        sec.style.cursor = '';
+        h.busy(false);
+        const X = axis === 'x', ho = holderOf(ws, h.space(ws));
+        if (cancel || !at || Math.abs(d) < 0.01) {
+          if (at && at.moving.length && d) h.moveWindows(ws, at.moving, X ? -d : 0, X ? 0 : -d, true);
+        } else if (at.moving.length) remember(ws, at.moving, X ? d : 0, X ? 0 : d, ho);
+        else { remember(ws, [], 0, 0, ho); ho.roomRight = d < 0 ? ho.roomRight + d : Math.max(spaceEnd(ws), p.x + d); }
+        sizeCanvas(ws);
+        h.changed(ws);
+      };
+      const esc = (ev) => { if (ev.key !== 'Escape') return; ev.preventDefault(); ev.stopPropagation(); end(null, true); };
+      sec.addEventListener('pointermove', move);
+      sec.addEventListener('pointerup', end);
+      sec.addEventListener('pointercancel', end);
+      sec.addEventListener('lostpointercapture', end);
+      window.addEventListener('keydown', esc, true);
+      return true;
+    }
+    if (typeof h.moveWindows !== 'function') console.error('app.js does not pass moveWindows, so a double-click at a side of the view adds no room');
+    /* Which side of the view a point is at: 1 right, -1 left, 0 neither (EDGE_HIT px). */
+    function sideOf(x) {
+      const r = vp.getBoundingClientRect();
+      return x >= r.right - EDGE_HIT ? 1 : x <= r.left + EDGE_HIT ? -1 : 0;
+    }
+    /* Is a point in the band along an edge of the bare desktop (EDGE_HIT px, at the bottom under the dock's box too)? A
+       double-click there is the edge's: it never also opens room between two windows. */
+    function inBand(x, y) {
+      const r = vp.getBoundingClientRect(), bar = document.querySelector('.menubar'), top = Math.max(r.top, bar ? bar.getBoundingClientRect().bottom : r.top);
+      return x >= r.right - EDGE_HIT || x <= r.left + EDGE_HIT || y >= r.bottom - EDGE_HIT || (y >= top && y <= top + EDGE_HIT);
+    }
+    /* Which edge of the bare desktop a point is at (EDGE_HIT px): left or right first, then the bottom (not under the
+       dock's box: the dock wins there) or the top (below the bar: on the bar or the pills the bar wins). */
+    function edgeOf(x, y) {
+      const r = vp.getBoundingClientRect(), bar = document.querySelector('.menubar'), top = Math.max(r.top, bar ? bar.getBoundingClientRect().bottom : r.top);
+      const dock = document.getElementById('dock'), d = dock && dock.getBoundingClientRect();
+      if (x >= r.right - EDGE_HIT) return { axis: 'x', side: 1 };
+      if (x <= r.left + EDGE_HIT) return { axis: 'x', side: -1 };
+      if (y >= r.bottom - EDGE_HIT) return d && d.width && x >= d.left && x <= d.right && y >= d.top ? null : { axis: 'y', side: 1 };
+      if (y >= top && y <= top + EDGE_HIT) return { axis: 'y', side: -1 };
+      return null;
+    }
+    vp.addEventListener('dblclick', (e) => {
+      const ws = h.current(), sec = e.target.closest && e.target.closest('.ws');
+      if (!ws || !sec || sec.dataset.id !== ws.id || (e.target.closest('.win, .away') && !e.target.closest('.win .rz')) || typeof h.moveWindows !== 'function') return;
+      if (!press || Math.hypot(e.clientX - press.x, e.clientY - press.y) > 6) return;
+      const at = edgeOf(e.clientX, e.clientY);
+      if (at) addRoom(ws, at.axis, at.side);
+    });
+
+    /* ---------- room between windows (owner, 22:50) ---------- */
+    /* The two windows a point of bare desktop lies between, one of them at least partly in view: side by side (axis
+       'x': the room opens between them and the right one makes way) or one above the other ('y': the lower one makes
+       way). With both, the narrower gap on screen. */
+    function between(ws, p) {
+      const vr = visible(ws), { vw, vh } = size(), list = here(ws).map((w) => ({ w, r: h.geo(w) }));
+      const seen = (r) => r.x < vr.x + vr.w && r.x + r.w > vr.x && r.y < vr.y + vr.h && r.y + r.h > vr.y;
+      const best = (arr, f) => arr.reduce((b, o) => (!b || f(o) < f(b) ? o : b), null);
+      const row = list.filter((o) => o.r.y <= p.y && p.y <= o.r.y + o.r.h), col = list.filter((o) => o.r.x <= p.x && p.x <= o.r.x + o.r.w);
+      const L = best(row.filter((o) => o.r.x + o.r.w <= p.x + 0.05), (o) => -(o.r.x + o.r.w)), R = best(row.filter((o) => o.r.x >= p.x - 0.05), (o) => o.r.x);
+      const U = best(col.filter((o) => o.r.y + o.r.h <= p.y + 0.05), (o) => -(o.r.y + o.r.h)), D = best(col.filter((o) => o.r.y >= p.y - 0.05), (o) => o.r.y);
+      const gx = L && R && (seen(L.r) || seen(R.r)) ? R.r.x - L.r.x - L.r.w : Infinity;
+      const gy = U && D && (seen(U.r) || seen(D.r)) ? D.r.y - U.r.y - U.r.h : Infinity;
+      if (gx === Infinity && gy === Infinity) return null;
+      return (gx / 100) * vw <= (gy / 100) * vh ? { axis: 'x', near: L.r, far: R.r } : { axis: 'y', near: U.r, far: D.r };
+    }
+    /* The open areas of the space on screen inside [X0, X1] x [Y0, Y1], each the widest clear stretch across a band, the
+       usual gaps kept from every window; with p, only those at p (within a gap of it). */
+    function clearings(ws, p, X0, X1, Y0, Y1) {
+      const obs = here(ws).map((o) => { const g = h.geo(o); return { x0: g.x - GAP_X, x1: g.x + g.w + GAP_X, y0: g.y - GAP_Y, y1: g.y + g.h + GAP_Y }; });
+      const ys = [...new Set([Y0, Y1, ...obs.flatMap((o) => [o.y0, o.y1])])].filter((y) => y >= Y0 && y <= Y1).sort((a, b) => a - b);
+      const out = [];
+      ys.forEach((T, i) => ys.slice(i + 1).forEach((B) => {
+        if (p && (T > p.y + GAP_Y || B < p.y - GAP_Y)) return;
+        const xs = obs.filter((o) => o.y0 < B - 0.05 && o.y1 > T + 0.05).sort((a, b) => a.x0 - b.x0);
+        let x = X0;
+        for (const o of [...xs, { x0: X1, x1: Infinity }]) {
+          const e = Math.min(o.x0, X1);
+          if (e - x > 0.05 && (!p || (x - GAP_X <= p.x && p.x <= e + GAP_X))) out.push({ L: x, R: e, T, B });
+          x = Math.max(x, o.x1);
+        }
+      }));
+      return out;
+    }
+    /* A window r at a spot with no usable open area there, or let go over a window (under), keeps its own size, and
+       nothing is left under it (lead, Nov 2 09:1x and 10:3x). First a small nudge of r itself: within about 15% of its
+       size each way, the point it was made at (pt) still in it, the usual gap from every window, never above y0 or left
+       of x0; then nothing else moves. Else windows past it, starting at or after its top (or its left side), make way down
+       (or to the right) by what they overlap it plus the gap: those it would cover or crowd, those they then run into,
+       and their row-mates past that side, all by one amount, the way that moves the fewest windows, then the least; the
+       rest stays, and windows already over each other stay so. A window before it, above or left of it, is never pushed:
+       r goes just past it instead, down or right, whichever is less. The window under the hand makes way too. With no
+       way at all, r goes past the space's last window, at its top. dry: only says where it would go, moving nothing. */
+    function makeWay(ws, r, dry, under, pt, x0, y0) {
+      if (typeof h.moveWindows !== 'function') return r;
+      const { vw, vh } = size(), all = here(ws), geo = new Map(all.map((o) => [o, h.geo(o)]));
+      const hit = (p, q) => p.x < q.x + q.w - 0.05 && q.x < p.x + p.w - 0.05 && p.y < q.y + q.h - 0.05 && q.y < p.y + p.h - 0.05;
+      const pad = (p, q) => p.x < q.x + q.w + GAP_X - 0.05 && q.x < p.x + p.w + GAP_X - 0.05 && p.y < q.y + q.h + GAP_Y - 0.05 && q.y < p.y + p.h + GAP_Y - 0.05;
+      const dxs = [0], dys = [0];
+      geo.forEach((g) => { if (pad(r, g)) { dxs.push(g.x - GAP_X - r.x - r.w, g.x + g.w + GAP_X - r.x); dys.push(g.y - GAP_Y - r.y - r.h, g.y + g.h + GAP_Y - r.y); } });
+      let small = null;
+      dxs.forEach((dx) => dys.forEach((dy) => {
+        if (Math.abs(dx) > 0.15 * r.w + 0.01 || Math.abs(dy) > 0.15 * r.h + 0.01) return;
+        const b = { ...r, x: r.x + dx, y: r.y + dy }, cost = Math.abs(dx) * vw + Math.abs(dy) * vh;
+        if ((small && small.cost <= cost) || b.x < (x0 || 0) - 0.01 || b.y < (y0 || 0) - 0.01) return;
+        if (pt && (pt.x < b.x - 0.01 || pt.x > b.x + b.w + 0.01 || pt.y < b.y - 0.01 || pt.y > b.y + b.h + 0.01)) return;
+        if (![...geo.values()].some((g) => pad(b, g))) small = { b, cost };
+      }));
+      if (small) return small.b;
+      const way = (a, X) => {
+        const A0 = (g) => (X ? g.x : g.y), A1 = (g) => (X ? g.x + g.w : g.y + g.h), B0 = (g) => (X ? g.y : g.x), B1 = (g) => (X ? g.y + g.h : g.x + g.w);
+        const G = X ? GAP_X : GAP_Y, along = (p, q) => A0(p) < A1(q) - 0.05 && A0(q) < A1(p) - 0.05;
+        const crowds = (p, q) => B0(p) < B1(q) - 0.05 && B0(q) < B1(p) - 0.05 && A0(p) < A1(q) + G - 0.05 && A0(q) < A1(p) + G - 0.05;
+        const row = (p, q) => along(p, q) && Math.max(B0(p), B0(q)) - Math.min(B1(p), B1(q)) <= ATTACH;
+        const past = (o) => o === under || A0(geo.get(o)) >= A0(a) - 0.05;
+        const m = all.filter((o) => past(o) && crowds(a, geo.get(o))), need = Math.max(0, ...m.map((o) => A1(a) + G - A0(geo.get(o))));
+        const moved = (o) => { const g = geo.get(o); return X ? { ...g, x: g.x + need } : { ...g, y: g.y + need }; };
+        for (let grew = true; grew;) {
+          grew = false;
+          all.forEach((o) => {
+            if (m.includes(o)) return;
+            const g = geo.get(o);
+            if (m.some((q) => (crowds(moved(q), g) && !hit(geo.get(q), g)) || (past(o) && row(geo.get(q), g)))) { m.push(o); grew = true; }
+          });
+        }
+        return all.every((o) => m.includes(o) || !hit(a, geo.get(o))) ? { X, m, need, px: need * (X ? vw : vh) } : null;
+      };
+      let a = { ...r };
+      for (let i = 0; i < 8; i++) {
+        const ok = [way(a, false), way(a, true)].filter(Boolean).sort((p, q) => p.m.length - q.m.length || p.px - q.px)[0];
+        if (ok) {
+          if (ok.need > 0 && !dry) h.moveWindows(ws, ok.m, ok.X ? ok.need : 0, ok.X ? 0 : ok.need, true);
+          return a;
+        }
+        const block = all.filter((o) => o !== under && hit(a, geo.get(o))).map((o) => geo.get(o));
+        const down = Math.max(...block.filter((g) => g.y < a.y - 0.05).map((g) => g.y + g.h + GAP_Y));
+        const right = Math.max(...block.filter((g) => g.x < a.x - 0.05).map((g) => g.x + g.w + GAP_X));
+        const byDown = Number.isFinite(down) ? (down - a.y) * vh : Infinity, byRight = Number.isFinite(right) ? (right - a.x) * vw : Infinity;
+        if (byDown === Infinity && byRight === Infinity) break;
+        a = byRight < byDown ? { ...a, x: right } : { ...a, y: down };
+      }
+      return { ...r, x: contentEnd(ws) + 1.5, y: TOP };
+    }
+    /* A window made at a point of the desktop: by its right-click menu there, or a dock button carried there and let go,
+       held by its title bar at the hand (lead 16:1x, from browse's walk of a busy space: a drop in a gap moved 8 windows a
+       page width, one on a page 12, one at the right edge landed out of view). At the hand, at its own size, wholly in
+       view where nothing is, else where the hand is; else in the open space at the hand, sized to it down to the smallest
+       of use (MIN_W x MIN_H); else nudged a little from where the hand holds it; in a gap between two windows, beside
+       the near one with what is past it making way (owner 23:57); let go over a window, into its row in order (lead
+       19:2x); on bare desktop with no room at the hand, the nearest open place in view, nothing moving (lead 18:0x); only
+       then the windows directly in its
+       way make way, right or down only, never up or left (lead 17:15, as the + does), each by just enough, in view if it
+       was and one way keeps it so, the way that moves the least in all, what they run into the same way (makeRoom 'rd';
+       where that would push one two ways, right or down as for beside(), else down). With no way at all, the first open
+       place (openSpot). Never a row a page width when moving one down will do. pt: the hand, else the point; dry: only
+       says where, moving nothing. */
+    function placeRoom(ws, at, w, hh, hand, dry) {
+      /* the view's own bottom, not the space's: on the board a point below the windows is a place too */
+      const vr = visible(ws), k = 1 / vr.z, { vw, vh } = size(), { top, hh: fit } = rows(ws, vr, k, hh), bot = Math.max(top + fit, vr.y + bottom() * k);
+      const L = Math.max(SIDE, vr.x + SIDE * k), R = Math.max(L, vr.x + vr.w - SIDE * k), W0 = Math.min(w, R - L), H0 = fit;
+      const mw = Math.min(W0, (MIN_W / vw) * 100), mh = Math.min(H0, (MIN_H / vh) * 100), pt = hand || at, wins = here(ws).map((o) => h.geo(o));
+      const pad = (r) => wins.some((g) => r.x < g.x + g.w + GAP_X - 0.05 && g.x < r.x + r.w + GAP_X - 0.05 && r.y < g.y + g.h + GAP_Y - 0.05 && g.y < r.y + r.h + GAP_Y - 0.05);
+      /* at the hand, at its own size: moved in just enough to be wholly in view where that covers nothing; else right where
+         the hand is when that covers nothing, past the view's side or bottom (the view comes to it, focusWin) */
+      const spot = { x: clamp(at.x, L, R - W0), y: clamp(at.y, top, bot - H0), w: W0, h: H0 };
+      if (!pad(spot)) return spot;
+      const raw = { x: Math.max(L, at.x), y: Math.max(top, at.y), w: W0, h: H0 };
+      if (!pad(raw)) return raw;
+      /* the open space at the hand, the window sized to it down to the smallest of use, as near the spot as it fits */
+      const p = { x: clamp(pt.x, L, R), y: clamp(pt.y, top, bot) };
+      let best = null;
+      clearings(ws, p, L, R, top, bot).forEach((c) => {
+        const cw = Math.min(W0, c.R - c.L), ch = Math.min(H0, c.B - c.T);
+        if (cw < mw - 0.01 || ch < mh - 0.01) return;
+        const x = clamp(spot.x, c.L, c.R - cw), y = clamp(spot.y, c.T, c.B - ch), area = cw * vw * ch * vh, off = Math.abs(x - spot.x) * vw + Math.abs(y - spot.y) * vh;
+        if (!best || area > best.area * 1.001 || (area > best.area * 0.999 && off < best.off)) best = { x, y, w: cw, h: ch, area, off };
+      });
+      if (best) return { x: best.x, y: best.y, w: best.w, h: best.h };
+      /* a small nudge of the window itself from where the hand holds it: within NUDGE of its size each way, flush the usual
+         gap off a neighbour (just under a window its title bar was let go over); past the view's bottom or right side the
+         view comes to it (focusWin), never above or left */
+      const dxs = [0], dys = [0];
+      wins.forEach((g) => { dxs.push(g.x - GAP_X - raw.x - W0, g.x + g.w + GAP_X - raw.x); dys.push(g.y - GAP_Y - raw.y - H0, g.y + g.h + GAP_Y - raw.y); });
+      let near = null;
+      dxs.forEach((dx) => dys.forEach((dy) => {
+        if (Math.abs(dx) > NUDGE * W0 + 0.01 || Math.abs(dy) > NUDGE * H0 + 0.01) return;
+        const r = { ...raw, x: raw.x + dx, y: raw.y + dy }, cost = Math.abs(dx) * vw + Math.abs(dy) * vh;
+        if ((near && near.cost <= cost) || r.x < L - 0.01 || r.y < top - 0.01 || pad(r)) return;
+        near = { r, cost };
+      }));
+      if (near) return near.r;
+      /* in a gap between two windows, side by side or one over the other (owner 23:57: "dropped in a gap, room is made"):
+         beside the near one, level with it as far as the view allows, the usual gap from it, and what is past it in its
+         way makes way, all that way; the near one never moves, so nothing jumps over the new window (flows, batch 8).
+         Only where it fits in the view there and all in its way is past the near one; else the push below. */
+      const bare = !wins.some((g) => pt.x > g.x && pt.x < g.x + g.w && pt.y > g.y && pt.y < g.y + g.h);
+      const gap = bare && typeof h.moveWindows === 'function' && between(ws, p);
+      if (gap) {
+        const X = gap.axis === 'x', n = gap.near;
+        const r = X ? { x: n.x + n.w + GAP_X, y: clamp(n.y, top, bot - H0), w: W0, h: H0 } : { x: clamp(n.x, L, R - W0), y: n.y + n.h + GAP_Y, w: W0, h: H0 };
+        const fits = X ? r.x >= L - 0.01 && r.x + r.w <= R + 0.01 : r.y >= top - 0.01 && r.y + r.h <= bot + 0.01;
+        const past = wins.filter((g) => r.x < g.x + g.w + GAP_X - 0.05 && g.x < r.x + r.w + GAP_X - 0.05 && r.y < g.y + g.h + GAP_Y - 0.05 && g.y < r.y + r.h + GAP_Y - 0.05)
