@@ -1628,3 +1628,329 @@
       for (const c of _counts) if (t - c.t <= PINCH_START_MS && c.n > peak) peak = c.n;
       pinchK = { kind: peak >= 3 ? 'space' : 'win', last: t };
       return pinchK.kind;
+    }
+    let panSave = 0;
+    function panBy(dx, dy) {
+      const ws = h.current();
+      if (!ws) return;
+      const v = view(ws);
+      showPan(ws, v.x + dx / v.z, v.y + dy / v.z, v.z);
+      clearTimeout(panSave);
+      panSave = setTimeout(() => settle(ws), GAP_MS);
+    }
+
+    /* ---------- pinch: zoom the space around the fingers ---------- */
+    /* Chromium hands a trackpad pinch over as ctrl-wheel events, zoom factor exp(-deltaY / 100) per event. The canvas
+       point under the fingers stays put, wherever they are, as on a Miro board (owner, Nov 1 18:53; lead, Nov 2 21:1x):
+       pinching in over empty board zooms into that spot, and pinching out draws everything toward the fingers, so what is
+       in view stays in view. Only the look changes: windows keep their layout size, so terminals keep their columns and
+       rows. Pinching back, actual size holds until the fingers go 12% further: that is the way back to 100%. Nothing
+       else moves the zoom or the view.
+       Like a swipe, a pinch is one gesture by event time (t), so events that waited behind a slow frame stay part of it,
+       and its end, which saves the view, waits as long again as the last event waited, and for whatever is held (a
+       window, the desktop) to be let go; once another space is on screen, there is nothing to save. */
+    /* The space at zoom z, the point px, py of the view (px from its top left) staying put. */
+    function zoomAround(ws, z, px, py) {
+      const v = view(ws), { vw, vh } = size();
+      Object.assign(ws, { zoom: z, pan: toPct(v.x + px / v.z - px / z, vw), panY: toPct(v.y + py / v.z - py / z, vh) });
+    }
+    /* by: what drives the pinch, 'stream' (the touches) or 'wheel' (Chromium's). */
+    function zoomAt(dy, cx, cy, t, by) {
+      const ws = h.current();
+      if (!ws) return;
+      stopFling();
+      slideStop();
+      const r = vp.getBoundingClientRect();
+      if (!pinching || pinching.ws !== ws || t - pinching.last > GAP_MS) pinching = { ws, last: t, hold: null };
+      pinching.by = by;
+      pinching.last = Math.max(pinching.last, t);
+      const v = view(ws), was = Math.log(v.z), d = -dy / 100;
+      let lz = was + d;
+      if (pinching.hold !== null) pinching.hold += d;
+      else if (was !== 0 && Math.sign(lz) !== Math.sign(was)) pinching.hold = 0;   // the event that crosses it stops at 100%
+      if (pinching.hold !== null) {
+        lz = Math.abs(pinching.hold) < HOLD ? 0 : pinching.hold - Math.sign(pinching.hold) * HOLD;
+        if (lz !== 0) pinching.hold = null;
+      }
+      const z = clamp(Math.exp(lz), zmin(ws), ZMAX), sp = h.space(ws);
+      const px = cx - r.left, py = cy - r.top;
+      if (z !== v.z) {
+        zoomAround(ws, z, px, py);
+        rubber = 0;
+        show(ws, false);
+        if (grab && grab.ws === ws) grab.rebase();
+      }
+      clearTimeout(pinchTimer);
+      const end = () => {
+        if (document.body.classList.contains('busy')) { pinchTimer = setTimeout(end, 250); return; }
+        if (h.space(ws) === sp) h.changed(ws);
+      };
+      pinchTimer = setTimeout(end, 250 + clamp(performance.now() - t, 0, 1000));
+    }
+    /* A pinch (Chromium's ctrl-wheel) zooms the space only with three fingers down (the owner's Miro zoom, MAC_NOTES
+       58 a / 60). With two it belongs to what is under them (58 b): over a window it goes to that window as a bubbling
+       'flow-pinch' { factor, x, y, t } (factor the zoom ratio of this event; its note or terminal zooms itself; a page
+       zooms itself in guest-preload and never sends its pinch here), and over bare desktop it does nothing. A space's
+       pinch keeps its last wheels, which can come after the lift, by event time. */
+    function pinchAt(e) {
+      const dy = e.deltaY * (e.deltaMode === 1 ? 16 : 1);
+      const kind = pinchKind(e.timeStamp);
+      if (kind === 'space') {
+        if (!touch.pinchBy) touch.pinchBy = 'wheel';
+        if (touch.pinchBy === 'wheel') zoomAt(dy, e.clientX, e.clientY, e.timeStamp, 'wheel');
+        return;
+      }
+      const win = e.target.closest && e.target.closest('.win');
+      if (win) e.target.dispatchEvent(new CustomEvent('flow-pinch', { bubbles: true, detail: { factor: Math.exp(-dy / 100), x: e.clientX, y: e.clientY, t: performance.timeOrigin + e.timeStamp } }));
+    }
+    vp.addEventListener('wheel', (e) => {
+      if (e.ctrlKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        pinchAt(e);
+        return;
+      }
+      if (pinching && e.timeStamp - pinching.last < GAP_MS) return;
+      const bare = !!e.target.closest && !e.target.closest('.win, .away') && !!e.target.closest('.ws');
+      if (take(e.deltaX, e.deltaY, e.timeStamp, (dir) => scrollsX(e.target, dir, vp), bare)) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }, { capture: true, passive: false });
+
+    /* ---------- removing a sub-workspace or a workspace ---------- */
+    /* Never ends an agent: its terminals go to the closed list of the workspace that stays, sessions running. The toast
+       offers undo, which puts everything back where it was. */
+    /* A removed workspace's terminals, by kind (a shell is no agent), and where the sidebar shows them: dimmed under the
+       workspace that holds them now (browse, batch 8) */
+    const agents = (list, where) => {
+      if (!list.length) return '';
+      const kinds = new Set(list.map((w) => (w.type === 'team' ? 'team' : w.cmd === 'shell' ? 'shell' : 'agent'))), one = kinds.size === 1 ? [...kinds][0] : 'terminal';
+      return `. ${list.length === 1 ? `its ${one} still runs` : `its ${list.length} ${one}s still run`}, dimmed under ${where} in the sidebar`;
+    };
+    const isTerm = (w) => w.type === 'term' || w.type === 'team';
+    /* A workspace as itself or by its index (the sidebar has indexes, the pill menu the workspace). */
+    const wsOf = (x) => (typeof x === 'number' ? h.workspaces()[x] : x);
+    /* Nothing in a sub-workspace goes with it (lead, Nov 2 15:5x): its windows move into the space it is in (main at
+       the top) as they are, agents running and pages loaded, together as they were arranged and each at its own size,
+       over nothing: where that space's view has room for all of them, else past its last window at its top. Its own
+       sub-workspaces move up one level whole, and its sections with them (batch 9). Undo puts it and everything back
+       exactly. */
+    function removeZone(which, sid) {
+      const ws = wsOf(which), zn = ws && zoneOf(ws, sid);
+      if (!zn) return false;
+      /* Open in a pop-out (lead, Nov 2 16:4x): that window closes first, the normal way (its page saves, as on any pop-out
+         close), its windows come back here, and then it goes as any sub-workspace does; undo opens the pop-out again
+         where it was, at its size. It always goes (lead 20:1x: nothing refuses): should the close fail, its window closes
+         itself once its space is gone (app.js applyRemote), and undo cannot open it again. */
+      if (awayOn && away.has(awayKey(ws.id, sid))) {
+        let frame = null;
+        window.flow.closePopout({ ws: ws.id, zone: sid })
+          .then((f) => { frame = f; return window.flow.popouts().then(setAway); })
+          .catch((err) => console.error(`flow: could not close the window that holds ${zn.name}; it closes itself once ${zn.name} is removed, and undo will not open it again`, err))
+          .then(() => { if (zoneOf(ws, sid)) removeHere(ws, sid, frame); });
+        return true;
+      }
+      return removeHere(ws, sid, null);
+    }
+    /* frame: the pop-out it was in, to open again on undo. */
+    function removeHere(ws, sid, frame) {
+      const zn = zoneOf(ws, sid), at = ws.zones.indexOf(zn), shown = h.space(ws) === sid;
+      // nested sub-workspaces (batch 9, lead): everything in it goes one level up, to the space it is in (main at the top)
+      const up = zn.parent && zoneOf(ws, zn.parent) ? zn.parent : null, kids = ws.zones.filter((z) => z.parent === sid);
+      const wins = ws.windows.filter((w) => inSpace(w, sid)), shut = ws.closed.filter((w) => inSpace(w, sid));
+      const was = new Map([...wins, ...shut].map((w) => [w, { x: w.x, y: w.y, w: w.w, h: w.h, max: w.max }]));
+      if (shown) h.showSpace(ws, up);
+      wins.forEach((w) => { if (w.max) Object.assign(w, w.max); w.max = null; });
+      if (wins.length) {
+        // one spot for the group, found among main's own windows while these are still research's
+        const x0 = Math.min(...wins.map((w) => w.x)), y0 = Math.min(...wins.map((w) => w.y));
+        const bw = Math.max(...wins.map((w) => w.x + w.w)) - x0, bh = Math.max(...wins.map((w) => w.y + w.h)) - y0;
+        const fit = freeSpot(ws, bw, bh, up, true), to = fit && fit.w >= bw - 0.01 && fit.h >= bh - 0.01 ? fit : { x: contentEnd(ws, null, up) + 1.5, y: TOP };
+        wins.forEach((w) => { w.x += to.x - x0; w.y += to.y - y0; });
+      }
+      [...wins, ...shut].forEach((w) => { if (up) w.zone = up; else delete w.zone; });
+      // its own sub-workspaces move up one level whole, in their places; its sections go up too (app.js, notes)
+      kids.forEach((z) => { if (up) z.parent = up; else delete z.parent; });
+      const unSections = typeof h.moveSections === 'function' ? h.moveSections(ws, sid, up) : null;
+      ws.zones.splice(at, 1);
+      h.refresh(ws);
+      h.changed(ws);
+      // into a space open in a pop-out: that window shows them now, so this one lets their pages and terminals go
+      if (up && spaceAway(ws, up)) wins.forEach((w) => h.release(w));
+      h.toast(`removed ${zn.name}`, 8000, { label: 'undo', run: () => {
+        if (zoneOf(ws, sid)) return;
+        ws.zones.splice(Math.min(at, ws.zones.length), 0, zn);
+        kids.forEach((z) => { z.parent = sid; });
+        if (unSections) unSections();
+        was.forEach((g, w) => { if (ws.windows.includes(w) || ws.closed.includes(w)) Object.assign(w, g, { zone: sid }); });
+        if (shown) h.showSpace(ws, sid);
+        h.refresh(ws);
+        h.changed(ws);
+        if (frame) h.popOut(ws.id, sid, frame);
+      } });
+      return true;
+    }
+    function removeWorkspace(which) {
+      const ws = wsOf(which);
+      return ws && typeof h.closeWorkspace === 'function' ? h.closeWorkspace(ws) : false;
+    }
+
+    /* ---------- a popped-out space lives only in its pop-out ---------- */
+    /* In the main window a space open in a pop-out has no page and no terminal client of its own (each page loads once,
+       each terminal has one tmux client) and shows only its name and "in another window"; a click brings that window
+       forward. A pop-out of a whole workspace takes all its spaces. The pop-out itself shows its space as usual. */
+    let away = new Set();
+    /* Only once app.js passes release and refresh (its side of this) does a pop-out take a space away from here. */
+    const awayOn = !h.solo && typeof h.release === 'function' && typeof h.refresh === 'function';
+    const awayKey = (wsId, zid) => `${wsId}|${zid || ''}`;
+    const spaceAway = (ws, zid) => awayOn && (away.has(awayKey(ws.id, null)) || (!!zid && away.has(awayKey(ws.id, zid))));
+    const winAway = (ws, w) => spaceAway(ws, w.zone || null);
+    const awayEls = new Map();
+    function showAway(ws) {
+      const c = ws && h.canvas(ws), sec = c && c.parentElement;
+      if (!sec) return;
+      const zid = h.space(ws), on = spaceAway(ws, zid);
+      let el = awayEls.get(ws.id);
+      if (!on) { if (el) el.style.display = 'none'; return; }
+      if (!el || el.parentElement !== sec) {
+        el = document.createElement('div');
+        el.className = 'away';
+        el.style.cssText = 'position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer;user-select:none;-webkit-user-select:none';
+        el.addEventListener('click', () => bringAway(ws, h.space(ws)));
+        sec.appendChild(el);
+        awayEls.set(ws.id, el);
+      }
+      const zn = zoneOf(ws, zid), name = away.has(awayKey(ws.id, null)) || !zn ? ws.name : zn.name;
+      if (el.dataset.name !== name) {
+        const line = (text, css) => Object.assign(document.createElement('div'), { textContent: text, style: css });
+        el.replaceChildren(line(name, 'color:#cfcfd4;font-size:14px'), line('in another window', 'color:#8d8d93;font-size:12px'));
+        el.dataset.name = name;
+      }
+      el.style.display = 'flex';
+    }
+    /* Brings forward the pop-out that holds a space of this workspace (zid null: the main space). */
+    function bringAway(ws, zid) {
+      const space = { ws: ws.id, zone: away.has(awayKey(ws.id, null)) ? null : zid };
+      window.flow.focusPopout(space).then((ok) => {
+        if (!ok) console.warn(`flow: no window holds ${space.ws}${space.zone ? ` › ${space.zone}` : ''} any more, so none came forward`);
+      }, (err) => console.error('flow: could not bring the pop-out forward', err));
+    }
+    function setAway(list) {
+      if (!awayOn) return;
+      const before = away;
+      away = new Set((Array.isArray(list) ? list : []).map((p) => awayKey(p.ws, p.zone)));
+      h.workspaces().forEach((ws) => {
+        const was = (w) => before.has(awayKey(ws.id, null)) || (!!w.zone && before.has(awayKey(ws.id, w.zone)));
+        let changed = false;
+        ws.windows.forEach((w) => {
+          const now = winAway(ws, w), then = was(w);
+          if (now === then) return;
+          changed = true;
+          if (now) h.release(w);
+        });
+        if (changed) h.refresh(ws);
+        if (takeBack(ws)) h.changed(ws);
+      });
+      showAway(h.current());
+    }
+    /* A space's view moves with it between windows. Its pop-out keeps the view it shows as popView (app.js); once the
+       space is not in a pop-out, that view is the space's here: on screen, or kept for it. */
+    function takeBack(ws) {
+      let n = 0;
+      [null, ...(ws.zones || []).map((zn) => zn.id)].forEach((sid) => {
+        const zn = zoneOf(ws, sid), ho = zn || ws, pv = ho.popView;
+        if (!pv || spaceAway(ws, sid)) return;
+        delete ho.popView;
+        n++;
+        if (pv.old) return;
+        const v = viewOf(pv);
+        if ((sid || null) === h.space(ws)) { Object.assign(ws, v); sizeCanvas(ws); }
+        else if (zn) Object.assign(zn, v);
+        else Object.assign(ws, { mainPan: v.pan, mainPanY: v.panY, mainZoom: v.zoom });
+      });
+      return n;
+    }
+    let ready = Promise.resolve();
+    if (awayOn && (!window.flow.popouts || !window.flow.onPopouts)) {
+      console.error('flow.popouts is missing (preload), so a popped-out space also stays live in the main window');
+    } else if (awayOn) {
+      ready = window.flow.popouts().then(setAway, (err) => console.error('flow: could not read which spaces are popped out', err));
+      window.flow.onPopouts(setAway);
+    }
+
+    return {
+      /* geometry app.js calls in place of its own */
+      setPan, sizeCanvas, edges, visible, toSpace, bottom, collides, contentStart, contentEnd, freeSpot, openSpot, placeAt, fillRect,
+      reveal, fitStart, recover, swap, zoom: (ws) => view(ws).z, edgePan, placeRoom, beside, clear, arrange, sideOf,
+      cutAt, canCut, addAt, extendRight, undoSpace, spaceUndoReady, spaceAt,
+      /* ⌘0 with no page in front (app.js routes it; lead, Nov 2 14:2x): the space back to 100% around the middle of the
+         view, the way back to default besides pinching back. */
+      actualSize: (ws) => { stopFling(); const { vw, vh } = size(); zoomAround(ws, 1, vw / 2, vh / 2); setView(ws, view(ws), true); h.changed(ws); },
+      /* The view glides so box (in % of the view at 100%) shows whole and as large as fits, never past 100%: the overview
+         and a group's name (owner Nov 7, image 02-03). One asked-for move, like actualSize; a box smaller than the view is
+         centred at 100%. */
+      frameTo: (ws, box, margin = 0.05) => {
+        if (!box || !(box.w > 0) || !(box.h > 0)) return;
+        stopFling();
+        const { vw, vh } = size(), bw = (box.w / 100) * vw, bh = (box.h / 100) * vh;
+        const z = clamp(Math.min((vw * (1 - 2 * margin)) / bw, (vh * (1 - 2 * margin)) / bh, 1), zmin(ws), ZMAX);
+        const cx = ((box.x + box.w / 2) / 100) * vw, cy = ((box.y + box.h / 2) / 100) * vh;
+        setView(ws, { x: cx - vw / z / 2, y: cy - vh / z / 2, z }, true);
+        h.changed(ws);
+      },
+      removeZone, removeWorkspace,
+      /* The space on screen as a sheet, in % of the view (what the overview draws), and the overview's way to move over it. */
+      sheet: (ws) => ({ w: spaceEnd(ws), h: spaceBottom(ws) }), goTo,
+      /* Is this window's space open in a pop-out (main window only)? app.js gives it no body and no frame then. */
+      away: (ws, w) => winAway(ws, w),
+      /* Brings forward the pop-out that holds this window's space. */
+      focusAway: (ws, w) => bringAway(ws, w.zone || null),
+      /* Resolves once the main window knows which spaces are popped out; app.js awaits it before building windows. */
+      ready,
+      /* Whether app.js passes release and refresh, so a popped-out space lives only in its pop-out. */
+      popoutsLive: awayOn,
+      /* Whether a gesture nav took (two fingers moving the board, three or four moving spaces or workspaces) still goes
+         on at event time t (performance clock): a wheel then belongs to it, not to a page under the fingers. */
+      swiping: (t) => touch.n >= 3 || (!!gest && (gest.owner === 'pan' || gest.owner === 'fingers') && t - gest.last <= GAP_MS),
+      /* The trackpad from main (touch.js): { n, t, dx, pinch, x, y } n fingers down (0 when lifted) at t epoch ms; dx,
+         when the stream has it, the touches' sideways px since the last report (MAC_NOTES 25); pinch, their spread's
+         ratio since then, at x, y; or { swipe: 'left' | 'right', t }, macOS's own swipe (systemSwipe). */
+      fingers: (f) => {
+        if (!f) return;
+        const t = Number.isFinite(+f.t) ? +f.t - performance.timeOrigin : performance.now();
+        if (f.swipe === 'left' || f.swipe === 'right') { systemSwipe(f.swipe === 'left' ? 1 : -1, t); return; }
+        fingers(Math.max(0, +f.n || 0), t, f.dx === undefined || f.dx === null ? undefined : +f.dx, +f.pinch || 0, +f.x || 0, +f.y || 0);
+      },
+      /* A page's wheel event (page.js onWheel): dx, dy in px, t epoch ms, used when the page could use it. behind: the
+         page is behind another window; the wheel reached nav from the window itself (app.js backPageWheel sends the page
+         a copy), and a sideways swipe there moves to the next space at once, whatever the page does with it: the page
+         is brought in front to scroll it sideways. So its report is not used. */
+      wheel: (w) => {
+        if (!w || w.ctrl || w.behind) return;
+        const t = Number.isFinite(+w.t) ? +w.t - performance.timeOrigin : performance.now();
+        if (pinching && t - pinching.last < GAP_MS) return;
+        take(+w.dx || 0, +w.dy || 0, t, () => !!w.used, false, true);
+      },
+      /* A page's pinch, from its preload through page.js (onPinch): x, y in this window's CSS px; t epoch ms. Only a
+         three-finger pinch zooms the space (MAC_NOTES 60) and this returns true; under two the page zooms itself and this
+         returns false (the page takes a pinch it took itself before it reaches here at all). Which a pinch is comes from
+         pinchKind, latched once: never from the count at one event alone. */
+      pinch: (p) => {
+        if (!p) return false;
+        const t = Number.isFinite(+p.t) ? +p.t - performance.timeOrigin : performance.now();
+        if (pinchKind(t) !== 'space') return false;
+        if (!touch.pinchBy) touch.pinchBy = 'wheel';
+        if (touch.pinchBy !== 'wheel') return false;
+        zoomAt((+p.deltaY || 0) * (p.deltaMode === 1 ? 16 : 1), +p.x || 0, +p.y || 0, t, 'wheel');
+        return true;
+      },
+    };
+  }
+
+  window.FlowNav = { mount, viewOf };
+})();
+
+
+
+
