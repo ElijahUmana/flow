@@ -766,3 +766,259 @@
         H.fitSoon(0);
         const L = H.locate(id);
         if (f == null || !L) return;
+        L.w.paneW = +f.toFixed(4);
+        H.save();
+      };
+      if (e.isTrusted) g.setPointerCapture(e.pointerId);
+      pane.classList.add('sizing');
+      g.addEventListener('pointermove', move);
+      g.addEventListener('pointerup', up);
+      g.addEventListener('pointercancel', up);
+    });
+    g.addEventListener('dblclick', () => {
+      const L = H.locate(id);
+      if (!L || !L.w.paneW) return;
+      delete L.w.paneW;
+      pane.style.width = '';
+      H.fitSoon(60);
+      H.save();
+    });
+  }
+  function noteHTML(w) {
+    return `<div class="nd">${titleField('ntitle', `title:${w.noteId}`, '')}${host(`note:${w.noteId}`, '', 'nbody')}</div>`;
+  }
+
+  /* Mounts an editor in each note host of a window that is in the DOM. */
+  function attach(ws, w) {
+    const r = H.win(w.id);
+    if (!r) return;
+    const eds = ED.get(w.id) || new Map();
+    ED.set(w.id, eds);
+    if (w.type === 'page') bind(ws, w);
+    r.el.querySelectorAll('.nhost[data-key]').forEach((h) => {
+      const key = h.dataset.key;
+      if (eds.has(key)) return;
+      const page = key.startsWith('page:');
+      eds.set(key, window.FlowNote.mount(h, {
+        key, className: `ned${h.dataset.cls ? ` ${h.dataset.cls}` : ''}`, placeholder: h.dataset.ph, value: valueFor(ws, key, w) || '',
+        writable: !page || !!PANE.get(w.id).key,
+        onChange: (v) => changed(w.id, key, v),
+        quotes: page,
+        found: page ? (text) => { const f = FOUND.get(w.id); return !!f && f.has(text); } : null,
+        onQuote: (text) => showQuote(w.id, text),
+        onOpenLink: (url) => H.openLink(w.id, url),
+        brief,
+        peek: (url, box) => peek(w.id, url, box),
+        folds: foldsOf(ws, key) || {},
+        onFolds: (f) => { const L = H.locate(w.id); if (L) setFolds(L.ws, key, f); },
+      }));
+    });
+    if (w.type === 'page') marks(ws, w);
+    LIT.set(w.id, lit(ws, w));
+    divider(r, w.id);
+  }
+  /* What is unfolded in a note is remembered with that note: the agent's window, the note, the page's record. */
+  function foldsOf(ws, key) {
+    const { kind, id } = split(key);
+    if (kind === 'win') { const w = H.findWin(ws, id); return w && w.folds; }
+    if (kind === 'page') { const b = PANE.get(id); const r = b && rec(b.key); return r && r.folds; }
+    const n = H.noteById(ws, id);
+    return n && n.folds;
+  }
+  function setFolds(ws, key, f) {
+    const { kind, id } = split(key);
+    const has = Object.keys(f).length;
+    let o = null;
+    if (kind === 'win') o = H.findWin(ws, id);
+    else if (kind === 'page') { const b = PANE.get(id); o = b && rec(b.key); }
+    else if (kind === 'note') o = H.noteById(ws, id);
+    if (!o) return;
+    if (has) o.folds = f;
+    else delete o.folds;
+    if (kind === 'page') o.at = Date.now();
+    H.save();
+  }
+  /* The page itself inside a note: one at a time, gone when folded. */
+  let peeks = 0;
+  function peek(winId, url, box) {
+    if (!window.FlowPage) { console.error('page.js did not load, so a page cannot show inside a note'); return { dispose: noopDispose }; }
+    const p = window.FlowPage.mount(box, { id: `peek-${winId}-${++peeks}`, url, bare: true, onOpen: (u) => H.openLink(winId, u) });
+    p.setVisible(true);
+    return { dispose: () => p.dispose() };
+  }
+  const noopDispose = () => {};
+  function detach(id) {
+    // a note window going away leaves its place, size and sub-workspace with its note (the size it had before ⤢, if it
+    // was so)
+    const L = H.locate(id), n = L && L.w.type === 'note' ? H.noteById(L.ws, L.w.noteId) : null;
+    if (n) { const g = L.w.max || L.w; n.place = { x: g.x, y: g.y, w: g.w, h: g.h, ...(L.w.zone ? { zone: L.w.zone } : {}) }; }
+    const eds = ED.get(id);
+    if (eds) eds.forEach((e) => e.dispose());
+    ED.delete(id);
+    PANE.delete(id);
+    LIT.delete(id);
+    FOUND.delete(id);
+  }
+  function editorOf(id, key) {
+    const eds = ED.get(id);
+    return eds ? eds.get(key) || null : null;
+  }
+  /* Edit > Undo and Redo (app.js's menu actions) for what has the keys: true when it is in a note's text, which keeps
+     its own history, so nothing else may undo there. */
+  function history(el, back) {
+    if (!el) return false;
+    const t = el.closest && el.closest('.ntitle');
+    if (t) {
+      titleStep(t, back);
+      return true;
+    }
+    for (const eds of ED.values()) {
+      for (const e of eds.values()) {
+        if (!e.el.contains(el)) continue;
+        if (back) e.undo();
+        else e.redo();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /* Puts the model's text into a window's notes; a focused one is left alone unless force. */
+  function fill(ws, w, force) {
+    const r = H.win(w.id);
+    if (!r) return;
+    if (w.type === 'page') bind(ws, w);
+    const eds = ED.get(w.id);
+    if (eds) eds.forEach((e, key) => {
+      if (!force && e.el === document.activeElement) return;
+      const v = valueFor(ws, key, w);
+      if (v != null) e.set(v);
+    });
+    r.el.querySelectorAll('.ned[contenteditable][data-key^="title:"]').forEach((ed) => {
+      if (!force && ed === document.activeElement) return;
+      const v = valueFor(ws, ed.dataset.key, w);
+      if (v != null && ed.innerText.replace(/\n$/, '') !== v) {
+        ed.textContent = v;
+        TITLES.delete(ed);
+      }
+    });
+    if (w.type === 'note') heading(ws, w);
+    if (w.type === 'page') marks(ws, w);
+    relight(ws, w);
+  }
+
+  /* ---------- a page window's ✎ panel shows the note of the page on screen ---------- */
+  function bind(ws, w) {
+    const url = pageUrl(ws, w);
+    const k = key(url);
+    const n = H.noteById(ws, w.noteId);
+    const old = PANE.get(w.id);
+    PANE.set(w.id, { key: k, url, title: (n && n.title) || '' });
+    // a tab with no page has no note: its panel takes no typing until a page shows
+    const e = editorOf(w.id, `page:${w.id}`);
+    if (e) e.writable(!!k);
+    return !old || old.key !== k;
+  }
+  /* The page on screen changed (another tab, a link followed): its own note shows. */
+  function follow(ws, w) {
+    if (w.type !== 'page' || !bind(ws, w)) { const r = rec((PANE.get(w.id) || {}).key); if (r && !r.title && PANE.get(w.id).title) r.title = PANE.get(w.id).title; return; }
+    FOUND.delete(w.id);
+    const e = editorOf(w.id, `page:${w.id}`);
+    if (e) { e.set(valueFor(ws, `page:${w.id}`, w)); e.setFolds(foldsOf(ws, `page:${w.id}`) || {}); }
+    marks(ws, w);
+    relight(ws, w);
+  }
+  /* The page on screen highlights its quoted sentences; hovering one shows what was written under it. It says which
+     of them it has, so ↗ shows only where it can take the owner. */
+  let warnedMarks = false;
+  function marks(ws, w) {
+    const p = H.page(w.id);
+    if (!p) return;
+    if (typeof p.setMarks !== 'function') {
+      if (!warnedMarks) { warnedMarks = true; console.warn('page.js has no setMarks yet, so annotations are not highlighted on pages'); }
+      return;
+    }
+    const r = rec((PANE.get(w.id) || {}).key);
+    p.setMarks(marksOf(r ? r.note : ''), (texts) => {
+      FOUND.set(w.id, new Set(texts));
+      const e = editorOf(w.id, `page:${w.id}`);
+      if (e) e.repaint();
+    });
+  }
+  /* Another window showing the same page follows an edit made here. */
+  function paintOthers(fromId) {
+    const b = PANE.get(fromId);
+    if (!b) return;
+    for (const [id, x] of PANE) {
+      if (id === fromId || x.key !== b.key) continue;
+      const L = H.locate(id);
+      if (L) fill(L.ws, L.w);
+    }
+  }
+  let warnedFind = false;
+  function showQuote(id, text) {
+    const p = H.page(id);
+    if (!p) return;
+    if (typeof p.findQuote !== 'function') {
+      if (!warnedFind) { warnedFind = true; console.warn('page.js has no findQuote yet, so ↗ cannot scroll the page to a quoted sentence'); }
+      return;
+    }
+    p.findQuote(text).then((found) => {
+      if (found) return;
+      // the page changed since it said it had the sentence: its ↗ goes
+      const f = FOUND.get(id);
+      if (f) f.delete(String(text).trim());
+      const e = editorOf(id, `page:${id}`);
+      if (e) e.repaint();
+    }, (err) => console.error('could not look for the sentence on the page', err));
+  }
+  /* A click on a highlighted sentence in the page opens the ✎ panel at what was written under it. */
+  function onMark(id, text) {
+    const L = H.locate(id);
+    const r = L && rec((PANE.get(id) || {}).key);
+    if (!r) return;
+    setPane(L.ws, L.w, true, 'end');
+    const e = editorOf(id, `page:${id}`);
+    const lines = r.note.split('\n');
+    let off = 0, end = -1;
+    for (const line of lines) {
+      const start = off;
+      off += line.length + 1;
+      if (end < 0) {
+        if (line.startsWith(QUOTE) && line.slice(QUOTE.length).trim() === text) end = start + line.length;
+        continue;
+      }
+      if (!line.trim() || line.startsWith(QUOTE)) break;
+      end = start + line.length;
+    }
+    if (e && end >= 0) e.focusAt(end);
+  }
+
+  /* ---------- ✎: open or closed, bright when the window's note has something in it ---------- */
+  function paneKey(w) {
+    if (w.type === 'term' || w.type === 'team') return `win:${w.id}`;
+    if (w.type === 'page') return `page:${w.id}`;
+    return '';
+  }
+  function setPane(ws, w, on, at) {
+    const r = H.win(w.id);
+    if (!r) return;
+    w.noted = on;
+    r.el.classList.toggle('noted', on);
+    if (on) {
+      const e = editorOf(w.id, paneKey(w));
+      if (e) e.focus(at || 'end');
+    }
+    H.fitSoon(60);
+    H.save();
+  }
+  function toggle(ws, w) {
+    const r = H.win(w.id);
+    if (r) setPane(ws, w, !r.el.classList.contains('noted'));
+  }
+  function lit(ws, w) {
+    if (w.type === 'term' || w.type === 'team') return !!String(w.note || '').trim();
+    if (w.type === 'page') { const b = PANE.get(w.id) || { key: key(pageUrl(ws, w)) }; const r = rec(b.key); return !!(r && r.note.trim()); }
+    return false;
+  }
+  function relight(ws, w) {
