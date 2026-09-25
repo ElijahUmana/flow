@@ -510,3 +510,259 @@
         if (!disposed) setWritable(!!on);
       },
       /* Edit > Undo and Redo, as Flow's own menu actions: a step of this note's history. */
+      undo() {
+        if (!disposed) step('historyUndo');
+      },
+      redo() {
+        if (!disposed) step('historyRedo');
+      },
+      repaint: paint,
+      dispose() {
+        if (disposed) return;
+        disposed = true;
+        ro.disconnect();
+        listeners.forEach(([t, type, f]) => t.removeEventListener(type, f));
+        for (const url of [...X.keys()]) unplace(url);
+        unpaint();
+        wrap.remove();
+      },
+    };
+  }
+
+  window.FlowNote = { mount };
+})();
+
+/* FlowNotes: the notes in the app. app.js mounts it once with hooks into its model and calls it for the parts of a
+   window that are notes: the ✎ side panel of an agent, a team or a page, and a note window's title and body.
+   A web page is a thing of its own: one record per page for the whole app, keyed by its address (key below), holds
+   what was written about it. Open the page again, anywhere, and its note is there. A "> sentence" line in it is an
+   annotation: the page highlights that sentence and shows the lines under it. */
+(() => {
+  'use strict';
+
+  let H = null;
+  let PAGES = {};
+  const ED = new Map();
+  const PANE = new Map();
+  const LIT = new Map();
+  const FOUND = new Map();   // page window id -> the quoted sentences its page has (page.js setMarks reports them)
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const host = (key, ph, cls) => `<div class="nhost" data-key="${esc(key)}" data-ph="${esc(ph)}"${cls ? ` data-cls="${esc(cls)}"` : ''}></div>`;
+  const titleField = (cls, key, ph) => `<div class="${cls} ned" contenteditable="plaintext-only" spellcheck="false" data-key="${esc(key)}" data-ph="${esc(ph)}"></div>`;
+  const oneLine = (s) => String(s || '').replace(/\s+/g, ' ');
+  const QUOTE = '> ';
+  /* A note's name, one for its row, ⌘K and its window's title: the title the owner gave it, else its first line (without
+     a todo box or quote mark), else "new note". A blank title is no title. A title from before the owner could leave it
+     unset counts as given unless it is the default. */
+  const NEW_NOTE = 'new note';
+  const titled = (n) => !!n && !!String(n.title || '').trim() && (n.titleSet != null ? !!n.titleSet : n.title !== NEW_NOTE);
+  function noteName(n) {
+    if (titled(n)) return oneLine(n.title).trim();
+    const line = String((n && n.body) || '').split('\n').map((l) => oneLine(l.replace(/^(?:\[[ x]\] |> )/, '')).trim()).find(Boolean);
+    return line || NEW_NOTE;
+  }
+  /* A note window's heading holds only the owner's title, and says "new note" (faintly) only while the whole note is
+     empty. The window may not be in the page yet (it is filled before it is placed). */
+  function heading(ws, w) {
+    const r = H.win(w.id), n = H.noteById(ws, w.noteId);
+    if (!r || !n) return;
+    const ph = !titled(n) && !String(n.body || '').trim() ? NEW_NOTE : '';
+    r.el.querySelectorAll('.ntitle').forEach((ed) => { ed.dataset.ph = ph; });
+  }
+
+  /* ---------- the page: its address, the same for every way of writing it (checked on real sites by browse) ----------
+     https; no "www." or mobile host; no trailing "/"; path escapes written one way; no fragment or :~:text=; no tracking
+     keys; the rest of the query sorted. Sites that name a page by an id key by that id: Notion and Medium by the id at
+     the end, YouTube by v, Google Docs by d, Wikipedia's index.php by its title, GitHub's owner and repo in any case.
+     A fragment is dropped (an anchor in the page) unless it is a route ("#/…", "#!…") or the page itself lives in it
+     (Gmail's thread, an Excalidraw drawing). Always key the address a page landed on. A file shown as a page
+     (flow-file://mac/<signature>/<path>, flow-file://vm/<signature>/<host>/<path>) is keyed by where it is and its path,
+     never by the signature in its address. */
+  const TRACK = /^(?:utm_[a-z0-9_]+|fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid|si|ref|ref_src|source|cmp)$/i;
+  const SITE_DROP = { 'x.com': /^(?:s|t)$/, 'notion.so': /^(?:pvs|__dm_a)$/ };
+  const IN_HASH = /^(?:mail\.google\.com|excalidraw\.com)$/;
+  /* One way of writing a path segment; a segment whose escapes do not decode stays as it was written. */
+  function segment(x) {
+    if (!/%[0-9a-f]{2}/i.test(x)) return encodeURIComponent(x);
+    let d = x;
+    try { d = decodeURIComponent(x); } catch (err) { return x; }
+    return encodeURIComponent(d);
+  }
+  function key(url) {
+    const s = String(url || '').trim();
+    if (!URL.canParse(s)) return '';
+    const u = new URL(s);
+    if (u.protocol === 'flow-file:') {
+      const parts = u.pathname.split('/').filter(Boolean);
+      if (/^[A-Za-z0-9_-]{22}$/.test(parts[0] || '')) parts.shift();
+      const where = u.hostname === 'vm' && parts.length ? `vm/${segment(parts.shift())}` : 'mac';
+      return parts.length ? `flow-file://${where}/${parts.map(segment).join('/')}` : '';
+    }
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
+    let host = u.hostname.toLowerCase().replace(/^(?:www|m|mobile)\./, '').replace(/\.m\.wikipedia\.org$/, '.wikipedia.org');
+    if (host === 'twitter.com') host = 'x.com';
+    let parts = u.pathname.split('/').filter(Boolean);
+    const q = u.searchParams;
+    if (host === 'youtu.be' && parts[0]) return `https://youtube.com/watch?v=${encodeURIComponent(parts[0])}`;
+    if (host === 'youtube.com') {
+      const v = q.get('v') || (/^(?:shorts|embed|live)$/.test(parts[0] || '') ? parts[1] : '');
+      if (v) return `https://youtube.com/watch?v=${encodeURIComponent(v)}`;
+    }
+    if (/(?:^|\.)notion\.(?:so|site)$/.test(host) || host === 'app.notion.com') {
+      const m = /([0-9a-f]{32})$/i.exec(parts[parts.length - 1] || '');
+      if (m) return `https://notion.so/${m[1].toLowerCase()}`;
+      host = 'notion.so';
+    }
+    if (host === 'medium.com' || host.endsWith('.medium.com')) {
+      const last = parts[parts.length - 1] || '';
+      const m = parts[0] === 'p' ? /^([0-9a-f]{8,16})$/i.exec(last) : /-([0-9a-f]{8,16})$/i.exec(last);
+      if (m) return `https://medium.com/p/${m[1].toLowerCase()}`;
+    }
+    if (host === 'docs.google.com') {
+      const i = parts.indexOf('d');
+      if (i > 0 && parts[i + 1]) return `https://docs.google.com/${parts[0]}/d/${parts[i + 1]}`;
+    }
+    if (host.endsWith('.wikipedia.org') && u.pathname === '/w/index.php' && q.get('title')) {
+      parts = ['wiki', ...q.get('title').replace(/ /g, '_').split('/')];
+      q.delete('title');
+    }
+    if (host === 'github.com') parts = parts.map((x, i) => (i < 2 ? x.toLowerCase() : x));
+    const drop = SITE_DROP[host];
+    const kept = [...q].filter(([k]) => !TRACK.test(k) && !(drop && drop.test(k))).sort((a, b) => (a[0] === b[0] ? (a[1] < b[1] ? -1 : 1) : a[0] < b[0] ? -1 : 1));
+    const qs = kept.length ? `?${kept.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&')}` : '';
+    const port = u.port && u.port !== '80' && u.port !== '443' ? `:${u.port}` : '';
+    const frag = u.hash.split(':~:')[0];
+    const hash = frag.length > 1 && (IN_HASH.test(host) || /^#[/!]/.test(frag)) ? frag : '';
+    return `https://${host}${port}${parts.length ? `/${parts.map(segment).join('/')}` : ''}${qs}${hash}`;
+  }
+  const plainUrl = (url) => String(url || '').split('#')[0];
+  /* A record is found by its page's key, or by an address that page redirected from (its `from`). */
+  const ALIAS = new Map();
+  /* A deleted or moved record leaves { gone: true, at } so that windows and the store can tell a deletion from a record
+     they have not seen yet; it counts as no record. */
+  const own = (k) => !!k && Object.prototype.hasOwnProperty.call(PAGES, k) && !!PAGES[k] && !PAGES[k].gone;
+  const keyOf = (k) => (own(k) ? k : ALIAS.has(k) && own(ALIAS.get(k)) ? ALIAS.get(k) : '');
+  const rec = (k) => { const x = keyOf(k); return x ? PAGES[x] : null; };
+  function reindex() {
+    ALIAS.clear();
+    for (const k of Object.keys(PAGES)) if (own(k)) for (const f of PAGES[k].from || []) if (f !== k) ALIAS.set(f, k);
+  }
+  function ensure(url, title) {
+    const k = key(url);
+    if (!k) return null;
+    if (!rec(k)) PAGES[k] = { url: plainUrl(url), title: title || '', about: '', note: '', at: Date.now() };
+    return rec(k);
+  }
+  /* What was written under each quoted sentence of a page's note, up to the next blank line or quote. */
+  function marksOf(note) {
+    const out = [];
+    let cur = null;
+    for (const line of String(note || '').split('\n')) {
+      if (line.startsWith(QUOTE) && line.slice(QUOTE.length).trim()) { cur = { text: line.slice(QUOTE.length).trim(), note: '' }; out.push(cur); continue; }
+      if (!line.trim()) { cur = null; continue; }
+      if (cur) cur.note = cur.note ? `${cur.note}\n${line}` : line;
+    }
+    return out;
+  }
+
+  function split(key) {
+    const k = key.indexOf(':');
+    return { kind: key.slice(0, k), id: key.slice(k + 1) };
+  }
+  /* The address a page window shows now: its tab on screen (none yet for a new tab, which so has no note of a page),
+     else, for a window with no tabs yet, its note's. */
+  function pageUrl(ws, w) {
+    if (Array.isArray(w.tabs) && w.tabs.length) {
+      const t = w.tabs[Number.isInteger(w.tab) ? w.tab : 0];
+      return (t && t.url) || '';
+    }
+    const n = H.noteById(ws, w.noteId);
+    return (n && n.url) || '';
+  }
+  function valueFor(ws, key, w) {
+    const { kind, id } = split(key);
+    if (kind === 'win') { const x = H.findWin(ws, id); return x ? x.note || '' : null; }
+    if (kind === 'page') { const b = PANE.get(id); const r = b && rec(b.key); return r ? r.note : ''; }
+    const n = H.noteById(ws, id);
+    if (!n) return null;
+    if (kind === 'note') return n.body || '';
+    return n.kind === 'page' || titled(n) ? n.title || '' : '';
+  }
+  function setValue(ws, key, v, ed) {
+    const { kind, id } = split(key);
+    if (kind === 'win') {
+      const w = H.findWin(ws, id);
+      if (!w) return false;
+      w.note = v;
+      return true;
+    }
+    if (kind === 'page') {
+      const b = PANE.get(id);
+      const r = b && (rec(b.key) || (v ? ensure(b.url, b.title) : null));
+      if (!r) return false;
+      r.note = v;
+      r.at = Date.now();
+      return true;
+    }
+    const n = H.noteById(ws, id);
+    if (!n) return false;
+    if (kind === 'note') { n.body = v; return true; }
+    n.title = v;
+    n.titleSet = !!v.trim();
+    H.updateNoteTitle(ws, n, ed);
+    return true;
+  }
+  function changed(winId, key, v, ed) {
+    const L = H.locate(winId);
+    if (!L) return;
+    const n = L.w.noteId ? H.noteById(L.ws, L.w.noteId) : null, name = n ? noteName(n) : '';
+    if (!setValue(L.ws, key, v, ed)) return;
+    if (key.startsWith('page:')) { marks(L.ws, L.w); paintOthers(winId); }
+    else if (L.w.type === 'note') heading(L.ws, L.w);
+    const relit = relight(L.ws, L.w);
+    // the sidebar shows a note's name and ✎, and its search finds notes by their text: only those draw it again
+    const q = document.getElementById('q');
+    if (relit || (n && noteName(n) !== name) || (q && q.value.trim())) H.scheduleSidebar();
+    H.save();
+  }
+
+  /* ---------- markup: the ✎ panel, and a note window's body ---------- */
+  // the divider sits just before the pane, on its edge (the pane clips what lies outside it)
+  const GRIP = '<div class="npane-grip"></div>';
+  function paneHTML(w) {
+    if (w.type === 'term') return `${GRIP}<div class="anote npane">${host(`win:${w.id}`, '')}</div>`;
+    if (w.type === 'team') return `${GRIP}<div class="tnote npane">${host(`win:${w.id}`, '')}</div>`;
+    if (w.type === 'page') return `${GRIP}<div class="anote npane">${host(`page:${w.id}`, '')}</div>`;
+    return '';
+  }
+  /* The ✎ pane's left edge is a divider, as in a Mac split view: dragged, the pane takes that share of the window (a
+     fifth to seven tenths), kept with the window, and a terminal beside it reflows as it goes; a double-click puts back
+     the usual width. */
+  function divider(r, id) {
+    const g = r.el.querySelector('.npane-grip'), pane = g && g.nextElementSibling;
+    if (!g || g.dataset.on || !pane || !pane.classList.contains('npane')) return;
+    g.dataset.on = '1';
+    const L0 = H.locate(id);
+    if (L0 && L0.w.paneW) pane.style.width = `${(L0.w.paneW * 100).toFixed(2)}%`;
+    g.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      // the edge keeps the distance from where it was pressed, and a terminal fits itself at most every 100 ms
+      const body = pane.parentElement.getBoundingClientRect(), off = e.clientX - pane.getBoundingClientRect().left;
+      let f = null, fitAt = 0;
+      const move = (ev) => {
+        f = Math.min(0.7, Math.max(0.2, (body.right - (ev.clientX - off)) / body.width));
+        pane.style.width = `${(f * 100).toFixed(2)}%`;
+        if (ev.timeStamp - fitAt >= 100) {
+          fitAt = ev.timeStamp;
+          H.fitSoon(0);
+        }
+      };
+      const up = () => {
+        g.removeEventListener('pointermove', move);
+        g.removeEventListener('pointerup', up);
+        g.removeEventListener('pointercancel', up);
+        pane.classList.remove('sizing');
+        H.fitSoon(0);
+        const L = H.locate(id);
+        if (f == null || !L) return;
