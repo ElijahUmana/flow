@@ -1,0 +1,198 @@
+'use strict';
+// Full-text index of every Claude Code transcript, for ⌘K search (B4). sessions.js runs this file in a worker
+// thread so main never blocks. It copies what was said (your prompts, Claude's replies, compaction summaries,
+// titles) out of ~/.claude/projects/*/<uuid>.jsonl into a pack in userData, one line per message, keyed by each
+// transcript's inode, size and mtime, so a transcript is read once and then only its new lines. ~/.claude is only
+// ever read.
+//
+// pack.txt holds the messages as written, pack.lc the same bytes with A-Z lowered (so offsets match), meta.runs the
+// stretches of the pack that belong to one transcript, and pack.tri one 32768-bit set per 64 KB block of the pack
+// of the three-byte sequences in it. A search reads only the blocks that hold every three bytes of a word, finds
+// it with Buffer.indexOf and, after a few hits in a transcript's stretch, jumps to its end.
+
+const fs = require('fs');
+const path = require('path');
+const { parentPort, workerData, threadId } = require('worker_threads');
+
+const V = 3;
+const CHUNK = 16 * 1024 * 1024;
+const HEAD = 4096;
+const MAX_TEXT = 50000;
+const PER_RUN = 8;
+const BLOCK = 64 * 1024;
+const TRI = 4096;
+const SAVE_EVERY = 2000;
+const REFRESH_AFTER = 3000;
+const REFRESH_BUDGET = 500;
+const KEEP_MS = Number(workerData.keepMs) || 60000;
+// The first build reads every transcript once (tens of GB on the Mac): it runs at a quarter of one core and at most
+// 64 MB/s of reads, so the Mac stays quiet. Later updates read only new lines and run at full speed.
+const GENTLE_SHARE = 0.25;
+const GENTLE_RATE = 64 * 1024 * 1024;
+const UUID_FILE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+const META_TEXT = /^(<command-name>|<command-message>|<command-args>|<local-command-stdout>|<local-command-stderr>|<system-reminder>|<bash-input>|<bash-stdout>|<bash-stderr>|Caveat: |\[Request interrupted)/;
+const KIND = { u: 'you', a: 'claude', s: 'summary', t: 'title' };
+const WEIGHT = { t: 5, u: 4, h: 4, s: 3, a: 2, f: 2 };
+const B = (s) => Buffer.from(s);
+const ROLE_USER = B('"role":"user"');
+const ROLE_ASSISTANT = B('"role":"assistant"');
+const TOOL_RESULT = B('"tool_use_id"');
+const TEXT_BLOCK = B('"type":"text"');
+const OTHER_TYPES = [B('"type":"summary"'), B('"type":"custom-title"'), B('"type":"ai-title"')];
+
+const root = workerData.root;
+const dir = workerData.cacheDir;
+const PACK = path.join(dir, 'pack.txt');
+const LC = path.join(dir, 'pack.lc');
+const TRIS = path.join(dir, 'pack.tri');
+const META = path.join(dir, 'meta.json');
+const TMP = `.${process.pid}-${threadId}.tmp`;   // this thread's own temp names
+
+let meta = null;
+const status = { sessions: 0, pending: 0, built: false };
+const byNo = new Map();
+let packFd = null;
+let lcFd = null;
+let tri = Buffer.alloc(0);
+let triDirty = Infinity;
+let refreshing = null;
+let lastRefresh = 0;
+// A search inside REFRESH_AFTER of the last refresh answers from what that refresh saw; changes since then (a session
+// that just ended) come in with one more refresh, and until it has run the answer says updating, so ⌘K asks again.
+let lastStart = 0;
+let lastAnswer = 0;
+let trailing = null;
+let compacting = null;
+let searches = 0;
+let savedAt = 0;
+const hist = { file: '', ino: 0, offset: 0, map: new Map() };
+
+const threadCpu = () => {
+  const u = typeof process.threadCpuUsage === 'function' ? process.threadCpuUsage() : process.cpuUsage();
+  return (u.user + u.system) / 1000;
+};
+const pacing = { on: false, cpu: 0, wall: 0, bytes: 0 };
+async function pace(bytes) {
+  if (!pacing.on) return;
+  pacing.bytes += bytes;
+  const wall = Date.now() - pacing.wall;
+  const wait = Math.max((threadCpu() - pacing.cpu) / GENTLE_SHARE - wall, (pacing.bytes / GENTLE_RATE) * 1000 - wall, 0);
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  pacing.cpu = threadCpu();
+  pacing.wall = Date.now();
+  pacing.bytes = 0;
+}
+
+const fresh = () => ({ v: V, root, packBytes: 0, deadBytes: 0, nextNo: 1, files: {}, runs: [], blocks: [] });
+const tick = () => new Promise((r) => setImmediate(r));
+const lower = (s) => s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
+const sizeOf = (file) => {
+  try {
+    return fs.statSync(file).size;
+  } catch (e) {
+    if (e.code === 'ENOENT') return -1;
+    throw e;
+  }
+};
+
+// ---------- three-byte block sets ----------
+
+const hash3 = (a, b, c) => Math.imul((a << 16) | (b << 8) | c, -1640531535) >>> 17;
+
+function blockSet(b) {
+  const need = (b + 1) * TRI;
+  if (tri.length < need) {
+    const grown = Buffer.alloc(Math.max(need, tri.length * 2, 64 * TRI));
+    tri.copy(grown);
+    tri = grown;
+  }
+  if (b < triDirty) triDirty = b;
+}
+
+/* Adds the complete lines in lc (which start at pack offset at) to the block sets, opening a new block when the
+   current one would pass BLOCK. Blocks always start at a line, so no match is ever split between two. */
+function addBlocks(lc, at) {
+  const blocks = meta.blocks;
+  let s = 0;
+  while (s < lc.length) {
+    let e = lc.indexOf(10, s);
+    if (e < 0) e = lc.length - 1;
+    const start = at + s;
+    if (!blocks.length || (start > blocks[blocks.length - 1] && start + (e + 1 - s) - blocks[blocks.length - 1] > BLOCK)) blocks.push(start);
+    const b = blocks.length - 1;
+    blockSet(b);
+    const base = b * TRI;
+    for (let i = s; i + 2 < e; i++) {
+      const h = hash3(lc[i], lc[i + 1], lc[i + 2]);
+      tri[base + (h >>> 3)] |= 1 << (h & 7);
+    }
+    s = e + 1;
+  }
+}
+
+function rebuildBlocks() {
+  meta.blocks = [];
+  tri = Buffer.alloc(0);
+  triDirty = 0;
+  const fd = fs.openSync(LC, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(CHUNK);
+    let at = 0;
+    while (at < meta.packBytes) {
+      const n = fs.readSync(fd, buf, 0, Math.min(CHUNK, meta.packBytes - at), at);
+      if (!n) break;
+      let last = buf.lastIndexOf(10, n - 1);
+      if (last < 0) last = n - 1;
+      addBlocks(buf.subarray(0, last + 1), at);
+      at += last + 1;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function saveBlocks() {
+  const n = meta.blocks.length;
+  if (triDirty >= n) return;
+  const fd = fs.openSync(TRIS, fs.existsSync(TRIS) ? 'r+' : 'w');
+  try {
+    fs.writeSync(fd, tri, triDirty * TRI, (n - triDirty) * TRI, triDirty * TRI);
+    fs.ftruncateSync(fd, n * TRI);
+  } finally {
+    fs.closeSync(fd);
+  }
+  triDirty = Infinity;
+}
+
+function load() {
+  fs.mkdirSync(dir, { recursive: true });
+  let m = null;
+  try {
+    m = JSON.parse(fs.readFileSync(META, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn(`[flow] session index: starting over, ${META} was unreadable: ${e.message}`);
+  }
+  if (!m || m.v !== V || m.root !== root || sizeOf(PACK) < m.packBytes || sizeOf(LC) < m.packBytes) {
+    m = fresh();
+    fs.writeFileSync(PACK, '');
+    fs.writeFileSync(LC, '');
+  } else {
+    // Lines appended after the last save are dropped; their transcripts are read again from the saved offsets.
+    fs.truncateSync(PACK, m.packBytes);
+    fs.truncateSync(LC, m.packBytes);
+  }
+  meta = m;
+  status.built = Object.keys(meta.files).length > 0;
+  // Until the first listing ends, the saved index says how many transcripts there are.
+  status.sessions = Object.keys(meta.files).length;
+  status.pending = 0;
+  byNo.clear();
+  for (const f of Object.values(meta.files)) byNo.set(f.no, f);
+  tri = Buffer.alloc(0);
+  triDirty = Infinity;
+  if (sizeOf(TRIS) === meta.blocks.length * TRI) {
+    if (meta.blocks.length) tri = fs.readFileSync(TRIS);
+  } else {
+    rebuildBlocks();
+    saveBlocks();
+  }
