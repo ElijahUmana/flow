@@ -1022,3 +1022,259 @@
     return false;
   }
   function relight(ws, w) {
+    const now = lit(ws, w);
+    if (LIT.get(w.id) === now) return false;
+    LIT.set(w.id, now);
+    H.renderTitle(ws, w);
+    return true;
+  }
+
+  /* ---------- note windows ---------- */
+  function open(ws, nid) {
+    const n = H.noteById(ws, nid);
+    let w = ws.windows.find((x) => x.noteId === nid), back = false;
+    if (!w) {
+      if (!n) return null;
+      const page = n.kind === 'page', p = !page && n.place;
+      if (p) {
+        // a note opened again comes back exactly where it was, at its size, in its sub-workspace, and what is there now
+        // makes way, as for a terminal reopened from its row (app.js's clear); without that, a place another window
+        // took meanwhile gives a free spot in that space
+        const zone = p.zone && spaceOf(ws, p.zone) ? p.zone : null;
+        const taken = !H.clear && ws.windows.some((o) => (o.zone || null) === zone && p.x < o.x + o.w && o.x < p.x + p.w && p.y < o.y + o.h && o.y < p.y + p.h);
+        const at = taken ? H.freeSpot(ws, p.w, p.h, zone) : { x: p.x, y: p.y, w: p.w, h: p.h };
+        w = H.addWindow(ws, { id: H.newId('w'), type: 'note', noteId: nid, ...at }, null, zone);
+        back = !taken && !!H.clear;
+      } else w = H.addWindow(ws, { id: H.newId('w'), type: page ? 'page' : 'note', noteId: nid, ...H.freeSpot(ws, page ? 46 : 34, page ? 62 : 46) });
+      H.renderSidebar();
+    }
+    H.focusWin(ws, w);
+    // once its space is on screen: clear makes room in the space shown
+    if (back) H.clear(ws, w);
+    focus(ws, w);
+    return w;
+  }
+  /* Going to a note window: its body takes the caret where it last was (the end the first time). */
+  function focus(ws, w) {
+    if (!w || w.type !== 'note') return;
+    const e = editorOf(w.id, `note:${w.noteId}`);
+    if (e) e.focus('last');
+  }
+
+  /* A note's title is one line: Enter goes on to the body, a paste comes in as one line. */
+  function onTitleKey(e) {
+    const t = e.target.closest && e.target.closest('.ntitle');
+    if (!t) return;
+    // ⌘Z and ⇧⌘Z where the keys reach the title before the menu: the title's own steps; a key that moves the caret ends
+    // the run
+    if (/^(?:Arrow|Page|Home$|End$)/.test(e.key)) titleHist(t).run = '';
+    if ((e.metaKey || e.ctrlKey) && !e.altKey) {
+      const k = e.key.toLowerCase();
+      if (k === 'z' || (k === 'y' && e.ctrlKey && !e.metaKey)) {
+        e.preventDefault();
+        titleStep(t, k === 'z' && !e.shiftKey);
+        return;
+      }
+    }
+    if (e.key !== 'Enter' || e.isComposing) return;
+    e.preventDefault();
+    const win = t.closest('.win');
+    const L = win && H.locate(win.dataset.id);
+    const b = L ? editorOf(L.w.id, `note:${L.w.noteId}`) : null;
+    if (b) b.focus('start');
+  }
+  function onTitlePaste(e) {
+    const t = e.target.closest && e.target.closest('.ntitle');
+    if (!t) return;
+    e.preventDefault();
+    // a paste is a step of its own
+    const h = titleHist(t);
+    h.run = '';
+    document.execCommand('insertText', false, e.clipboardData.getData('text/plain').replace(/\s*\n\s*/g, ' ').replace(/\s+$/, ''));
+    h.run = '';
+  }
+  function onTitleInput(e) {
+    const ed = e.target.closest && e.target.closest('.ntitle');
+    if (!ed || !ed.dataset.key) return;
+    recordTitle(ed, e.inputType || '');
+    const win = ed.closest('.win');
+    if (win) changed(win.dataset.id, ed.dataset.key, titleText(ed), ed);
+  }
+  // Chromium's own undo and redo commands on a title (from anywhere that sends them) take the same steps
+  function onTitleBefore(e) {
+    const t = e.target.closest && e.target.closest('.ntitle');
+    if (!t) return;
+    // the history starts from the title as it was before its first change
+    titleHist(t);
+    if (e.inputType !== 'historyUndo' && e.inputType !== 'historyRedo') return;
+    e.preventDefault();
+    titleStep(t, e.inputType === 'historyUndo');
+  }
+  function onTitleMoved(e) {
+    const t = e.target.closest && e.target.closest('.ntitle');
+    if (t && TITLES.has(t)) TITLES.get(t).run = '';
+  }
+
+  /* A note's title keeps its own undo, as its body does (FlowNote's mount): each key in a title renames the note and
+     redraws its row, and Chromium ends a typing run whenever a node in the window is removed, so its undo took a title
+     back a letter at a time. A run of typing, or of deleting, with the caret left alone is one step; text put in from
+     outside (fill) starts the history again. */
+  const TITLES = new WeakMap();
+  const titleText = (t) => t.innerText.replace(/\n$/, '').replace(/\n/g, ' ');
+  const titleRun = (type) => (/^insert(?:Text|CompositionText)$/.test(type) ? 'type' : /^delete(?:Content|Word)/.test(type) ? 'delete' : '');
+  function titleCaret(t) {
+    const sel = getSelection();
+    if (!sel.rangeCount || !t.contains(sel.anchorNode) || !t.contains(sel.focusNode)) return null;
+    const off = (node, o) => { const r = document.createRange(); r.selectNodeContents(t); r.setEnd(node, o); return r.toString().length; };
+    const a = off(sel.anchorNode, sel.anchorOffset), b = off(sel.focusNode, sel.focusOffset);
+    return { a: Math.min(a, b), b: Math.max(a, b) };
+  }
+  function titleSelect(t, a, b) {
+    const n = t.firstChild && t.firstChild.nodeType === 3 ? t.firstChild : null, len = n ? n.data.length : 0;
+    const r = document.createRange();
+    if (n) {
+      r.setStart(n, Math.min(a, len));
+      r.setEnd(n, Math.min(b, len));
+    } else r.setStart(t, 0);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+  function titleHist(t) {
+    let h = TITLES.get(t);
+    if (!h) {
+      h = { past: [], future: [], now: { text: t.textContent, at: null }, run: '' };
+      TITLES.set(t, h);
+    }
+    return h;
+  }
+  function recordTitle(t, type) {
+    const h = titleHist(t), text = t.textContent, at = titleCaret(t);
+    if (text !== h.now.text) {
+      const kind = titleRun(type), last = h.past[h.past.length - 1];
+      if (kind && kind === h.run && last) last.after = { text, at };
+      else if (h.past.push({ before: h.now, after: { text, at } }) > 200) h.past.shift();
+      h.run = kind;
+      h.future.length = 0;
+    }
+    h.now = { text, at };
+  }
+  function titleStep(t, back) {
+    const h = titleHist(t), step = (back ? h.past : h.future).pop();
+    if (!step) return;
+    (back ? h.future : h.past).push(step);
+    h.run = '';
+    const s = back ? step.before : step.after, at = s.at || { a: s.text.length, b: s.text.length };
+    t.textContent = s.text;
+    titleSelect(t, at.a, at.b);
+    h.now = { text: s.text, at: titleCaret(t) };
+    const win = t.closest('.win');
+    if (win && t.dataset.key) changed(win.dataset.id, t.dataset.key, titleText(t), t);
+  }
+
+  /* ---------- a clip is an annotation: the sentence goes into the page's own note, and the page highlights it ---------- */
+  function clip(id, text, url) {
+    const L = H.locate(id);
+    const quote = oneLine(text).trim();
+    if (!L || !quote) return;
+    const b = PANE.get(id);
+    const r = ensure(url || (b && b.url), b && b.title);
+    if (!r) return;
+    const body = r.note.replace(/\s+$/, '');
+    r.note = `${body}${body ? '\n\n' : ''}${QUOTE}${quote}\n`;
+    r.at = Date.now();
+    follow(L.ws, L.w);
+    fill(L.ws, L.w, true);
+    paintOthers(id);
+    setPane(L.ws, L.w, true, 'end');
+    H.scheduleSidebar();
+    H.save();
+  }
+  /* A page that loaded tells what it is; its record (if it has one, or once it is saved somewhere) keeps that. */
+  function seen(url, o = {}) {
+    const k = key(url);
+    if (!k) return;
+    /* What a page says about itself is not the owner's change (notes-merge.js). A record made here for a saved page
+       loses to one the owner changed in another window, but not to a deletion this window already knows of. */
+    let r = rec(k);
+    if (!r && H.workspaces().some((ws) => (ws.saved || []).some((s) => key(s.url) === k))) {
+      const was = PAGES[k];
+      r = ensure(url, o.title);
+      r.at = was && was.gone ? (was.at || 0) + 1 : 0;
+    }
+    if (!r) return;
+    let c = false;
+    if (o.title && o.title !== r.title) { r.title = o.title; c = true; }
+    if (o.about && o.about !== r.about) { r.about = o.about; c = true; }
+    if (!c) return;
+    r.seen = Date.now();
+    H.save();
+  }
+
+  /* ---------- a page's name: the one the owner gave it ('' for none), shown instead of its own title ---------- */
+  function nameOf(url) {
+    const r = rec(key(url));
+    return (r && r.name) || '';
+  }
+  /* title: the page's own title, for a record made here (the page had no notes and was not saved). */
+  function renamePage(url, name, title) {
+    const k = key(url);
+    if (!k) return false;
+    const v = oneLine(name).trim();
+    const r = rec(k) || (v ? ensure(url, oneLine(title).trim()) : null);
+    if (!r) return false;
+    let c = false;
+    if (!r.title && title) { r.title = oneLine(title).trim(); c = true; }
+    if ((r.name || '') !== v) {
+      if (v) r.name = v;
+      else delete r.name;
+      c = true;
+    }
+    if (!c) return false;
+    r.at = Date.now();
+    H.save();
+    H.renamed(k);
+    return true;
+  }
+
+  /* ---------- a redirect (the server's, or the page's own before any input) keeps the page: its record moves to where
+     the page landed, merging into one that is already there, and the address it left still finds it. A navigation the
+     owner makes is not a redirect: page.js reports only redirects. ---------- */
+  /* A bounce to sign in (a sign-in address, or one that carries the page it came from to go back to) is not the page
+     moving: the name stays where it was given. */
+  const RETURN = /^(?:next|return_?to|return_?url|redirect(?:_?uri|_?url|_?to)?|continue|callback(?:_?url)?|dest(?:ination)?|goto|target)$/i;
+  const SIGNIN = /(?:^|\/)(?:login|log-in|signin|sign-in|sign_in|auth|sso|oauth2?|authorize)(?:[/.]|$)/i;
+  function bounce(from, to) {
+    const t = new URL(to);
+    if (SIGNIN.test(t.pathname)) return true;
+    const fp = URL.canParse(from) ? new URL(from).pathname : '';
+    for (const [k, v] of t.searchParams) if (RETURN.test(k) || (fp.length > 1 && v.includes(fp))) return true;
+    return false;
+  }
+  function moved(from, to) {
+    const a = keyOf(key(from)), b = key(to);
+    if (!a || !b || a === b || keyOf(b) === a || bounce(from, to)) return false;
+    const src = PAGES[a];
+    const bk = keyOf(b) || b;
+    const dst = own(bk) ? PAGES[bk] : null;
+    /* Two pages that both hold the owner's words stay two pages. */
+    if (dst && ((dst.name && src.name && dst.name !== src.name) || (dst.note.trim() && src.note.trim() && !dst.note.includes(src.note.trim())))) return false;
+    if (!dst) {
+      PAGES[bk] = src;
+      src.url = plainUrl(to);
+    } else {
+      if (!dst.name && src.name) dst.name = src.name;
+      const t = src.note.trim();
+      if (t && !dst.note.includes(t)) dst.note = dst.note.trim() ? `${dst.note.replace(/\s+$/, '')}\n\n${src.note}` : src.note;
+      if (!dst.title && src.title) dst.title = src.title;
+      if (!dst.about && src.about) dst.about = src.about;
+      if (src.folds) dst.folds = { ...src.folds, ...(dst.folds || {}) };
+    }
+    const r = PAGES[bk];
+    r.from = [...new Set([...(r.from || []), a, ...(src.from || [])])].filter((k) => k !== bk);
+    r.at = Date.now();
+    PAGES[a] = { gone: true, at: r.at };
+    reindex();
+    const showing = [...PANE].filter(([, x]) => x.key === a || x.key === bk).map(([id]) => id);
+    for (const id of showing) {
+      const L = H.locate(id);
