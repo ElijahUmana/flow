@@ -196,3 +196,201 @@ function load() {
     rebuildBlocks();
     saveBlocks();
   }
+  packFd = fs.openSync(PACK, 'a');
+  lcFd = fs.openSync(LC, 'a');
+}
+
+function save(force) {
+  const now = Date.now();
+  if (!force && now - savedAt < SAVE_EVERY) return;
+  savedAt = now;
+  saveBlocks();
+  const tmp = META + TMP;
+  fs.writeFileSync(tmp, JSON.stringify(meta));
+  fs.renameSync(tmp, META);
+}
+
+function drop(file) {
+  const f = meta.files[file];
+  if (!f) return;
+  meta.deadBytes += f.bytes;
+  byNo.delete(f.no);
+  delete meta.files[file];
+}
+
+// ---------- reading transcripts ----------
+
+function clean(raw) {
+  let text = String(raw || '').trim();
+  if (!text || META_TEXT.test(text)) return '';
+  const mate = text.match(/^<teammate-message\b[^>]*>([\s\S]*?)(<\/teammate-message>|$)/);
+  if (mate) text = mate[1];
+  return text;
+}
+
+function texts(content) {
+  if (typeof content === 'string') return [content];
+  if (!Array.isArray(content)) return [];
+  return content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text);
+}
+
+function push(out, kind, raw) {
+  let text = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!text) return;
+  if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT);
+  out.push(`${kind}\t${text}\n`);
+}
+
+function take(o, f, out) {
+  if (!f.cwd && typeof o.cwd === 'string') f.cwd = o.cwd;
+  if (o.type === 'summary') return push(out, 's', o.summary);
+  if (o.type === 'custom-title') return push(out, 't', o.customTitle);
+  if (o.type === 'ai-title') return push(out, 't', o.aiTitle);
+  const m = o.message;
+  if (!m) return;
+  if (o.type === 'user') {
+    if (o.isCompactSummary) return push(out, 's', texts(m.content).join(' '));
+    if (o.isMeta || o.toolUseResult !== undefined) return;
+    for (const t of texts(m.content)) push(out, 'u', clean(t));
+  } else if (o.type === 'assistant') {
+    for (const t of texts(m.content)) push(out, 'a', t);
+  }
+}
+
+/* Most of a transcript is tool output. Cheap byte tests skip those lines before JSON.parse ever sees them. */
+function wanted(line) {
+  const head = line.subarray(0, HEAD);
+  if (head.indexOf(ROLE_USER) >= 0) return head.indexOf(TOOL_RESULT) < 0;
+  if (head.indexOf(ROLE_ASSISTANT) >= 0) return line.indexOf(TEXT_BLOCK) >= 0;
+  return OTHER_TYPES.some((t) => head.indexOf(t) >= 0);
+}
+
+function lines(data, end, f, out, bad) {
+  let s = 0;
+  while (s < end) {
+    let e = data.indexOf(10, s);
+    if (e < 0 || e > end) e = end;
+    if (e - s > 2 && data[s] === 0x7b) {
+      const line = data.subarray(s, e);
+      if (wanted(line)) {
+        let o = null;
+        try {
+          o = JSON.parse(line.toString('utf8'));
+        } catch (err) {
+          bad.n += 1;
+        }
+        if (o) take(o, f, out);
+      }
+    }
+    s = e + 1;
+  }
+}
+
+function append(out, f) {
+  if (!out.length) return;
+  const text = out.join('');
+  const orig = Buffer.from(text);
+  const lc = Buffer.from(lower(text));
+  if (lc.length !== orig.length) throw new Error('session index: lowering changed the byte length');
+  fs.writeSync(packFd, orig);
+  fs.writeSync(lcFd, lc);
+  addBlocks(lc, meta.packBytes);
+  const last = meta.runs[meta.runs.length - 1];
+  if (!last || last[1] !== f.no) meta.runs.push([meta.packBytes, f.no]);
+  meta.packBytes += orig.length;
+  f.bytes += orig.length;
+}
+
+async function indexFile({ id, file, st }) {
+  let f = meta.files[file];
+  if (!f || f.ino !== st.ino || st.size < f.offset) {
+    if (f) drop(file);
+    f = { no: meta.nextNo++, id, ino: st.ino, size: 0, mtimeMs: 0, offset: 0, bytes: 0, cwd: '' };
+    meta.files[file] = f;
+    byNo.set(f.no, f);
+  }
+  const fh = await fs.promises.open(file, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(CHUNK);
+    let readAt = f.offset;
+    let carry = null;
+    const bad = { n: 0 };
+    while (readAt < st.size) {
+      const { bytesRead } = await fh.read(buf, 0, Math.min(CHUNK, st.size - readAt), readAt);
+      if (!bytesRead) break;
+      const data = carry ? Buffer.concat([carry, buf.subarray(0, bytesRead)]) : buf.subarray(0, bytesRead);
+      const start = readAt - (carry ? carry.length : 0);
+      readAt += bytesRead;
+      const end = data.lastIndexOf(10);
+      if (end < 0) {
+        carry = Buffer.from(data);
+        continue;
+      }
+      const out = [];
+      lines(data, end, f, out, bad);
+      append(out, f);
+      f.offset = start + end + 1;
+      carry = end + 1 < data.length ? Buffer.from(data.subarray(end + 1)) : null;
+      await pace(bytesRead);
+    }
+    if (bad.n) console.warn(`[flow] session index: skipped ${bad.n} unreadable line(s) in ${file}`);
+  } finally {
+    await fh.close();
+  }
+  // A last line still being written stays unread (offset stops before it) and is read with the next change.
+  f.size = st.size;
+  f.mtimeMs = st.mtimeMs;
+}
+
+async function listTranscripts() {
+  const projects = path.join(root, 'projects');
+  let dirs;
+  try {
+    dirs = await fs.promises.readdir(projects, { withFileTypes: true });
+  } catch (e) {
+    if (e.code === 'ENOENT') return [];
+    throw e;
+  }
+  const found = [];
+  await Promise.all(dirs.filter((d) => d.isDirectory()).map(async (d) => {
+    for (const name of await fs.promises.readdir(path.join(projects, d.name))) {
+      const m = UUID_FILE.exec(name);
+      if (m) found.push({ id: m[1].toLowerCase(), file: path.join(projects, d.name, name) });
+    }
+  }));
+  return found;
+}
+
+async function readHistory() {
+  const file = path.join(root, 'history.jsonl');
+  let st;
+  try {
+    st = await fs.promises.stat(file);
+  } catch (e) {
+    if (e.code === 'ENOENT') return;
+    throw e;
+  }
+  if (hist.file !== file || hist.ino !== st.ino || st.size < hist.offset) {
+    hist.file = file;
+    hist.ino = st.ino;
+    hist.offset = 0;
+    hist.map = new Map();
+  }
+  if (st.size === hist.offset) return;
+  const fh = await fs.promises.open(file, 'r');
+  let text = '';
+  try {
+    const buf = Buffer.alloc(st.size - hist.offset);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, hist.offset);
+    const end = buf.lastIndexOf(10, bytesRead - 1);
+    if (end >= 0) {
+      text = buf.toString('utf8', 0, end);
+      hist.offset += end + 1;
+    }
+  } finally {
+    await fh.close();
+  }
+  let bad = 0;
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    let o;
