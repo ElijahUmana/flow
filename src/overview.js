@@ -145,3 +145,150 @@ function mount(h) {
   };
   const stopDwell = () => { clearTimeout(dwell); dwell = 0; };
   /* The view as drawn right now, to tell whether it is still moving by itself (a glide, a step's slide, a pinch
+     settling, a workspace sliding in): it comes up only once the view is still and drawn where nav keeps it, so not
+     while a glide holds past an end before it springs back. */
+  const motion = () => {
+    const ws = h.current(), c = ws && h.canvas(ws);
+    if (!c) return '';
+    const t = c.closest('.track'), cs = getComputedStyle(c);
+    return `${cs.transform}|${cs.translate}|${t ? getComputedStyle(t).transform : ''}`;
+  };
+  const placed = () => {
+    const ws = h.current(), c = ws && h.canvas(ws), t = c ? getComputedStyle(c).transform : 'none';
+    if (!t || t === 'none') return true;
+    const m = new DOMMatrixReadOnly(t), z = m.a || 1, v = h.nav.visible(ws), { vw, vh } = h.size();
+    // in screen px: nav draws the canvas up to half a device pixel from its view
+    return Math.abs(-m.m41 - (v.x / 100) * vw * z) <= 1 && Math.abs(-m.m42 - (v.y / 100) * vh * z) <= 1;
+  };
+
+  /* The bottom right: from NEAR left of the map (at least of where a usual W-wide map would be, so the place to reach
+     for stays the same whatever the space's shape) to the window's right side, and from the map's top (at least ZONE_H
+     up) to the window's bottom, its outermost px included as for the dock, so a quick throw into the corner or against
+     an edge brings it up (layout's walk, owner 23:41); over a window only the bottom EDGE px. */
+  function inZone(x, y, overWin) {
+    const s = scene(), m = s && measure(s);
+    if (!m) return false;
+    const left = Math.min(m.left, m.st.right - RIGHT - W - 2) - NEAR;
+    if (x < left || x > m.st.right || y > m.st.bottom || y < Math.min(m.top, m.st.bottom - ZONE_H)) return false;
+    return !overWin || y >= m.st.bottom - EDGE;
+  }
+  const near = (x, y) => {
+    const m = map && map.m;
+    return !!m && x >= m.left - KEEP && x <= m.st.right && y >= m.top - KEEP_UP && y <= m.st.bottom;
+  };
+  /* Well away from the bottom right: no move here can bring the map up. */
+  const outside = (st, x, y) => x < st.right - RIGHT - WIDE - NEAR || y < st.bottom - BOTTOM - Math.max(TALL, ZONE_H) - 4;
+  /* A window's resize grips (app.js .rz) reach 5 px below its bottom edge, into the bare strip: a rest there aims at
+     the grip, not at the map. */
+  const grip = (t) => !!(t && t.closest && t.closest('.rz'));
+  const onMove = (e) => {
+    lastX = e.clientX;
+    lastY = e.clientY;
+    if (held) return;
+    if (shown) {
+      if (near(lastX, lastY)) { clearTimeout(timer); timer = 0; } else linger();
+      return;
+    }
+    const st = h.stage.getBoundingClientRect();
+    if (outside(st, lastX, lastY)) { stopDwell(); working = false; return; }
+    const over = !!(e.target && e.target.closest && e.target.closest('.win'));
+    if (e.buttons || grip(e.target) || !inZone(lastX, lastY, over)) { stopDwell(); return; }
+    if (working) return;
+    if (!dwell) {
+      let was = motion();
+      const fire = () => {
+        const now = motion();
+        if (now !== was || !placed()) { was = now; dwell = setTimeout(fire, DWELL_MS); return; }
+        dwell = 0;
+        const t = document.elementFromPoint(lastX, lastY);
+        if (!shown && !held && !grip(t) && inZone(lastX, lastY, !!(t && t.closest && t.closest('.win')))) set(true);
+      };
+      dwell = setTimeout(fire, DWELL_MS);
+    }
+  };
+  /* A press at the bottom right, the map down, is work there (a right-click "new note here", a double-click at the edge):
+     a rest there afterwards is not a reach, so the map waits until the pointer has gone well away from the corner or
+     out of the window (flows' board walk: it came up over a note just made under it). Crossing a window there, the
+     note just made included, is not going away. With the map up, a press on a window's resize grip beside it is such
+     work too, and the map goes so it never sits over the corner being resized. */
+  const onPress = (e) => {
+    if (el.contains(e.target) || outside(h.stage.getBoundingClientRect(), e.clientX, e.clientY)) return;
+    if (shown && !grip(e.target)) return;
+    working = true;
+    stopDwell();
+    if (shown) set(false);
+  };
+  /* Leaving the window, or going into a web page (its pointer moves never reach this document). */
+  const onOut = (e) => {
+    const to = e.relatedTarget;
+    if (!to || to.tagName === 'WEBVIEW' || to.tagName === 'IFRAME') { stopDwell(); working = false; linger(); }
+  };
+
+  /* A click on an empty part centers the view there; on a window's shape it goes to that window; a drag moves the frame
+     (held where it was taken, or centered on the pointer when taken outside it). */
+  el.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || !map) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const a = document.activeElement;
+    if (a && a !== document.body && a.blur) a.blur();
+    const { s, m, f } = map, r = el.getBoundingClientRect(), ox = r.left + 1, oy = r.top + 1;
+    const p0x = e.clientX - ox, p0y = e.clientY - oy;
+    const inFrame = p0x >= f.x && p0x <= f.x + f.w && p0y >= f.y && p0y <= f.y + f.h;
+    const dx = inFrame ? p0x - (f.x + f.w / 2) : 0, dy = inFrame ? p0y - (f.y + f.h / 2) : 0;
+    const at = (cx, cy, ax = 0, ay = 0) => ({ x: s.x0 + ((cx - ox - ax) / m.k / m.vw) * 100, y: s.y0 + ((cy - oy - ay) / m.k / m.vh) * 100 });
+    let moved = false;
+    held = true;
+    clearTimeout(timer);
+    timer = 0;
+    if (e.isTrusted) el.setPointerCapture(e.pointerId);
+    h.busy(true);
+    const move = (ev) => {
+      if (ev.pointerId !== e.pointerId) return;
+      if (!moved && Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < CLICK_PX) return;
+      moved = true;
+      const p = at(ev.clientX, ev.clientY, dx, dy);
+      h.nav.goTo(s.ws, p.x, p.y, false);
+    };
+    const up = (ev) => {
+      if (ev.pointerId !== e.pointerId) return;
+      el.removeEventListener('pointermove', move);
+      el.removeEventListener('pointerup', up);
+      el.removeEventListener('pointercancel', up);
+      el.removeEventListener('lostpointercapture', up);
+      held = false;
+      h.busy(false);
+      if (ev.type === 'pointerup' && !moved) {
+        const px = ev.clientX - ox, py = ev.clientY - oy;
+        const hit = map && [...map.rects].reverse().find((q) => px >= q.x && px <= q.x + q.w && py >= q.y && py <= q.y + q.h);
+        const w = hit && s.ws.windows.find((o) => o.id === hit.id);
+        if (w) h.go(s.ws, w);
+        else { const p = at(ev.clientX, ev.clientY); h.nav.goTo(s.ws, p.x, p.y, true); }
+      }
+      h.changed();
+      if (!near(lastX, lastY)) linger();
+    };
+    el.addEventListener('pointermove', move);
+    el.addEventListener('pointerup', up);
+    el.addEventListener('pointercancel', up);
+    el.addEventListener('lostpointercapture', up);
+  });
+  /* Two fingers over it still move between the spaces of the workspace; a pinch over it does nothing. */
+  el.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (!e.ctrlKey) h.nav.wheel({ dx: e.deltaX, dy: e.deltaY, t: performance.timeOrigin + e.timeStamp });
+  }, { passive: false });
+
+  window.addEventListener('pointermove', onMove, { capture: true, passive: true });
+  window.addEventListener('pointerdown', onPress, { capture: true, passive: true });
+  window.addEventListener('contextmenu', onPress, { capture: true, passive: true });
+  document.addEventListener('pointerout', onOut, true);
+  return { isShown: () => shown };
+}
+
+window.FlowOverview = { mount };
+})();
+
+
+
+
