@@ -1278,3 +1278,257 @@
     const showing = [...PANE].filter(([, x]) => x.key === a || x.key === bk).map(([id]) => id);
     for (const id of showing) {
       const L = H.locate(id);
+      if (L) { PANE.delete(id); fill(L.ws, L.w, false); }
+    }
+    H.save();
+    H.renamed(bk);
+    return true;
+  }
+
+  /* ---------- records for the sidebar: the page in brief, and deleting what was written about a page ---------- */
+  function records() {
+    return Object.keys(PAGES).filter(own).map((k) => ({ key: k, url: PAGES[k].url, title: PAGES[k].title, name: PAGES[k].name || '', at: PAGES[k].at, hasNote: !!String(PAGES[k].note || '').trim() }));
+  }
+  function deletePage(k) {
+    const r = own(k) ? PAGES[k] : null;
+    if (!r) return null;
+    PAGES[k] = { gone: true, at: Date.now() };
+    reindex();
+    refreshKey(k);
+    H.save();
+    let undone = false;
+    return {
+      title: r.title || r.url,
+      undo: () => {
+        if (undone || rec(k)) return false;
+        undone = true;
+        PAGES[k] = { ...r, at: Date.now() };
+        reindex();
+        refreshKey(k);
+        H.save();
+        return true;
+      },
+    };
+  }
+  /* A closed page window's entry in ws.notes stays only while it holds something of the owner's: a page among its tabs
+     with text or a name in its record, or saved in any workspace; the entry in a section; another window on it. */
+  function unused(ws, w) {
+    const n = w && H.noteById(ws, w.noteId);
+    if (!n || n.kind !== 'page' || n.parent || String(n.body || '').trim() || (n.titleSet && n.title)) return false;
+    if (ws.windows.some((x) => x !== w && x.noteId === n.id)) return false;
+    const saved = new Set(H.workspaces().flatMap((x) => (x.saved || []).map((s) => key(s.url))));
+    return ![n.url, ...(w.tabs || []).map((t) => t && t.url)].map(key).filter(Boolean)
+      .some((k) => { const r = rec(k); return saved.has(k) || (r && (r.note.trim() || r.name)); });
+  }
+  function refreshKey(k) {
+    for (const [id, b] of PANE) {
+      if (b.key !== k) continue;
+      const L = H.locate(id);
+      if (L) fill(L.ws, L.w, true);
+    }
+    H.renderSidebar();
+  }
+  const siteOf = (url) => { const s = String(url || ''); return URL.canParse(s) ? new URL(s).hostname.replace(/^www\./, '') : s; };
+  /* The page in brief: its name as its row shows it (the owner's, else the title the row has, else its own), its site
+     unless that is the name, what it is about, the start of its note and its quoted sentences. */
+  function brief(url, title) {
+    const r = rec(key(url));
+    const el = document.createElement('div');
+    el.className = 'nbrief';
+    const add = (cls, text) => { if (!text) return; const d = document.createElement('div'); d.className = cls; d.textContent = text; el.appendChild(d); };
+    const site = siteOf(url);
+    const name = (r && r.name) || oneLine(title).trim() || (r && r.title) || site;
+    add('nb-t', name);
+    if (name !== site) add('nb-s', site);
+    add('nb-a', r && r.about);
+    if (r && r.note.trim()) {
+      const lines = r.note.split('\n').filter((l) => l.trim()).slice(0, 8);
+      lines.forEach((l) => (l.startsWith(QUOTE) ? add('nb-q', l.slice(QUOTE.length)) : add('nb-n', l)));
+    }
+    return el;
+  }
+
+  /* ---------- the store: load, save, other windows. A state saved before page records existed (no pages in it) has
+     its page notes moved into records once; after that a launch changes nothing, so a page comes back as it was left. */
+  function load(doc) {
+    use(window.FlowNotesMerge.merge({}, doc).pages);
+    return doc == null ? migrate() : 0;
+  }
+  function use(pages) {
+    PAGES = pages;
+    for (const r of Object.values(PAGES)) if (!r.gone) r.note = String(r.note || '');
+    reindex();
+  }
+  /* Old page notes (ws.notes entries of kind 'page') move into their page's record, written or not, so every page the
+     owner had stays in the state and ⌘K finds it until the owner's × removes it. Nothing is lost: text already in the
+     record is not added twice, a page without an address keeps its entry, an entry a window points at stays (empty),
+     and so does one in a section until the sidebar has moved it to its saved pages. */
+  function migrate() {
+    let moved = 0;
+    for (const ws of H.workspaces()) {
+      const used = new Set(ws.windows.map((w) => w.noteId).filter(Boolean));
+      for (const n of [...ws.notes]) {
+        if (n.kind !== 'page' || !key(n.url)) continue;
+        const text = String(n.body || '').replace(/\s+$/, '');
+        if (!rec(key(n.url))) moved++;
+        const r = ensure(n.url, n.title || '');
+        if (!r.title && n.title) r.title = n.title;
+        if (n.titleSet && n.title && !r.name) { r.name = n.title; moved++; }
+        if (text && !r.note.includes(text)) r.note = r.note.trim() ? `${r.note.replace(/\s+$/, '')}\n\n${text}` : text;
+        if (n.body || n.clips) moved++;
+        n.body = '';
+        delete n.clips;
+        if (!used.has(n.id) && !n.parent && Array.isArray(ws.saved)) { ws.notes.splice(ws.notes.indexOf(n), 1); moved++; }
+      }
+    }
+    return moved;
+  }
+  const pagesDoc = () => PAGES;
+  /* Another window saved: each record is taken from whichever copy changed it last (notes-merge.js; the store merges
+     the same way). A focused note is not rewritten under the caret (fill leaves it), and its next keystroke is newer. */
+  function remote(doc) {
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return;
+    use(window.FlowNotesMerge.merge(PAGES, doc).pages);
+  }
+
+  /* ---------- an agent's note stays with its Claude session when the agent ends, and comes back with it ---------- */
+  function keep(ws, w) {
+    if (!w || !w.sessionId || !(w.note || '').trim()) return false;
+    ws.sessionNotes = { ...(ws.sessionNotes || {}), [w.sessionId]: w.note };
+    return true;
+  }
+  function take(sid) {
+    for (const ws of H.workspaces()) {
+      const m = ws.sessionNotes;
+      if (m && Object.prototype.hasOwnProperty.call(m, sid)) {
+        const v = m[sid];
+        const rest = { ...m };
+        delete rest[sid];
+        if (Object.keys(rest).length) ws.sessionNotes = rest;
+        else delete ws.sessionNotes;
+        return v;
+      }
+    }
+    return '';
+  }
+
+  /* ---------- sections: a note or a page moves into a named section of its group. A section is a ws.notes entry of
+     kind 'folder' that holds 'note' or 'page'; an item points at its section with parent. A section is in one space of
+     its workspace: zone is that sub-workspace's id, none for the main space. ---------- */
+  const byId = (ws, id) => ws.notes.find((n) => n.id === id) || null;
+  const isSection = (n) => !!n && n.kind === 'folder';
+  const itemsOf = (ws, id) => ws.notes.filter((n) => (n.parent || null) === id);
+  function holdsOf(ws, f) {
+    if (f.holds) return f.holds;
+    const items = itemsOf(ws, f.id);
+    return items.length && items.every((n) => n.kind === 'page') ? 'page' : 'note';
+  }
+  const kindOf = (n) => (n.kind === 'page' ? 'page' : 'note');
+  const spaceOf = (ws, zone) => (zone && (ws.zones || []).some((z) => z.id === zone) ? zone : null);
+  const done = (v) => { H.renderSidebar(); H.save(); return v; };
+  function sections(ws, holds) {
+    return ws.notes.filter((n) => isSection(n) && (!holds || holdsOf(ws, n) === holds));
+  }
+  function sectionOf(ws, id) {
+    const n = byId(ws, id);
+    const f = n && n.parent ? byId(ws, n.parent) : null;
+    return isSection(f) ? f : null;
+  }
+  function newSection(ws, o = {}) {
+    const holds = o.holds === 'page' ? 'page' : 'note';
+    const title = String(o.title || '').trim() || 'new section';
+    const f = { id: H.newId('n'), kind: 'folder', title, holds };
+    const zone = spaceOf(ws, o.zone);
+    if (zone) f.zone = zone;
+    const last = ws.notes.map((n, i) => (isSection(n) && holdsOf(ws, n) === holds ? i : -1)).filter((i) => i >= 0).pop();
+    ws.notes.splice(last == null ? ws.notes.length : last + 1, 0, f);
+    const item = o.item ? byId(ws, o.item) : null;
+    if (item && !isSection(item) && kindOf(item) === holds) item.parent = f.id;
+    return done(f);
+  }
+  /* A note renamed from the sidebar: its window's heading follows. A blank name takes the title away, so the note is
+     named by its first line again. */
+  function renameNote(ws, id, title) {
+    const n = byId(ws, id);
+    const t = oneLine(title).trim();
+    if (!n || isSection(n) || n.kind === 'page' || (t ? titled(n) && n.title === t : !titled(n))) return false;
+    n.title = t;
+    n.titleSet = !!t;
+    H.updateNoteTitle(ws, n);
+    ws.windows.filter((x) => x.noteId === id).forEach((x) => heading(ws, x));
+    return done(true);
+  }
+  function renameSection(ws, id, title) {
+    const f = byId(ws, id);
+    const t = String(title || '').trim();
+    if (!isSection(f) || !t) return false;
+    f.title = t;
+    return done(true);
+  }
+  function move(ws, id, sectionId) {
+    const n = byId(ws, id);
+    if (!n || isSection(n)) return false;
+    if (sectionId) {
+      const f = byId(ws, sectionId);
+      if (!isSection(f) || holdsOf(ws, f) !== kindOf(n)) return false;
+      n.parent = f.id;
+    } else delete n.parent;
+    return done(true);
+  }
+  /* A section to another space of its workspace (zone null: the main one). */
+  function moveSection(ws, id, zone) {
+    const f = byId(ws, id), z = spaceOf(ws, zone);
+    if (!isSection(f) || (zone && !z) || (f.zone || null) === z) return false;
+    if (z) f.zone = z;
+    else delete f.zone;
+    return done(true);
+  }
+  /* Saved pages (sidebar's ws.saved) count as items of their section too. */
+  function removeSection(ws, id) {
+    const f = byId(ws, id);
+    if (!isSection(f) || itemsOf(ws, id).length || (ws.saved || []).some((x) => x.section === id)) return false;
+    ws.notes.splice(ws.notes.indexOf(f), 1);
+    return done(true);
+  }
+  /* Deleting closes the note's window; undo puts the note back in its place and its window where it was. */
+  function deleteNote(ws, id) {
+    const n = byId(ws, id);
+    if (!n || isSection(n)) return null;
+    const at = ws.notes.indexOf(n);
+    const wins = ws.windows.filter((w) => w.noteId === id).map((w) => ({ ...w }));
+    ws.windows.filter((w) => w.noteId === id).forEach((w) => { detach(w.id); H.removeWindow(ws, w); });
+    ws.notes.splice(at, 1);
+    let undone = false;
+    const undo = () => {
+      if (undone || byId(ws, id)) return false;
+      undone = true;
+      if (n.parent && !isSection(byId(ws, n.parent))) delete n.parent;
+      ws.notes.splice(Math.min(at, ws.notes.length), 0, n);
+      wins.forEach((w) => H.addWindow(ws, w));
+      return done(true);
+    };
+    done(true);
+    return { title: noteName(n) || 'untitled', undo };
+  }
+
+  function mount(hooks) {
+    H = hooks;
+    document.addEventListener('keydown', onTitleKey, true);
+    document.addEventListener('paste', onTitlePaste, true);
+    document.addEventListener('input', onTitleInput);
+    document.addEventListener('beforeinput', onTitleBefore, true);
+    document.addEventListener('mousedown', onTitleMoved, true);
+    document.addEventListener('focusout', onTitleMoved, true);
+  }
+
+  window.FlowNotes = {
+    mount, paneHTML, noteHTML, attach, detach, fill, toggle, open, focus, noteName, clip, keep, take,
+    key, load, pagesDoc, remote, follow, lit, seen, onMark, records, deletePage, unused, brief, nameOf, renamePage, renameNote, moved,
+    newSection, renameSection, move, moveSection, removeSection, deleteNote, sections, sectionOf,
+    undo: (el) => history(el, true), redo: (el) => history(el, false),
+  };
+})();
+
+
+
+
