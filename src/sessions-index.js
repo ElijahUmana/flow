@@ -394,3 +394,201 @@ async function readHistory() {
   for (const line of text.split('\n')) {
     if (!line) continue;
     let o;
+    try {
+      o = JSON.parse(line);
+    } catch (e) {
+      bad += 1;
+      continue;
+    }
+    if (!o || !o.sessionId || typeof o.display !== 'string') continue;
+    const id = String(o.sessionId).toLowerCase();
+    let h = hist.map.get(id);
+    if (!h) hist.map.set(id, (h = { cwd: o.project || '', parts: [], lc: '', last: 0 }));
+    const t = o.display.replace(/\s+/g, ' ').trim();
+    if (t) h.parts.push(t);
+    if (o.timestamp > h.last) h.last = o.timestamp;
+    h.lc = '';
+  }
+  if (bad) console.warn(`[flow] session index: skipped ${bad} unreadable line(s) in ${file}`);
+}
+
+async function refreshNow(gentle) {
+  const [files] = await Promise.all([listTranscripts(), readHistory()]);
+  const seen = new Set();
+  const work = [];
+  for (const { id, file } of files) {
+    seen.add(file);
+    let st;
+    try {
+      st = await fs.promises.stat(file);
+    } catch (e) {
+      if (e.code === 'ENOENT') continue;
+      throw e;
+    }
+    const f = meta.files[file];
+    if (f && f.ino === st.ino && f.size === st.size && f.mtimeMs === st.mtimeMs) continue;
+    work.push({ id, file, st });
+  }
+  for (const file of Object.keys(meta.files)) if (!seen.has(file)) drop(file);
+  work.sort((a, b) => b.st.mtimeMs - a.st.mtimeMs);
+  status.sessions = files.length;
+  status.pending = work.length;
+  pacing.on = gentle || !status.built;
+  pacing.cpu = threadCpu();
+  pacing.wall = Date.now();
+  pacing.bytes = 0;
+  for (const w of work) {
+    try {
+      await indexFile(w);
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      drop(w.file);
+    }
+    status.pending -= 1;
+    save(false);
+    await pace(0);
+    await tick();
+  }
+  pacing.on = false;
+  status.built = true;
+  save(true);
+  const live = byNo.size;
+  if ((meta.deadBytes > 64 * 1024 * 1024 && meta.deadBytes > meta.packBytes * 0.3) || meta.runs.length > 4 * live + 1000) await compact();
+}
+
+function refresh(gentle) {
+  if (!refreshing) {
+    lastStart = Date.now();
+    refreshing = refreshNow(gentle).finally(() => {
+      refreshing = null;
+      lastRefresh = Date.now();
+    });
+  }
+  return refreshing;
+}
+
+/* Rewrites both packs with each live transcript's stretches together and the dropped ones gone. Never while a
+   search reads them. */
+async function compact() {
+  while (searches > 0) await new Promise((r) => setTimeout(r, 50));
+  compacting = (async () => {
+    const ends = meta.runs.map((r, i) => (i + 1 < meta.runs.length ? meta.runs[i + 1][0] : meta.packBytes));
+    const byFile = new Map();
+    meta.runs.forEach((r, i) => {
+      if (!byNo.has(r[1])) return;
+      if (!byFile.has(r[1])) byFile.set(r[1], []);
+      byFile.get(r[1]).push([r[0], ends[i]]);
+    });
+    const runs = [];
+    let at = 0;
+    const copies = [[PACK, PACK + TMP], [LC, LC + TMP]].map(([from, to]) => ({ from: fs.openSync(from, 'r'), to: fs.openSync(to, 'w'), name: to }));
+    try {
+      const buf = Buffer.allocUnsafe(CHUNK);
+      for (const [no, parts] of byFile) {
+        const start = at;
+        for (const [s, e] of parts) {
+          for (let p = s; p < e; p += CHUNK) {
+            const n = Math.min(CHUNK, e - p);
+            for (const c of copies) {
+              fs.readSync(c.from, buf, 0, n, p);
+              fs.writeSync(c.to, buf, 0, n);
+            }
+            at += n;
+          }
+        }
+        runs.push([start, no]);
+        await tick();
+      }
+    } finally {
+      for (const c of copies) {
+        fs.closeSync(c.from);
+        fs.closeSync(c.to);
+      }
+    }
+    fs.closeSync(packFd);
+    fs.closeSync(lcFd);
+    fs.renameSync(PACK + TMP, PACK);
+    fs.renameSync(LC + TMP, LC);
+    packFd = fs.openSync(PACK, 'a');
+    lcFd = fs.openSync(LC, 'a');
+    meta.packBytes = at;
+    meta.deadBytes = 0;
+    meta.runs = runs;
+    rebuildBlocks();
+    save(true);
+  })().finally(() => {
+    compacting = null;
+  });
+  return compacting;
+}
+
+// ---------- search ----------
+
+/* Up to 70 characters before the match and 150 after, with … where the message goes on. */
+function around(text, at, len) {
+  const from = Math.max(0, at - 70);
+  const to = Math.min(text.length, at + len + 150);
+  return `${from > 0 ? '…' : ''}${text.slice(from, to)}${to < text.length ? '…' : ''}`;
+}
+
+async function snippet(fd, h) {
+  const from = Math.max(h.textAt, h.at - 300);
+  const to = Math.min(h.lineEnd, h.at + h.len + 600);
+  const buf = Buffer.alloc(to - from);
+  const { bytesRead } = await fd.read(buf, 0, buf.length, from);
+  const m0 = h.at - from;
+  const m1 = Math.min(bytesRead, m0 + h.len);
+  const pre = buf.toString('utf8', 0, m0).replace(/^�+/, '');
+  const post = buf.toString('utf8', m1, bytesRead).replace(/�+$/, '');
+  const a = pre.length > 70 ? pre.slice(-70) : pre;
+  const b = post.length > 150 ? post.slice(0, 150) : post;
+  return `${a.length < pre.length || from > h.textAt ? '…' : ''}${a}${buf.toString('utf8', m0, m1)}${b}${b.length < post.length || to < h.lineEnd ? '…' : ''}`;
+}
+
+function runAt(runs, off) {
+  let lo = 0;
+  let hi = runs.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (runs[mid][0] <= off) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+/* Buffer.indexOf searches words under 7 bytes by scanning for their first byte, which for "error" is the most
+   common letter there is. Look for the rarest byte's tail instead and check the head. */
+const COMMON = ' etaoinsrhldcumfpgwybvkxjqz';
+function finder(needle) {
+  if (needle.length >= 7) return (buf, from) => buf.indexOf(needle, from);
+  let j = 0;
+  for (let x = 1; x < needle.length; x++) {
+    const r = COMMON.indexOf(String.fromCharCode(needle[x]));
+    const best = COMMON.indexOf(String.fromCharCode(needle[j]));
+    if (r < 0 ? best >= 0 : best >= 0 && r > best) j = x;
+  }
+  if (!j) return (buf, from) => buf.indexOf(needle, from);
+  const tail = needle.subarray(j);
+  return (buf, from) => {
+    let p = buf.indexOf(tail, from + j);
+    while (p >= 0) {
+      if (buf.compare(needle, 0, j, p - j, p) === 0) return p - j;
+      p = buf.indexOf(tail, p + 1);
+    }
+    return -1;
+  };
+}
+
+/* Runs every job ({ needle, ranges, onHit }) over its stretches of pack.lc, at most PER_RUN hits in each
+   transcript's stretch. The union of all stretches is read once, 16 MB at a time, and searched in place. */
+async function scanMany(fd, jobs) {
+  const runs = meta.runs;
+  const end = meta.packBytes;
+  jobs = jobs.filter((j) => j.ranges.length);
+  if (!runs.length || !jobs.length) return;
+  const union = [];
+  for (const [s, e] of jobs.flatMap((j) => j.ranges).sort((a, b) => a[0] - b[0])) {
+    const last = union[union.length - 1];
+    if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+    else union.push([s, e]);
+  }
