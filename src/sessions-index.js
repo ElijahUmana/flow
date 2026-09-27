@@ -592,3 +592,201 @@ async function scanMany(fd, jobs) {
     if (last && s <= last[1]) last[1] = Math.max(last[1], e);
     else union.push([s, e]);
   }
+  for (const j of jobs) {
+    j.find = finder(j.needle);
+    j.skipUntil = 0;
+    j.ri = 0;
+  }
+  const buf = Buffer.allocUnsafe(CHUNK);
+  let cpu = 0;
+  const searchIn = (j, base, from, to) => {
+    const view = buf.subarray(from, to);
+    const at0 = base + from;
+    let r = runAt(runs, at0);
+    let run = -1;
+    let counted = 0;
+    let i = j.find(view, Math.max(0, j.skipUntil - at0));
+    while (i >= 0) {
+      const abs = at0 + i;
+      while (r + 1 < runs.length && runs[r + 1][0] <= abs) r++;
+      const runEnd = r + 1 < runs.length ? runs[r + 1][0] : end;
+      if (r !== run) {
+        run = r;
+        counted = 0;
+      }
+      const ls = view.lastIndexOf(10, i) + 1;
+      let next;
+      if (!byNo.has(runs[r][1])) {
+        next = runEnd - at0;
+      } else if (i < ls + 2) {
+        next = ls + 2;
+      } else {
+        const le = view.indexOf(10, i);
+        j.onHit(runs[r][1], String.fromCharCode(view[ls]), abs, at0 + ls + 2, at0 + le, j.needle.length);
+        counted += 1;
+        next = counted >= PER_RUN ? runEnd - at0 : le + 1;
+      }
+      if (next >= view.length) {
+        j.skipUntil = at0 + next;
+        return;
+      }
+      i = j.find(view, next);
+    }
+  };
+  let ui = 0;
+  while (ui < union.length) {
+    const w0 = union[ui][0];
+    let uj = ui;
+    while (uj < union.length && union[uj][1] <= w0 + CHUNK) uj++;
+    const w1 = uj > ui ? union[uj - 1][1] : w0 + CHUNK;
+    const { bytesRead } = await fd.read(buf, 0, w1 - w0, w0);
+    if (!bytesRead) break;
+    stats.read += bytesRead;
+    const c0 = process.hrtime.bigint();
+    let wEnd = w1;
+    if (uj === ui) {
+      let last = buf.lastIndexOf(10, bytesRead - 1);
+      if (last < 0) last = bytesRead - 1;
+      wEnd = w0 + last + 1;
+      union[ui][0] = wEnd;
+    } else {
+      ui = uj;
+    }
+    for (const j of jobs) {
+      while (j.ri < j.ranges.length && j.ranges[j.ri][1] <= w0) j.ri++;
+      for (let x = j.ri; x < j.ranges.length && j.ranges[x][0] < wEnd; x++) {
+        const s = Math.max(j.ranges[x][0], w0);
+        const e = Math.min(j.ranges[x][1], wEnd);
+        if (s < e) searchIn(j, w0, s - w0, e - w0);
+      }
+    }
+    cpu += Number(process.hrtime.bigint() - c0) / 1e6;
+    await tick();
+  }
+  stats.cpu += cpu;
+}
+
+const stats = { read: 0, cpu: 0 };
+
+/* The pack's stretches that belong to these sessions, merged where they touch. */
+function rangesFor(ids) {
+  const runs = meta.runs;
+  const out = [];
+  for (let i = 0; i < runs.length; i++) {
+    const f = byNo.get(runs[i][1]);
+    if (!f || !ids.has(f.id)) continue;
+    const s = runs[i][0];
+    const e = i + 1 < runs.length ? runs[i + 1][0] : meta.packBytes;
+    if (out.length && out[out.length - 1][1] === s) out[out.length - 1][1] = e;
+    else out.push([s, e]);
+  }
+  return out;
+}
+
+/* The blocks that hold every three-byte sequence of the needle (all blocks for a needle under three bytes). */
+function blocksWith(needle) {
+  const n = meta.blocks.length;
+  const hs = [];
+  for (let i = 0; i + 2 < needle.length; i++) {
+    const h = hash3(needle[i], needle[i + 1], needle[i + 2]);
+    if (!hs.includes(h)) hs.push(h);
+  }
+  const out = [];
+  for (let b = 0; b < n; b++) {
+    const base = b * TRI;
+    let all = true;
+    for (const h of hs) {
+      if (!(tri[base + (h >>> 3)] & (1 << (h & 7)))) {
+        all = false;
+        break;
+      }
+    }
+    if (all) out.push(b);
+  }
+  return out;
+}
+
+/* The parts of the ranges that lie in the given blocks. */
+function within(ranges, blocks) {
+  const starts = meta.blocks;
+  const out = [];
+  let ri = 0;
+  for (const b of blocks) {
+    const bs = starts[b];
+    const be = b + 1 < starts.length ? starts[b + 1] : meta.packBytes;
+    while (ri < ranges.length && ranges[ri][1] <= bs) ri++;
+    for (let rj = ri; rj < ranges.length && ranges[rj][0] < be; rj++) {
+      const s = Math.max(bs, ranges[rj][0]);
+      const e = Math.min(be, ranges[rj][1]);
+      if (s >= e) continue;
+      if (out.length && out[out.length - 1][1] === s) out[out.length - 1][1] = e;
+      else out.push([s, e]);
+    }
+  }
+  return out;
+}
+
+async function search(query, limit) {
+  if (compacting) await compacting;
+  searches += 1;
+  try {
+    const q = lower(String(query || '').replace(/\s+/g, ' ').trim());
+    const terms = [...new Set(q.split(' ').filter(Boolean))];
+    if (!terms.length) return { total: 0, results: [] };
+    const P = terms.length;
+    const needles = terms.map((t) => Buffer.from(t));
+    const sessions = new Map();
+    const get = (id) => {
+      let s = sessions.get(id);
+      if (!s) sessions.set(id, (s = { id, counts: new Array(P).fill(0), best: new Array(P).fill(''), first: new Array(P).fill(null), phrase: null, mtimeMs: 0, cwd: '' }));
+      return s;
+    };
+    const lfd = await fs.promises.open(LC, 'r');
+    let candidates;
+    try {
+      const hit = (k) => (no, kind, at, textAt, lineEnd, len) => {
+        const s = get(byNo.get(no).id);
+        if (k === P) {
+          if (!s.phrase) s.phrase = { kind, at, textAt, lineEnd, len };
+          return;
+        }
+        s.counts[k] += 1;
+        if (!s.best[k] || WEIGHT[kind] > WEIGHT[s.best[k]]) s.best[k] = kind;
+        if (!s.first[k] || WEIGHT[kind] > WEIGHT[s.first[k].kind]) s.first[k] = { kind, at, textAt, lineEnd, len };
+      };
+      const withCwd = (k, ids) => {
+        for (const f of byNo.values()) if (lower(f.cwd).includes(terms[k])) ids.add(f.id);
+        return ids;
+      };
+      // The word in the fewest blocks picks the candidate sessions; the other words and the exact phrase are then
+      // looked for together, in one pass over just those sessions' stretches.
+      const blocks = needles.map(blocksWith);
+      const order = needles.map((_, k) => k).sort((a, b) => blocks[a].length - blocks[b].length || needles[b].length - needles[a].length);
+      const first = order[0];
+      const all = [[0, meta.packBytes]];
+      if (P > 1 && blocks[first].length * 2 > meta.blocks.length) {
+        // Even the rarest word is in most blocks: narrowing to its sessions would read nearly everything twice.
+        const phrase = Buffer.from(q);
+        await scanMany(lfd, [...order.map((k) => ({ needle: needles[k], ranges: within(all, blocks[k]), onHit: hit(k) })), { needle: phrase, ranges: within(all, blocksWith(phrase)), onHit: hit(P) }]);
+        candidates = withCwd(first, new Set([...sessions.keys()]));
+        for (const k of order.slice(1)) {
+          const has = withCwd(k, new Set());
+          for (const id of candidates) {
+            const x = sessions.get(id);
+            if (!(x && x.counts[k]) && !has.has(id)) candidates.delete(id);
+          }
+        }
+      } else {
+        await scanMany(lfd, [{ needle: needles[first], ranges: within(all, blocks[first]), onHit: hit(first) }]);
+        candidates = withCwd(first, new Set([...sessions.keys()]));
+      }
+      if (P > 1 && candidates.size && blocks[first].length * 2 <= meta.blocks.length) {
+        const mine = rangesFor(candidates);
+        const phrase = Buffer.from(q);
+        const jobs = order.slice(1).map((k) => ({ needle: needles[k], ranges: within(mine, blocks[k]), onHit: hit(k) }));
+        jobs.push({ needle: phrase, ranges: within(mine, blocksWith(phrase)), onHit: hit(P) });
+        await scanMany(lfd, jobs);
+        for (const k of order.slice(1)) {
+          const has = withCwd(k, new Set());
+          for (const id of candidates) {
+            const x = sessions.get(id);
