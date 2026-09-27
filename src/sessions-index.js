@@ -790,3 +790,198 @@ async function search(query, limit) {
           const has = withCwd(k, new Set());
           for (const id of candidates) {
             const x = sessions.get(id);
+            if (!(x && x.counts[k]) && !has.has(id)) candidates.delete(id);
+          }
+        }
+      }
+    } finally {
+      await lfd.close();
+    }
+    const live = new Set();
+    for (const f of byNo.values()) {
+      live.add(f.id);
+      if (candidates.has(f.id)) {
+        const x = get(f.id);
+        if (f.mtimeMs > x.mtimeMs) x.mtimeMs = f.mtimeMs;
+        if (!x.cwd) x.cwd = f.cwd;
+      }
+    }
+    for (const [id, h] of hist.map) {
+      if (live.has(id)) continue;
+      if (!h.lc) h.lc = lower(h.parts.join('\n'));
+      const cwd = lower(h.cwd);
+      if (!terms.every((t) => h.lc.includes(t) || cwd.includes(t))) continue;
+      const s = get(id);
+      candidates.add(id);
+      s.cwd = s.cwd || h.cwd;
+      s.mtimeMs = h.last;
+      s.hist = h;
+      terms.forEach((t, k) => {
+        const c = h.lc.split(t).length - 1;
+        if (c) {
+          s.counts[k] += c;
+          if (!s.best[k] || WEIGHT.h > WEIGHT[s.best[k]]) s.best[k] = 'h';
+        }
+      });
+      if (P > 1 && h.lc.includes(q)) s.histPhrase = true;
+    }
+    const matched = [];
+    for (const id of candidates) {
+      const s = get(id);
+      const cwd = lower(s.cwd || '');
+      let ok = true;
+      let score = s.phrase || s.histPhrase ? 1000 : 0;
+      for (let k = 0; k < P; k++) {
+        if (s.counts[k]) score += WEIGHT[s.best[k]] * (1 + Math.log2(1 + s.counts[k]));
+        else if (cwd.includes(terms[k])) score += WEIGHT.f;
+        else ok = false;
+      }
+      if (ok) {
+        s.score = score;
+        matched.push(s);
+      }
+    }
+    matched.sort((a, b) => b.score - a.score || b.mtimeMs - a.mtimeMs);
+    const top = matched.slice(0, limit);
+    const fd = await fs.promises.open(PACK, 'r');
+    try {
+      for (const s of top) {
+        const hits = [];
+        for (const h of [s.phrase, ...s.first].filter(Boolean)) {
+          if (hits.length >= 3) break;
+          if (hits.some((x) => x.at <= h.at && h.at < x.at + 400)) continue;
+          hits.push({ at: h.at, kind: KIND[h.kind], text: await snippet(fd, h) });
+        }
+        if (s.hist && hits.length < 3) {
+          const text = s.hist.parts.join(' · ');
+          const lc = lower(text);
+          const t = P > 1 && lc.includes(q) ? q : terms.find((x) => lc.includes(x));
+          if (t) hits.push({ kind: 'you', text: around(text, lc.indexOf(t), t.length) });
+        }
+        if (!hits.length && s.cwd) hits.push({ kind: 'folder', text: s.cwd });
+        s.hits = hits.map(({ kind, text }) => ({ kind, text }));
+      }
+    } finally {
+      await fd.close();
+    }
+    return {
+      total: matched.length,
+      results: top.map((s) => ({ id: s.id, cwd: s.cwd || '', score: Math.round(s.score * 10) / 10, hits: s.hits })),
+    };
+  } finally {
+    searches -= 1;
+  }
+}
+
+/* For a question in plain words: the sessions that share the most telling words with it, any of them, not all.
+   Words in most of the pack say nothing about a session and are left out; the rarest count most. */
+const STOP = new Set('the and for that this with from have was were what when where which who why how you your are not but all any can did does had has her his its our out she they them then than there these those into onto about after before again also just like some such very will would could should been being over under only more most other same where while whom whose here there one two get got make made want need thing things stuff way said say see saw use used using'.split(' '));
+async function searchAny(query, limit) {
+  if (compacting) await compacting;
+  searches += 1;
+  try {
+    const words = [...new Set(lower(String(query || '')).split(/[^a-z0-9_.-]+/).filter((t) => t.length >= 3 && !STOP.has(t)))];
+    const n = meta.blocks.length;
+    /* Only the telling words are looked for in the pack (a word in most of it would read all of it); every word is
+       looked for in what was typed (history.jsonl, small), where a common word still says something. */
+    const scored = words.map((t) => ({ t, needle: Buffer.from(t), blocks: blocksWith(Buffer.from(t)) }))
+      .filter((x) => x.blocks.length && x.blocks.length * 2 <= Math.max(n, 2))
+      .sort((a, b) => a.blocks.length - b.blocks.length).slice(0, 8);
+    const sessions = new Map();
+    const get = (id) => {
+      let s = sessions.get(id);
+      if (!s) sessions.set(id, (s = { id, terms: new Map(), mtimeMs: 0, cwd: '' }));
+      return s;
+    };
+    const idf = scored.map((x) => Math.log2(1 + n / x.blocks.length));
+    const all = [[0, meta.packBytes]];
+    const lfd = await fs.promises.open(LC, 'r');
+    try {
+      await scanMany(lfd, scored.map((x, k) => ({ needle: x.needle, ranges: within(all, x.blocks), onHit: (no, kind) => {
+        const s = get(byNo.get(no).id);
+        const w = WEIGHT[kind] || 1;
+        s.terms.set(k, Math.max(s.terms.get(k) || 0, w));
+      } })));
+    } finally {
+      await lfd.close();
+    }
+    const live = new Set();
+    for (const f of byNo.values()) {
+      live.add(f.id);
+      const s = sessions.get(f.id);
+      if (s) { if (f.mtimeMs > s.mtimeMs) s.mtimeMs = f.mtimeMs; if (!s.cwd) s.cwd = f.cwd; }
+    }
+    const typed = new Map();
+    for (const h of hist.map.values()) if (!h.lc) h.lc = lower(h.parts.join('\n'));
+    /* in what was typed a word also counts by its stem ("training" in a question, "train" typed): its first five letters */
+    const stems = words.map((t) => (t.length > 6 ? t.slice(0, 5) : t));
+    const df = stems.map((t) => { let d = 0; for (const h of hist.map.values()) if (h.lc.includes(t)) d++; return d; });
+    const hn = Math.max(hist.map.size, 1);
+    for (const [id, h] of hist.map) {
+      let sc = 0;
+      stems.forEach((t, k) => { if (df[k] && h.lc.includes(t)) sc += Math.log2(1 + hn / df[k]); });
+      if (!sc) continue;
+      typed.set(id, sc);
+      const s = get(id);
+      s.cwd = s.cwd || h.cwd;
+      if (!live.has(id)) s.mtimeMs = h.last;
+    }
+    const out = [...sessions.values()].map((s) => ({ id: s.id, cwd: s.cwd, mtimeMs: s.mtimeMs, matched: s.terms.size,
+      score: Math.round(([...s.terms].reduce((a, [k, w]) => a + w * idf[k], 0) + WEIGHT.h * (typed.get(s.id) || 0)) * 10) / 10 }));
+    out.sort((a, b) => b.score - a.score || b.mtimeMs - a.mtimeMs);
+    return { total: out.length, terms: scored.map((x) => x.t), results: out.slice(0, limit) };
+  } finally {
+    searches -= 1;
+  }
+}
+
+const indexStatus = () =>({ sessions: status.sessions, indexed: status.sessions - status.pending, building: !!refreshing && (!status.built || status.pending > 0), updating: !!refreshing || !!trailing, bytes: meta.packBytes, cpuMs: Math.round(threadCpu()) });
+
+async function onSearch({ id, query, limit, any }) {
+  try {
+    if (Date.now() - lastRefresh > REFRESH_AFTER || refreshing) {
+      const done = refresh();
+      if (status.built) await Promise.race([done, new Promise((r) => setTimeout(r, REFRESH_BUDGET))]);
+    } else if (!frozen && !trailing && lastStart <= lastAnswer) {
+      trailing = setTimeout(() => {
+        trailing = null;
+        refresh().catch((e) => console.error(`[flow] session index: ${e.stack || e}`));
+      }, Math.max(0, lastRefresh + REFRESH_AFTER - Date.now()));
+    }
+    const t = Date.now();
+    stats.read = 0;
+    stats.cpu = 0;
+    const r = await (any ? searchAny : search)(query, Math.max(1, Math.min(500, Number(limit) || 50)));
+    r.scanMs = Date.now() - t;
+    r.readMB = Math.round(stats.read / 1e5) / 10;
+    r.cpuMs = Math.round(stats.cpu);
+    r.index = indexStatus();
+    lastAnswer = Date.now();
+    parentPort.postMessage({ id, result: r });
+  } catch (e) {
+    parentPort.postMessage({ id, error: e.stack || String(e) });
+  }
+}
+
+load();
+// frozen: search a prepared index as it is (test/sessions-test.js times searches on a Mac-sized copy).
+const frozen = !!workerData.frozen;
+if (frozen) lastRefresh = Infinity;
+parentPort.on('message', (m) => {
+  if (m && m.type === 'search') onSearch(m);
+  else if (m && m.type === 'status') parentPort.postMessage({ id: m.id, result: { total: 0, results: [], index: indexStatus() } });
+  else if (m && m.type === 'refresh') refresh().then(() => parentPort.postMessage({ id: m.id, result: { index: indexStatus() } }), (e) => parentPort.postMessage({ id: m.id, error: e.stack || String(e) }));
+});
+if (!frozen) {
+  refresh().catch((e) => console.error(`[flow] session index: ${e.stack || e}`));
+  /* Kept current in the background, so ⌘K never waits on a backlog of new lines: a look every KEEP_MS, paced like the
+     first build, and nothing read when nothing changed. */
+  setInterval(() => {
+    if (refreshing || Date.now() - lastRefresh < KEEP_MS) return;
+    refresh(true).catch((e) => console.error(`[flow] session index: ${e.stack || e}`));
+  }, KEEP_MS).unref();
+}
+
+
+
+
