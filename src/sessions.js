@@ -204,3 +204,209 @@ async function readTranscript(file, st) {
       scanLines(head.toString('utf8', 0, h.bytesRead), info, true);
       const tail = Buffer.alloc(TAIL);
       const t = await fh.read(tail, 0, TAIL, st.size - TAIL);
+      scanLines(tail.toString('utf8', 0, t.bytesRead), info, false);
+    }
+  } finally {
+    await fh.close();
+  }
+  return info;
+}
+
+async function listTranscripts() {
+  const dir = path.join(root, 'projects');
+  let projects;
+  try {
+    projects = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch (e) {
+    if (e.code === 'ENOENT') return [];
+    throw e;
+  }
+  const found = [];
+  await Promise.all(projects.filter((d) => d.isDirectory()).map(async (d) => {
+    const names = await fs.promises.readdir(path.join(dir, d.name));
+    for (const name of names) {
+      const m = UUID_FILE.exec(name);
+      if (m) found.push({ id: m[1], file: path.join(dir, d.name, name) });
+    }
+  }));
+  return found;
+}
+
+async function pool(items, fn) {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(PARALLEL, items.length) }, async () => {
+    while (next < items.length) {
+      const item = items[next++];
+      await fn(item);
+    }
+  });
+  await Promise.all(workers);
+}
+
+async function build() {
+  await loadListCache();
+  const [history, files] = await Promise.all([readHistory(), listTranscripts()]);
+  const seen = new Set();
+  const byId = new Map();
+  await pool(files, async ({ id, file }) => {
+    seen.add(file);
+    let st;
+    try {
+      st = await fs.promises.stat(file);
+    } catch (e) {
+      if (e.code === 'ENOENT') return; // removed while listing
+      throw e;
+    }
+    let cached = transcripts.get(file);
+    if (!cached || cached.mtimeMs !== st.mtimeMs || cached.size !== st.size) {
+      cached = { mtimeMs: st.mtimeMs, size: st.size, info: await readTranscript(file, st) };
+      transcripts.set(file, cached);
+      listCache.dirty = true;
+    }
+    const prev = byId.get(id);
+    if (!prev || prev.mtimeMs < cached.mtimeMs) byId.set(id, cached);
+  });
+  for (const file of [...transcripts.keys()]) {
+    if (seen.has(file)) continue;
+    transcripts.delete(file);
+    listCache.dirty = true;
+  }
+  if (listCache.dirty) scheduleListCache();
+
+  const out = [];
+  for (const s of history.values()) {
+    const t = byId.get(s.id);
+    const info = t ? t.info : null;
+    out.push({
+      id: s.id,
+      cwd: s.cwd || (info && info.cwd) || '',
+      title: (info && (info.customTitle || info.aiTitle)) || s.title || (info && info.texts[0]) || s.firstPrompt || '',
+      prompts: s.prompts.join('\n'),
+      firstAt: s.firstAt,
+      lastAt: Math.max(s.lastAt, t ? Math.round(t.mtimeMs) : 0),
+      count: s.count,
+      resumable: !!t,
+      agent: (info && info.agent) || '',
+      team: (info && info.team) || '',
+    });
+  }
+  for (const [id, t] of byId) {
+    if (history.has(id)) continue;
+    const info = t.info;
+    const texts = info.texts.length ? info.texts : (info.queued ? [info.queued] : []);
+    const acc = { prompts: [], promptsLen: 0 };
+    for (const x of texts) addPrompt(acc, x);
+    const firstText = texts.find((x) => !x.startsWith('/')) || texts[0] || '';
+    out.push({
+      id,
+      cwd: info.cwd,
+      title: info.customTitle || info.aiTitle || firstText,
+      prompts: acc.prompts.join('\n'),
+      firstAt: info.firstAt || Math.round(t.mtimeMs),
+      lastAt: Math.round(t.mtimeMs),
+      count: texts.length,
+      resumable: true,
+      agent: info.agent,
+      team: info.team,
+    });
+  }
+  out.sort((a, b) => b.lastAt - a.lastAt);
+  return out;
+}
+
+// ---------- the list cache ----------
+
+function listCacheFile() {
+  if (cacheDir) return path.join(cacheDir, 'list.json');
+  if (process.type === 'browser') return path.join(require('electron').app.getPath('userData'), 'session-index', 'list.json');
+  return '';
+}
+
+// Loaded once, before any read of history.jsonl: every build waits for the same load.
+let listCacheLoad = null;
+function loadListCache() {
+  if (!listCacheLoad) listCacheLoad = loadListCacheNow();
+  return listCacheLoad;
+}
+
+async function loadListCacheNow() {
+  const file = listCacheFile();
+  if (!file) return;
+  let c;
+  try {
+    c = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn(`[flow] session list: ignored the cache ${file}: ${e.message}`);
+    return;
+  }
+  if (!c || c.v !== 1 || c.root !== root || !c.hist || !Array.isArray(c.hist.sessions) || !Array.isArray(c.transcripts)) return;
+  if (!hist.file) {
+    Object.assign(hist, { file: c.hist.file, ino: c.hist.ino, mtimeMs: c.hist.mtimeMs, size: c.hist.size, offset: c.hist.offset });
+    hist.map = new Map(c.hist.sessions.map((x) => [x.id, x]));
+  }
+  for (const [f, t] of c.transcripts) if (!transcripts.has(f)) transcripts.set(f, t);
+}
+
+function listCacheDoc() {
+  const h = { file: hist.file, ino: hist.ino, mtimeMs: hist.mtimeMs, size: hist.size, offset: hist.offset, sessions: [...hist.map.values()] };
+  return JSON.stringify({ v: 1, root, hist: h, transcripts: [...transcripts] });
+}
+
+// Written 2 s after a list() that read something new, then at most once a minute, and at quit (stop).
+function scheduleListCache() {
+  if (listCache.timer || !listCacheFile()) return;
+  const wait = listCache.lastWrite ? Math.max(2000, 60000 - (Date.now() - listCache.lastWrite)) : 2000;
+  listCache.timer = setTimeout(() => {
+    listCache.timer = null;
+    writeListCache().catch((e) => console.warn(`[flow] session list: could not save the cache: ${e.message}`));
+  }, wait);
+  listCache.timer.unref();
+}
+
+async function writeListCache() {
+  const file = listCacheFile();
+  if (!file || !listCache.dirty) return;
+  listCache.dirty = false;
+  listCache.lastWrite = Date.now();
+  await fs.promises.mkdir(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${listCache.tag}.${++listCache.n}.tmp`;
+  await fs.promises.writeFile(tmp, listCacheDoc());
+  await fs.promises.rename(tmp, file);
+}
+
+/* At quit: the index worker stops, and a list cache that is due is written now. */
+function stop() {
+  stopIndex();
+  clearTimeout(listCache.timer);
+  listCache.timer = null;
+  const file = listCacheFile();
+  if (!file || !listCache.dirty) return;
+  listCache.dirty = false;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${listCache.tag}.${++listCache.n}.tmp`;
+  fs.writeFileSync(tmp, listCacheDoc());
+  fs.renameSync(tmp, file);
+}
+
+/* search() marks running sessions from a list at most RUNNING_TTL old: listing processes and Flow's tmux panes on
+   every keystroke costs about a second at a high load, and ⌘K asks running() itself right before it resumes anything. */
+const RUNNING_TTL = 3000;
+let runningMemo = null;   // { at, promise }
+function runningRecent() {
+  if (runningMemo && Date.now() - runningMemo.at < RUNNING_TTL) return runningMemo.promise;
+  runningMemo = { at: Date.now(), promise: runningById() };
+  return runningMemo.promise;
+}
+
+/* Sessions by id with their first running process, for search results. A failure to list processes is logged
+   and leaves the results without a running mark rather than without the results. */
+async function runningById() {
+  const on = new Map();
+  let live;
+  try {
+    live = await running();
+  } catch (e) {
+    console.error(`[flow] could not list running claude sessions: ${e.message}`);
+    return on;
+  }
+  for (const r of live) if (!on.has(r.id)) on.set(r.id, r);
