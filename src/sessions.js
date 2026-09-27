@@ -410,3 +410,209 @@ async function runningById() {
     return on;
   }
   for (const r of live) if (!on.has(r.id)) on.set(r.id, r);
+  return on;
+}
+
+function list() {
+  if (!inflight) inflight = build().finally(() => { inflight = null; });
+  if (!indexTimer && !worker && (cacheDir || process.type === 'browser')) indexTimer = setTimeout(warmIndex, INDEX_DELAY).unref();
+  return inflight;
+}
+
+/* Whether session id has a transcript here, so it can be forked (what list() calls resumable), without building the
+   list: the file list() last saw for it, else one stat in each project folder. */
+async function has(id) {
+  const name = `${id}.jsonl`;
+  if (typeof id !== 'string' || !UUID_FILE.test(name)) return false;
+  const isFile = (file) => fs.promises.stat(file).then((st) => st.isFile(), (e) => {
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return false;
+    throw e;
+  });
+  for (const file of transcripts.keys()) {
+    if (path.basename(file) === name && (await isFile(file))) return true;
+  }
+  const dir = path.join(root, 'projects');
+  let projects;
+  try {
+    projects = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch (e) {
+    if (e.code === 'ENOENT') return false;
+    throw e;
+  }
+  const found = await Promise.all(projects.filter((d) => d.isDirectory()).map((d) => isFile(path.join(dir, d.name, name))));
+  return found.includes(true);
+}
+
+// ---------- search (B4) ----------
+
+const INDEX_DELAY = 15000;
+let cacheDir = '';
+let worker = null;
+let workerDir = '';
+// One index worker per folder in a process: a second copy of this module (a test loading it fresh inside the running
+// app) would otherwise start its own worker on the same pack and both would write it.
+const openDirs = process.__flowSessionIndexDirs || (process.__flowSessionIndexDirs = new Set());
+let indexTimer = null;
+let nextReq = 0;
+const waiting = new Map();
+
+function setCacheDir(dir) {
+  if (dir && dir !== cacheDir) {
+    cacheDir = dir;
+    stopIndex();
+  }
+}
+
+function indexDir() {
+  if (cacheDir) return cacheDir;
+  if (process.type === 'browser') return path.join(require('electron').app.getPath('userData'), 'session-index');
+  throw new Error('flow sessions: no cache folder for the search index (call setCacheDir)');
+}
+
+function stopIndex() {
+  clearTimeout(indexTimer);
+  indexTimer = null;
+  if (worker) {
+    const w = worker;
+    worker = null;
+    openDirs.delete(workerDir);
+    workerDir = '';
+    w.terminate();
+  }
+}
+
+function startIndex() {
+  clearTimeout(indexTimer);
+  indexTimer = null;
+  if (worker) return worker;
+  const dir = indexDir();
+  if (openDirs.has(dir)) throw new Error(`the session index in ${dir} is already open in this process (is sessions.js loaded twice?)`);
+  const w = new Worker(path.join(__dirname, 'sessions-index.js'), { workerData: { root, cacheDir: dir } });
+  openDirs.add(dir);
+  workerDir = dir;
+  w.unref();
+  const fail = (err) => {
+    if (worker === w) {
+      worker = null;
+      openDirs.delete(dir);
+      workerDir = '';
+    }
+    for (const { rej } of waiting.values()) rej(err);
+    waiting.clear();
+  };
+  w.on('message', (m) => {
+    const p = m && waiting.get(m.id);
+    if (!p) return;
+    waiting.delete(m.id);
+    if (m.error) p.rej(new Error(`session index: ${m.error}`));
+    else p.res(m.result);
+  });
+  w.on('error', (err) => {
+    console.error(`[flow] session index worker failed: ${err.stack || err}`);
+    fail(err);
+  });
+  w.on('exit', (code) => {
+    if (worker === w && code !== 0) console.error(`[flow] session index worker exited with code ${code}`);
+    fail(new Error(`session index worker exited (code ${code})`));
+  });
+  worker = w;
+  return w;
+}
+
+/* Starts indexing a while after the first list(), so the first ⌘K search finds a ready index. */
+function warmIndex() {
+  try {
+    startIndex();
+  } catch (e) {
+    console.error(`[flow] could not start the session index: ${e.stack || e}`);
+  }
+}
+
+function ask(msg) {
+  const w = startIndex();
+  const id = ++nextReq;
+  return new Promise((res, rej) => {
+    waiting.set(id, { res, rej });
+    w.postMessage({ ...msg, id });
+  });
+}
+
+const shq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+/* Every word of the query must appear in the session: in what you typed, what Claude replied, a compaction
+   summary, the title or the folder. An exact phrase ranks first, then more matches, then the newest. */
+async function search(query, opts) {
+  if (opts && opts.meaning) return meaning(query, opts.items);
+  const t0 = Date.now();
+  const q = String(query == null ? '' : query).trim();
+  const limit = Math.max(1, Math.min(500, Number(opts && opts.limit) || 50));
+  const [found, all, on] = await Promise.all([q ? ask({ type: 'search', query: q, limit }) : ask({ type: 'status' }), build(), runningRecent()]);
+  const byId = new Map(all.map((s) => [s.id, s]));
+  // A session id or the start of one (⌘K finds a session by its id, as a resume command starts with it) comes first.
+  const idq = /^[0-9a-f-]{4,36}$/i.test(q) && (q.match(/[0-9a-f]/gi) || []).length >= 4 ? q.toLowerCase() : '';
+  const top = Math.max(0, ...(found.results || []).map((r) => r.score || 0)) + 1;
+  const byIdq = idq ? all.filter((s) => s.id.startsWith(idq)).slice(0, limit).map((s) => ({ id: s.id, cwd: s.cwd, score: top, hits: [{ kind: 'id', text: s.id }] })) : [];
+  const ids = new Set(byIdq.map((r) => r.id));
+  const merged = [...byIdq, ...(found.results || []).filter((r) => !ids.has(r.id))].slice(0, limit);
+  const results = merged.map((r) => {
+    const s = byId.get(r.id);
+    const cwd = (s && s.cwd) || r.cwd || '';
+    return {
+      id: r.id,
+      cwd,
+      title: (s && s.title) || '',
+      firstAt: s ? s.firstAt : 0,
+      lastAt: s ? s.lastAt : 0,
+      count: s ? s.count : 0,
+      resumable: s ? s.resumable : false,
+      resume: cwd ? `cd ${shq(cwd)} && claude --resume ${r.id}` : `claude --resume ${r.id}`,
+      running: on.get(r.id) || null,
+      score: r.score,
+      hits: r.hits,
+    };
+  });
+  const total = (found.total || 0) + byIdq.filter((r) => !(found.results || []).some((x) => x.id === r.id)).length;
+  return { query: q, ms: Date.now() - t0, scanMs: found.scanMs || 0, total, index: found.index, results };
+}
+
+// ---------- by meaning (owner Nov 7: "natural language search ... just like we built for the CLI code manager") ----------
+
+/* The CLI code manager's search: gpt-5.4 without reasoning ranks by meaning. Here it ranks only candidates: the
+   sessions that share the most telling words with the question (the index's any-word search) and the items ⌘K has
+   in its workspaces, so a search sends a few thousand tokens, never every prompt ever typed. */
+const MEANING_MODEL = 'gpt-5.4';
+const CANDIDATES = 40;
+const DIGEST = 360;
+let keyNote = '';
+function openaiKey() {
+  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
+  const file = path.join(os.homedir(), 'Library', 'Application Support', 'MyNotes', 'config.json');
+  let c;
+  try {
+    c = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return '';
+    throw new Error(`could not read ${file}: ${e.message}`);
+  }
+  return (c && typeof c.openaiApiKey === 'string' && c.openaiApiKey) || '';
+}
+function respond(instructions, input) {
+  const key = openaiKey();
+  if (!key) {
+    if (!keyNote) { keyNote = 'no OpenAI key (MyNotes config.json or OPENAI_API_KEY)'; console.warn(`[flow] search by meaning is off: ${keyNote}`); }
+    return Promise.resolve(null);
+  }
+  const https = require('https');
+  const body = JSON.stringify({ model: MEANING_MODEL, instructions, input, max_output_tokens: 600, reasoning: { effort: 'none' }, store: false, prompt_cache_key: 'flow-search' });
+  return new Promise((resolve, reject) => {
+    const req = https.request({ hostname: 'api.openai.com', path: '/v1/responses', method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` } }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        let o;
+        try {
+          o = JSON.parse(data);
+        } catch (e) {
+          reject(new Error(`OpenAI answered HTTP ${res.statusCode} with no JSON`));
+          return;
+        }
