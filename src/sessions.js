@@ -616,3 +616,206 @@ function respond(instructions, input) {
           reject(new Error(`OpenAI answered HTTP ${res.statusCode} with no JSON`));
           return;
         }
+        if (o.error) { reject(new Error(o.error.message || `OpenAI answered HTTP ${res.statusCode}`)); return; }
+        resolve((o.output || []).filter((x) => x.type === 'message').flatMap((x) => x.content || []).filter((c) => c.type === 'output_text').map((c) => c.text).join('').trim());
+      });
+    });
+    req.setTimeout(30000, () => req.destroy(new Error('OpenAI did not answer within 30 s')));
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+const digest = (s) => { s = String(s || '').replace(/\s+/g, ' ').trim(); return s.length <= DIGEST ? s : `${s.slice(0, 240)} … ${s.slice(-110)}`; };
+
+/* items: what ⌘K has in Flow's workspaces, [{ key, kind, label, text }]. Answers { ranked: [{ key, why }], sessions }
+   with sessions the session results (as search() gives them) for any ranked session. */
+async function meaning(query, items) {
+  const t0 = Date.now();
+  const q = String(query == null ? '' : query).trim();
+  if (!q) return { ranked: [], sessions: [], ms: 0 };
+  const [cand, all, on] = await Promise.all([ask({ type: 'search', query: q, limit: CANDIDATES, any: true }), build(), runningRecent()]);
+  const byId = new Map(all.map((s) => [s.id, s]));
+  const sess = (cand.results || []).map((r) => byId.get(r.id)).filter(Boolean);
+  const own = (Array.isArray(items) ? items : []).slice(0, 300).filter((x) => x && x.key && x.label);
+  if (!sess.length && !own.length) return { ranked: [], sessions: [], ms: Date.now() - t0, terms: cand.terms || [] };
+  const lines = [
+    ...sess.map((s) => `[s:${s.id.slice(0, 8)}] session "${digest(s.title)}" in ${s.cwd || '?'}: ${digest(s.prompts)}`),
+    ...own.map((x, i) => `[i:${i}] ${x.kind} "${digest(x.label)}"${x.text ? `: ${digest(x.text)}` : ''}`),
+  ];
+  const answer = await respond(
+    'You find things in the user\'s workspaces. The input lists candidates, each with a bracketed tag, a kind (a Claude Code ' +
+    'session, an agent, a note, a page, a file, a sub-workspace), its name and some of its text, then a search in plain words. ' +
+    'Return the candidates that match what the user is looking for by meaning, not only by words: at most 8, best first, one per ' +
+    'line, exactly as\n[tag] why it matches, in under 10 words\nCopy tags exactly. If nothing fits, return nothing.',
+    `${lines.join('\n')}\n\nSearch: ${q}`);
+  if (answer == null) return { ranked: [], sessions: [], ms: Date.now() - t0, off: keyNote };
+  const ranked = [];
+  const sessKeys = new Map(sess.map((s) => [`s:${s.id.slice(0, 8)}`, s]));
+  for (const line of answer.split('\n')) {
+    const m = /^\s*\[([si]:[0-9a-f]+)\]\s*[-—:]*\s*(.*)$/i.exec(line);
+    if (!m) continue;
+    const tag = m[1].toLowerCase();
+    const why = m[2].trim();
+    if (tag.startsWith('s:') && sessKeys.has(tag)) ranked.push({ key: `sess|${sessKeys.get(tag).id}`, why });
+    else if (tag.startsWith('i:') && own[Number(tag.slice(2))]) ranked.push({ key: own[Number(tag.slice(2))].key, why });
+  }
+  const sessions = ranked.filter((r) => r.key.startsWith('sess|')).map((r) => {
+    const s = byId.get(r.key.slice(5));
+    return { id: s.id, cwd: s.cwd, title: s.title, firstAt: s.firstAt, lastAt: s.lastAt, count: s.count, resumable: s.resumable,
+      resume: s.cwd ? `cd ${shq(s.cwd)} && claude --resume ${s.id}` : `claude --resume ${s.id}`, running: on.get(s.id) || null, hits: [] };
+  });
+  return { ranked, sessions, ms: Date.now() - t0, candidates: sess.length + own.length };
+}
+
+// ---------- running sessions (B1) ----------
+
+const SESSION_ARG = /(?:^|\s)(?:--session-id|--resume|-r)(?:=|\s+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\s|$)/i;
+let tmux = { bin: '', socket: '' };
+
+function setTmux(info) {
+  tmux = { bin: (info && info.tmux) || '', socket: (info && info.socket) || '' };
+  runningMemo = null;
+}
+
+function run(cmd, args, env) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { maxBuffer: 64 * 1024 * 1024, env: env ? { ...process.env, ...env } : process.env }, (err, stdout, stderr) => {
+      resolve({ code: err ? (typeof err.code === 'number' ? err.code : -1) : 0, error: err, stdout: String(stdout || ''), stderr: String(stderr || '') });
+    });
+  });
+}
+
+async function processes() {
+  const r = await run('ps', ['-axww', '-o', 'pid=,ppid=,lstart=,args='], { LC_ALL: 'C' });
+  if (r.code !== 0) throw new Error(`ps failed: ${r.stderr.trim() || (r.error && r.error.message)}`);
+  const procs = new Map();
+  for (const line of r.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d+:\d+:\d+\s+\d{4})\s+(.*)$/.exec(line);
+    if (m) procs.set(Number(m[1]), { ppid: Number(m[2]), start: Date.parse(m[3]), args: m[4] });
+  }
+  return procs;
+}
+
+/* The claude binary itself (any install), not a shell or wrapper that has claude on its command line. */
+function isClaude(args) {
+  const [a0, a1] = args.split(/\s+/);
+  if (/claude/i.test(path.basename(a0 || ''))) return true;
+  return /^(node|bun)$/.test(path.basename(a0 || '')) && /claude/i.test(a1 || '');
+}
+
+async function registry() {
+  const dir = path.join(root, 'sessions');
+  let names;
+  try {
+    names = await fs.promises.readdir(dir);
+  } catch (e) {
+    if (e.code === 'ENOENT') return [];
+    throw e;
+  }
+  const out = [];
+  await Promise.all(names.filter((n) => /^\d+\.json$/.test(n)).map(async (n) => {
+    const file = path.join(dir, n);
+    for (let attempt = 0; ; attempt++) {
+      let text;
+      try {
+        text = await fs.promises.readFile(file, 'utf8');
+      } catch (e) {
+        if (e.code === 'ENOENT') return; // the session ended while listing
+        throw e;
+      }
+      try {
+        const o = JSON.parse(text);
+        if (o && typeof o.sessionId === 'string' && Number.isInteger(o.pid)) out.push(o);
+        return;
+      } catch (e) {
+        // Claude Code rewrites these files in place, so a read can catch one half written.
+        if (attempt < 4) {
+          await new Promise((r) => setTimeout(r, 25));
+          continue;
+        }
+        // Then this process counts by its --session-id/--resume argument, if it has one.
+        if (!unreadable.has(file)) console.warn(`[flow] ${file} stayed unreadable over 100 ms: ${e.message}`);
+        unreadable.add(file);
+        return;
+      }
+    }
+  }));
+  return out;
+}
+const unreadable = new Set();
+
+/* The process this registry file describes is the one running now, not a later process given the same pid:
+   Linux keeps Claude Code's procStart as field 22 of /proc/<pid>/stat; elsewhere the process cannot have started
+   after the session it holds. */
+function sameProcess(r, p) {
+  if (typeof r.procStart === 'string' && process.platform === 'linux') {
+    let stat;
+    try {
+      stat = fs.readFileSync(`/proc/${r.pid}/stat`, 'utf8');
+    } catch (e) {
+      if (e.code === 'ENOENT' || e.code === 'ESRCH') return false;
+      throw e;
+    }
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] === r.procStart;
+  }
+  if (Number.isFinite(r.startedAt) && Number.isFinite(p.start)) return p.start <= r.startedAt + 2000;
+  return true;
+}
+
+async function flowPanes() {
+  const panes = new Map();
+  if (!tmux.bin || !tmux.socket) return panes;
+  const r = await run(tmux.bin, ['-L', tmux.socket, 'list-panes', '-a', '-F', '#{pane_pid} #{session_name}']);
+  if (r.code !== 0) {
+    if (/no server running|error connecting|No such file/i.test(r.stderr)) return panes;
+    throw new Error(`tmux list-panes: ${r.stderr.trim() || (r.error && r.error.message)}`);
+  }
+  for (const line of r.stdout.split('\n')) {
+    const m = /^(\d+) (.+)$/.exec(line);
+    if (m) panes.set(Number(m[1]), m[2]);
+  }
+  return panes;
+}
+
+/* Claude Code's own registry (~/.claude/sessions/<pid>.json) says which session each live claude process has
+   open now, also after /resume or /clear. Processes it does not list count by their --session-id or --resume
+   argument. tmux is the tmux session around the process; flowWindow is set when that is Flow's own flow_<id>. */
+async function running() {
+  const [procs, reg, panes] = await Promise.all([processes(), registry(), flowPanes()]);
+  const byPid = new Map();
+  for (const r of reg) {
+    const p = procs.get(r.pid);
+    if (!p) continue; // a registry file left behind by a process that is gone
+    // Claude Code wrote the file, and its start time (procStart, else startedAt) proves the pid is still that process,
+    // whatever its binary is called (an install can run as .../claude/current). A file without either must name claude.
+    if (typeof r.procStart !== 'string' && !Number.isFinite(r.startedAt) && !isClaude(p.args)) continue;
+    if (!sameProcess(r, p)) continue; // the pid now belongs to a newer process
+    byPid.set(r.pid, { id: r.sessionId.toLowerCase(), pid: r.pid, status: String(r.status || ''), cwd: String(r.cwd || ''), tmux: String(r.tmux || '').split(':')[0], flowWindow: '' });
+  }
+  for (const [pid, p] of procs) {
+    if (byPid.has(pid) || !isClaude(p.args) || /(^|\s)--fork-session(\s|$)/.test(p.args)) continue;
+    const m = SESSION_ARG.exec(p.args);
+    if (m) byPid.set(pid, { id: m[1].toLowerCase(), pid, status: '', cwd: '', tmux: '', flowWindow: '' });
+  }
+  for (const e of byPid.values()) {
+    for (let q = e.pid, i = 0; q > 1 && i < 64; i++) {
+      const name = panes.get(q);
+      if (name) {
+        e.tmux = name;
+        e.flowWindow = name.startsWith('flow_') ? name.slice(5) : '';
+        break;
+      }
+      const p = procs.get(q);
+      if (!p) break;
+      q = p.ppid;
+    }
+  }
+  return [...byPid.values()];
+}
+
+module.exports = { list, has, search, running, setClaudeDir, setCacheDir, setTmux, stop };
+
+
+
+
