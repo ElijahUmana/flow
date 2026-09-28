@@ -432,3 +432,220 @@
       if (list.length < 2 || new Set(list.map((r) => normUrl(r.url))).size < 2) return;
       const sites = list.map((r) => hostOf(r.url));
       if (new Set(sites).size === sites.length) { list.forEach((r, i) => { r.meta = sites[i]; }); return; }
+      const parts = list.map((r, i) => [sites[i], ...pathParts(r.url)]);
+      const pages = new Set(list.map((r) => normUrl(r.url))).size, most = Math.max(...parts.map((x) => x.length));
+      let k = 1;
+      while (k < most && new Set(parts.map((x) => x.slice(-k).join('/'))).size < pages) k++;
+      list.forEach((r, i) => { const x = parts[i]; r.meta = x.length > k ? `…/${x.slice(-k).join('/')}` : x.join('/'); });
+    });
+  }
+  const pathParts = (u) => String(u).replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, '').replace(/#.*$/, '').replace(/\/+(\?|$)/, '$1').split('/').filter(Boolean);
+  const hl = (s, qv) => {
+    const e = esc(s);
+    if (!qv) return e;
+    const k = e.toLowerCase().indexOf(esc(qv).toLowerCase());
+    return k < 0 ? e : `${e.slice(0, k)}<mark>${e.slice(k, k + esc(qv).length)}</mark>${e.slice(k + esc(qv).length)}`;
+  };
+  function snippet(s, qv) {
+    s = String(s || '').replace(/\s+/g, ' ');
+    const k = s.toLowerCase().indexOf(qv);
+    if (k < 0) return s.slice(0, 80);
+    const a = Math.max(0, k - 26);
+    return (a > 0 ? '…' : '') + s.slice(a, k + qv.length + 40);
+  }
+  const X = [['end', 'end it (stops its session)'], ['detach', 'close it (keeps running on the VM)'], ['close', 'close it'], ['del', 'delete it'], ['unsave', 'remove it from saved']];
+  function rowHTML(r, qv, prefix, note) {
+    let sub = '';
+    const inLabel = qv && r.label.toLowerCase().includes(qv);
+    const inText = qv && !inLabel && !r.path.toLowerCase().includes(qv) && r.text.toLowerCase().includes(qv);
+    if (prefix) sub = `${prefix}${r.path && r.path !== r.label ? ' › ' + r.path : (r.depth ? '' : ' › ' + r.label)}`;
+    if (inText) sub = (sub ? sub + ': ' : '') + snippet(r.text, qv);
+    else if (!prefix && qv && !inLabel && r.path.toLowerCase().includes(qv)) sub = r.path;
+    if (note) sub = (sub ? sub + ': ' : '') + note;
+    const live = !qv;
+    const glyph = r.tog && live ? `<span class="g" data-tog="${esc(r.tog)}" data-down="${r.glyph === '▾' ? '1' : '0'}">${r.glyph}</span>` : `<span class="g">${r.glyph}</span>`;
+    const pop = r.pop ? `<span class="x" data-zpop="${esc(r.pop)}" title="open in its own window">⤢</span>` : '';
+    const closews = live && r.closews ? '<span class="x sbwsx" data-closews="1" title="close workspace">×</span>' : '';
+    const x = X.filter(([k]) => r[k]).map(([k, t]) => `<span class="x" data-${k}="${esc(r[k])}" title="${t}">×</span>`).join('');
+    const attrs = `${r.drag && live ? ` draggable="true" data-drag="${esc(r.drag)}"` : ''}${r.drop && live ? ` data-drop="${esc(r.drop)}"` : ''}`;
+    return `<div${r.sd && live ? ` style="--sd:${r.sd}"` : ''} class="tr d${r.depth}${live && r.grp === 'space' ? ' sph' : ''}${r.dim ? ' dim' : ''}${r.here ? ' here' : ''}" data-act="${esc(r.act)}" data-ws="${r.ws}"${live && !r.space ? ` data-g="${esc(r.grp)}"` : ''}${attrs}>${glyph}<span class="l">${hl(r.label, qv)}${sub ? `<span class="p">${hl(sub, qv)}</span>` : ''}</span>${r.meta ? `<span class="m">${esc(r.meta)}</span>` : ''}${pop}${closews}${x}</div>`;
+  }
+  const GROUPS = ['agents', 'notes', 'browser', 'files'];
+  /* The heading of a group that can make a section in its space: its "+" (a click), and its drop while a row that fits
+     is dragged. */
+  const MAKE = { notes: ['newsec|note', 'note|+'], browser: ['newsec|page', 'page|+'] };
+  function treeHTML(ws) {
+    const rows = rowsFor(ws, false);
+    const i = A.WS.indexOf(ws);
+    const heads = rows.filter((r) => r.grp === 'space');
+    let html = '';
+    /* a sub-workspace in a window of its own has no headings */
+    (heads.length ? heads : [{ space: '' }]).forEach((h) => {
+      if (h.grp) html += rowHTML(h, '', '');
+      GROUPS.forEach((g) => {
+        const gr = rows.filter((r) => r.grp === g && r.space === h.space);
+        if (!gr.length) return;
+        const key = h.space ? `${ws.id}:g:${h.space}:${g}` : `${ws.id}:g:${g}`;
+        const shut = A.ui.closed.includes(key);
+        const mk = MAKE[g] && NOTES() ? MAKE[g] : null;
+        const make = mk ? `<span class="gadd" data-make="${mk[0]}${h.space ? `|${esc(h.space)}` : ''}" title="new section"></span>` : '';
+        html += `<div${h.sd ? ` style="--sd:${h.sd}"` : ''} class="grp${shut ? ' closed' : ''}" data-grp="${esc(key)}" data-ws="${i}"${h.space ? ` data-sp="${esc(h.space)}"` : ''}${mk ? ` data-drop="${mk[1]}"` : ''}>${esc(g)}${make}</div>`;
+        if (!shut) html += gr.map((r) => rowHTML(r, '', '')).join('');
+      });
+    });
+    /* while a row is dragged: a drop here makes a new sub-workspace with it inside */
+    if (heads.length && !SOLO && A.addZone) html += `<div class="sadd" data-drop="zone|+" data-ws="${i}"></div>`;
+    return html;
+  }
+
+  /* ---------- ⌘K: older sessions from flow.sessions.search, each with where it runs now; a conversation that is
+     running is never opened a second time (B1) ---------- */
+  let found = { q: '', results: null, total: 0, error: '' }, findSeq = 0, findTimer = 0, sessAll = false;
+  /* The search reads what was said, and a query that starts a session id finds that session (sessions.js). */
+  function findSessions(qv) {
+    clearTimeout(findTimer);
+    const seq = ++findSeq;
+    findMeaning(qv);
+    if (!qv) { found = { q: '', results: null, total: 0, error: '' }; return; }
+    findTimer = setTimeout(() => flow.sessions.search(qv, { limit: sessAll ? 500 : 100 }).then((r) => {
+      if (seq !== findSeq) return;
+      found = { q: qv, results: (r && r.results) || [], total: (r && r.total) || 0, index: r && r.index, error: '' };
+      render();
+      /* while the index is still being made, or may miss the last seconds of transcripts, ask again until it is done */
+      if (r && r.index && (r.index.building || r.index.updating)) findTimer = setTimeout(() => { if (seq === findSeq && q.value.trim().toLowerCase() === qv) findSessions(qv); }, 2000);
+    }, (err) => {
+      if (seq !== findSeq) return;
+      console.error('could not search the sessions', err);
+      found = { q: qv, results: [], total: 0, error: (err && err.message) || String(err) };
+      render();
+    }), 180);
+  }
+  const foundById = (id) => (found.results || []).find((s) => s.id === id) || meant.sessions.find((s) => s.id === id) || null;
+  const runsAt = (r) => (r.tmux ? `tmux session ${r.tmux}` : r.cwd ? tilde(r.cwd) : `process ${r.pid}`);
+  /* The Flow window a running session is in: { ws, w } when open, { ws, closed } when closed; null when none. */
+  function flowWinOf(r) {
+    if (!r || !r.flowWindow) return null;
+    for (const ws of A.WS) {
+      const w = findWin(ws, r.flowWindow);
+      if (w) return { ws, w };
+      const c = ws.closed.find((x) => x.id === r.flowWindow);
+      if (c) return { ws, closed: c };
+    }
+    return null;
+  }
+  /* A claude in a pane of Flow's own tmux server for a window Flow no longer has is one Flow has just ended, still
+     exiting: it is not running for the sidebar, and pty starts the new claude once it has gone. */
+  const runningOf = (r) => (r && r.flowWindow && !flowWinOf(r) ? null : r);
+  function foundRowHTML(s, qv) {
+    const title = s.title || 'untitled session';
+    const hit = (s.hits || []).find((h) => h.kind !== 'title' && h.kind !== 'id');
+    const said = !hit ? tilde(s.cwd) : hit.kind === 'folder' ? tilde(hit.text) : hit.kind === 'why' ? hit.text : `${hit.kind}: ${hit.text}`;
+    const on = runningOf(s.running);
+    const at = flowWinOf(on);
+    const run = !on ? '' : at ? `open in ${at.ws.name}` : `running in ${runsAt(on)}`;
+    const gone = s.resumable === false;
+    const parts = [gone ? 'cannot be resumed' : '', hl(said, qv), s.lastAt ? esc(ago(s.lastAt)) : '', run ? esc(run) : '', s.id.includes(qv) ? hl(s.id, qv) : ''].filter(Boolean);
+    return `<div class="tr srow${gone ? ' dim' : ''}" draggable="${gone || on ? 'false' : 'true'}" data-sess="${esc(s.id)}" title="${esc(`id ${s.id}`)}"><span class="g">›_</span><span class="l">${hl(title, qv)}<span class="p">${parts.join(' · ')}</span></span></div>`;
+  }
+  /* While the index is still being made, the results fill in by themselves (findSessions asks again). */
+  function foundHTML(qv) {
+    const head = '<div class="sec">sessions</div>';
+    if (found.q !== qv || !found.results) return `${head}<div class="empty">searching…</div>`;
+    if (found.error) return `${head}<div class="empty">could not search them: ${esc(found.error)}</div>`;
+    const opened = openSessionIds();
+    const list = found.results.filter((s) => !opened.has(s.id));
+    if (!list.length) return '';
+    const more = !sessAll && found.total > found.results.length ? `<div class="empty more" data-more="1">${found.total - found.results.length} more, show them</div>` : '';
+    return head + list.map((s) => foundRowHTML(s, qv)).join('') + more;
+  }
+  /* ---------- ⌘K: pages that are neither saved in a workspace nor open anywhere, from notes.js's page records; only
+     the owner's × deletes one ---------- */
+  const recordOf = (k) => (NOTES() && NOTES().records ? NOTES().records().find((r) => r.key === k) || null : null);
+  function loosePages(qv) {
+    if (!NOTES() || !NOTES().records) return [];
+    const kept = new Set();
+    A.WS.forEach((ws) => {
+      (ws.saved || []).forEach((s) => kept.add(normUrl(s.url)));
+      openPages(ws).forEach((p) => kept.add(normUrl(p.url)));
+    });
+    return NOTES().records().filter((r) => !kept.has(r.key) && `${r.name || ''} ${r.title || ''} ${r.url}`.toLowerCase().includes(qv)).sort((a, b) => (b.at || 0) - (a.at || 0));
+  }
+  function looseRowHTML(r, qv) {
+    const site = r.url.replace(/^https?:\/\/(www\.)?/, '').split(/[/?#]/)[0];
+    return `<div class="tr dim" data-act="rec|${esc(r.key)}" data-ws="${A.cur}"><span class="g">↗</span><span class="l">${hl(r.name || r.title || site, qv)}<span class="p">${hl(site, qv)}</span></span><span class="x" data-delpage="${esc(r.key)}" title="delete it">×</span></div>`;
+  }
+  function deletePage(k) {
+    const d = NOTES().deletePage(k);
+    render();
+    if (d) toast(`deleted ${d.title}`, 6000, { label: 'undo', run: () => { d.undo(); render(); } });
+  }
+  function searchHTML(qv) {
+    const match = (r) => (r.label + ' ' + r.path + ' ' + r.text).toLowerCase().includes(qv);
+    const here = A.WS[A.cur];
+    /* By kind (owner, Nov 7: "properly separating different kind of search results"): in each, what is in this workspace
+       first, then the same kind in other workspaces with the workspace's name on its second line, nothing more. */
+    const all = [here, ...(SOLO ? [] : A.WS.filter((w) => w !== here))].flatMap((w) => rowsFor(w, true).filter(match).map((r) => ({ r, w })));
+    shown = new Set(all.map(({ r }) => `${r.ws}|${r.act}`));
+    const kindOf = (r) => (r.grp === 'space' ? 'workspaces' : r.grp === 'browser' ? 'pages' : r.grp);
+    const row = ({ r, w }) => rowHTML(r, qv, w === here || r.act === 'zone|' ? '' : w.name);
+    let html = '';
+    for (const k of KINDS) {
+      const list = all.filter(({ r }) => kindOf(r) === k);
+      const loose = k === 'pages' && !SOLO ? loosePages(qv) : [];
+      if (list.length || loose.length) html += `<div class="sec">${k}</div>` + list.map(row).join('') + loose.map((r) => looseRowHTML(r, qv)).join('');
+    }
+    if (!SOLO) html += foundHTML(qv) + meantHTML(qv);
+    return html || (meant.q === qv && meant.pending ? '<div class="empty">searching…</div>' : '<div class="empty">nothing found</div>');
+  }
+  const KINDS = ['agents', 'notes', 'pages', 'files', 'workspaces'];
+
+  /* ---------- ⌘K by meaning: a question in plain words, as in the CLI code manager. sessions.js has gpt-5.4 rank the
+     sessions that share the most telling words with it and the items in Flow's workspaces; what the word search above
+     already lists is not listed again. Only for three or more words, once typing stops. ---------- */
+  let meant = { q: '', pending: false, ranked: [], sessions: [] }, meantSeq = 0, meantTimer = 0, shown = new Set();
+  const plainWords = (qv) => qv.split(/\s+/).filter((t) => t.length >= 3).length >= 3;
+  function meaningItems() {
+    const items = [];
+    A.WS.forEach((w) => rowsFor(w, true).forEach((r) => {
+      if (r.grp === 'space' && r.act === 'zone|') return;
+      items.push({ key: `${r.ws}|${r.act}`, kind: r.grp === 'browser' ? 'page' : r.grp === 'space' ? 'sub-workspace' : r.grp.replace(/s$/, ''), label: r.label, text: `${w.name}${r.path && r.path !== r.label ? ` › ${r.path}` : ''} ${r.url || ''} ${r.text || ''}` });
+    }));
+    return items;
+  }
+  function findMeaning(qv) {
+    clearTimeout(meantTimer);
+    const seq = ++meantSeq;
+    if (!qv || SOLO || !plainWords(qv)) { meant = { q: '', pending: false, ranked: [], sessions: [] }; return; }
+    if (meant.q === qv && !meant.error) return;
+    meant = { q: qv, pending: true, ranked: [], sessions: [] };
+    meantTimer = setTimeout(() => flow.sessions.search(qv, { meaning: true, items: meaningItems() }).then((r) => {
+      if (seq !== meantSeq) return;
+      meant = { q: qv, pending: false, ranked: (r && r.ranked) || [], sessions: (r && r.sessions) || [] };
+      render();
+    }, (err) => {
+      if (seq !== meantSeq) return;
+      console.error('could not search by meaning', err);
+      meant = { q: qv, pending: false, ranked: [], sessions: [], error: (err && err.message) || String(err) };
+      render();
+    }), 650);
+  }
+  function meantHTML(qv) {
+    if (meant.q !== qv) return '';
+    if (meant.error) return `<div class="sec">by meaning</div><div class="empty">could not search by meaning: ${esc(meant.error)}</div>`;
+    const opened = openSessionIds();
+    const listed = new Set([...shown, ...(found.q === qv ? (found.results || []).map((s) => `sess|${s.id}`) : [])]);
+    const rows = meant.ranked.filter((x) => !listed.has(x.key)).map((x) => {
+      if (x.key.startsWith('sess|')) {
+        const s = meant.sessions.find((y) => `sess|${y.id}` === x.key);
+        return s && !opened.has(s.id) ? foundRowHTML({ ...s, hits: [{ kind: 'why', text: x.why }] }, qv) : '';
+      }
+      const [wi, ...act] = x.key.split('|');
+      const w = A.WS[+wi];
+      const r = w && rowsFor(w, true).find((y) => y.act === act.join('|'));
+      return r ? rowHTML(r, '', w === A.WS[A.cur] ? '' : w.name, x.why) : '';
+    }).filter(Boolean);
+    return rows.length ? '<div class="sec">by meaning</div>' + rows.join('') : '';
+  }
+  /* Open a found session from what the search said of it, at once: one running in a Flow window goes to that window; one
+     running anywhere else stays where it is (fork it instead), once main's own list agrees; otherwise it resumes in a new
+     window here. A conversation that started somewhere since the search is pty's to guard (holdersOf): it starts no
