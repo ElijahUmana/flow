@@ -151,3 +151,156 @@
     if (typeof window.flow.term.teammate !== 'function') {
       if (!warnedMate) { warnedMate = true; console.error('flow.term.teammate is missing (preload), so teammates stay as panes of their team'); }
       return;
+    }
+    const lead = leadPane(list);
+    list.forEach((p) => {
+      const key = `${team.id} ${p.paneId}`;
+      if (p.paneId === lead.paneId || busy.has(key) || notMate.get(key) === p.command) return;
+      busy.add(key);
+      const move = window.flow.term.teammate(team.id, p.paneId, remoteOpts(team)).then((mate) => {
+        slow.delete(key);
+        const L = locate(team.id);
+        if (!L || isClosing(L.ws)) return null;
+        if (!mate) { notMate.set(key, p.command); return null; }
+        return breakOut(L.ws, L.w, p, null, null, mate);
+      }).catch((err) => failed(key, err, `could not check pane ${p.paneId} of ${team.id} for a teammate`))
+        .finally(() => busy.delete(key));
+      trackMutation(ws, move);
+    });
+  }
+  /* Moves one pane of a team into a window of its own: a teammate (mate set) goes beside the team in its space, a pane
+     dragged out goes where it was dropped. */
+  async function breakOut(ws, team, pane, cx, cy, mate) {
+    const nid = newId('w');
+    const name = mate ? mate.name : paneName(pane);
+    const p = cx == null ? null : toSpace(ws, cx, cy);
+    const sid = team.zone || null;
+    let res;
+    try {
+      res = await window.flow.term.breakPane(team.id, pane.paneId, nid);
+    } catch (err) {
+      res = { ok: false, error: err && err.message };
+    }
+    if (!res || !res.ok) {
+      const why = (res && res.error) || 'no reason given';
+      if (cx != null) toast(`could not take ${name} out: ${why}`, 5000);
+      else console.error(`could not move teammate ${name} of ${termTitle(team)} to its own window: ${why}`);
+      return null;
+    }
+    /* nav zooms and pans each space, so the drop point was captured in the space's own % before the async pane move. */
+    const at = p ? { w: 30, h: 38, x: p.x - 10, y: p.y - 4 } : mateSpot(ws, team);
+    const w = addWindow(ws, {
+      id: nid, type: 'term', title: name, where: team.host ? team.where : 'this Mac', host: team.host || undefined, note: '',
+      cmd: 'claude', cwd: team.host ? pane.cwd : tilde(pane.cwd) || ws.folder,
+      ...(team.attach || team.pollTitle ? { pollTitle: true } : {}),
+      ...(mate ? { sessionId: mate.sessionId || undefined, mate: { name: mate.name, team: mate.team, color: mate.color || '', lead: team.id, paneId: pane.paneId } } : {}),
+      ...at,
+    }, null, sid);
+    if (p) keepSpaceOrigin(ws, sid);
+    if (w.mate && !w.sessionId) settle(w.id, SETTLE_TRIES);
+    pollPanes(team.id);
+    renderSidebar();
+    return w;
+  }
+  /* Beside the team, then beside the teammate placed last, in the team's space. */
+  function mateSpot(ws, team) {
+    const mates = ws.windows.filter((o) => inSpace(ws, o) && ((o.mate && o.mate.lead === team.id) || o.group === team.id));
+    return besideSpot(ws, mates.length ? mates[mates.length - 1] : team);
+  }
+  /* A teammate writes its transcript once it has handled its first message, so its session id can come a little after
+     its window. Right after the move it is looked up a few times, on screen or not, so the window can resume its own
+     conversation after a restart; later only while on screen. */
+  function settle(id, tries) {
+    setTimeout(() => {
+      const L = locate(id);
+      if (!L || L.w.sessionId || !L.w.mate) return;
+      lookup(L.w).then((found) => { if (!found && tries > 1) settle(id, tries - 1); });
+    }, SETTLE_MS);
+  }
+  function findSession(w) {
+    if (!busy.has(w.id + ' sid')) lookup(w);
+  }
+  function lookup(w) {
+    if (typeof window.flow.term.teammate !== 'function') return Promise.resolve(false);
+    const L = locate(w.id);
+    if (!L || isBlocked(L.ws)) return Promise.resolve(false);
+    const key = w.id + ' sid';
+    busy.add(key);
+    const found = window.flow.term.teammate(w.id, w.mate.paneId, remoteOpts(w)).then((mate) => {
+      slow.delete(key);
+      const now = locate(w.id);
+      if (!now || isClosing(now.ws)) return false;
+      if (!mate || !mate.sessionId) return false;
+      if (!w.sessionId) { w.sessionId = mate.sessionId; save(); }
+      return true;
+    }, (err) => {
+      failed(key, err, `could not find the session of teammate ${termTitle(w)}`);
+      return false;
+    }).finally(() => busy.delete(key));
+    return trackMutation(L.ws, found);
+  }
+
+  /* ---------- hooks app.js calls ---------- */
+  /* A teammate window whose own session had to be started again (after a Mac restart, or reopened after its lead ended)
+     has lost its team link: it resumes its own conversation and says the link ended. */
+  function onOpened(id, res) {
+    const L = locate(id);
+    if (!L || isClosing(L.ws) || !res || !res.ok) return;
+    if (L.w.mate && res.created && !L.w.mate.unlinked) {
+      L.w.mate.unlinked = true;
+      if (!L.w.sessionId) L.w.title = '';
+      renderTitle(L.ws, L.w);
+      scheduleSidebar();
+      save();
+    }
+    if (L.w.type === 'team') pollPanes(id);
+  }
+  /* A lead that ends takes its teammates with it (Claude Code kills their panes): their windows go to the closed list,
+     where each one opens again with its own conversation. */
+  function onExit(id) {
+    const L = locate(id);
+    if (!L || isClosing(L.ws) || !L.w.mate || !L.ws.windows.includes(L.w)) return;
+    const { ws, w } = L;
+    removeWindow(ws, w);
+    w.max = null;
+    ws.closed.push(w);
+    renderSidebar();
+    save();
+  }
+  const teamAt = (ws, x, y, except) => ws.windows.find((o) => o.type === 'team' && o !== except && inSpace(ws, o) && elOf(o) && rectHas(elOf(o).getBoundingClientRect(), x, y));
+  /* A terminal dropped on a team keeps its own window and record and moves beside the team, grouped with it. It does
+     not become a teammate: only the lead's own spawn makes one, and Flow never types into an agent. */
+  function dropOnTeam(ws, w, team) {
+    if (isBlocked(ws)) return;
+    w.group = team.id;
+    w.max = null;
+    Object.assign(w, dropSpot(ws, team, w));
+    apply(w, w);
+    sizeCanvas(ws);
+    focusWin(ws, w);
+    renderSidebar();
+    save();
+  }
+  /* The nearest free place around the team (right, below, left) at the window's own size, then below it at the height
+     left above nav's layout bottom, else after the team's last member in its row. */
+  function dropSpot(ws, team, w) {
+    const g = geo(team), floor = bottom(), gap = 1.2;
+    const others = ws.windows.filter((o) => o !== w && inSpace(ws, o));
+    const free = (x, y, ww, hh) => !others.some((o) => {
+      const q = geo(o);
+      return x < q.x + q.w + gap && q.x < x + ww + gap && y < q.y + q.h + gap && q.y < y + hh + gap;
+    });
+    const W = w.w, H = Math.min(w.h, floor - 6.6);
+    for (const t of [{ x: g.x + g.w + 1.3, y: g.y }, { x: g.x, y: g.y + g.h + 1.3 }, { x: g.x - W - 1.3, y: g.y }]) {
+      if (t.x >= 0 && t.y >= 5.4 && t.y + H <= floor && free(t.x, t.y, W, H)) return { x: t.x, y: t.y, w: W, h: H };
+    }
+    const under = { x: g.x, y: g.y + g.h + 1.3, w: W, h: floor - (g.y + g.h + 1.3) };
+    if (under.h >= 18 && free(under.x, under.y, under.w, under.h)) return under;
+    const row = others.filter((o) => (o.mate && o.mate.lead === team.id) || o.group === team.id).map(geo);
+    let x = Math.max(g.x + g.w, ...row.map((q) => q.x + q.w)) + 1.3;
+    const y = clamp(g.y, 5.4, floor - H);
+    for (let i = 0; i < 400 && !free(x, y, W, H); i++) x += 1.3;
+    return { x, y, w: W, h: H };
+  }
+  /* A pane's handle dragged out of its team window and dropped outside it. */
+  function startPaneDrag(teamId, pane, e) {
