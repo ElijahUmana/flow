@@ -138,3 +138,142 @@ function start() {
   }
   // Flow sees three and four fingers only through the module, so macOS keeps its gestures when there is none
   takeTrackpad();
+  return true;
+}
+
+/* A Flow window takes trackpad touches; its views are taken in again after each load, which can replace them. macOS's
+   own swipe goes to a page that takes the trackpad as 'fingers' { swipe: 'left' | 'right', t }, module or not: nav
+   decides what it moves (a step to the space beside, or nothing after two fingers moved the board; owner, Nov 7). */
+function watch(win) {
+  win.on('swipe', (_event, direction) => {
+    if (wanting.has(win.webContents) && (direction === 'left' || direction === 'right')) win.webContents.send('fingers', { swipe: direction, t: Date.now() });
+  });
+  if (!addon) return;
+  const take = () => {
+    if (win.isDestroyed()) return;
+    try {
+      const id = addon.watch(win.getNativeWindowHandle());
+      if (!watched.has(id)) watched.set(id, { win, n: 0, down: false, sx: 0, sy: 0, ss: 0, ls: 0, spread: 0, axis: null, sent: false, touchAt: 0, most: 0, tapEnd: 0 });
+      ids.set(win, id);
+    } catch (e) {
+      console.error(`[flow] trackpad touches: could not watch a window: ${e.message}`);
+    }
+  };
+  take();
+  win.webContents.on('did-finish-load', take);
+  win.once('closed', () => {
+    const id = ids.get(win);
+    if (id === undefined) return;
+    watched.delete(id);
+    addon.unwatch(id);
+  });
+}
+
+/* A Flow window's page takes the touches from now on. */
+function want(wc) {
+  wanting.add(wc);
+}
+
+/* Whether main's own handling of the legacy 'swipe' gives way on win: its page takes the trackpad, and watch passes the
+   swipe on to it, so nav decides what it moves. */
+function live(win) {
+  return wanting.has(win.webContents);
+}
+
+function stop() {
+  if (addon) addon.stop();
+  giveBack();
+}
+
+/* `defaults` for one setting: verb read, write or delete, with what follows the key. */
+const defaultsArgs = (verb, s, ...rest) => (s.at[0] === '-currentHost' ? ['-currentHost', verb, '-g', s.key, ...rest] : [verb, s.at[0], s.key, ...rest]);
+const putArgs = (s) => (s.value === null ? defaultsArgs('delete', s) : defaultsArgs('write', s, '-int', String(s.value)));
+function defaults(verb, s, ...rest) {
+  return execFileSync(DEFAULTS, defaultsArgs(verb, s, ...rest), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }).trim();
+}
+// macOS takes trackpad settings at once only through activateSettings; without it they wait for the next login.
+function activate() {
+  try {
+    execFileSync(ACTIVATE, ['-u'], { stdio: 'ignore', timeout: 10000 });
+  } catch (e) {
+    console.error(`[flow] trackpad: macOS did not take the gesture settings at once: ${e.message}`);
+  }
+}
+function setAll(list) {
+  for (const s of list) {
+    try {
+      execFileSync(DEFAULTS, putArgs(s), { stdio: 'ignore', timeout: 5000 });
+    } catch (e) {
+      // delete of a key that is not there exits 1, which is the state wanted
+      if (s.value !== null) console.error(`[flow] trackpad: could not set ${s.key}: ${e.message}`);
+    }
+  }
+  activate();
+}
+
+/* Turns macOS's gestures in OFF off for as long as Flow runs (MAC_NOTES 32 b, 54, 60). */
+function takeTrackpad() {
+  if (!ownsTrackpad() || kept) return;
+  let before = null;
+  try {
+    // a run that ended without giving the trackpad back, and whose watchdog did not, left what macOS had: that is
+    // still what goes back
+    before = JSON.parse(fs.readFileSync(keptFile(), 'utf8')).settings;
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error(`[flow] trackpad: could not read what macOS had: ${e.message}`);
+  }
+  if (!Array.isArray(before)) {
+    before = OFF.map((s) => {
+      let value = null;
+      try {
+        const v = Number(defaults('read', s));
+        value = Number.isFinite(v) ? v : null;
+      } catch {
+        value = null;
+      }
+      return { ...s, value };
+    });
+  }
+  try {
+    fs.writeFileSync(keptFile(), JSON.stringify({ pid: process.pid, settings: before }));
+  } catch (e) {
+    console.error(`[flow] trackpad: could not keep what macOS had, so it is left as it is: ${e.message}`);
+    return;
+  }
+  kept = before;
+  watchdog();
+  setAll(OFF.map((s) => ({ ...s, value: 0 })));
+  console.log(`[flow] trackpad: macOS's ${OFF.map((s) => s.key).filter((k, i, a) => a.indexOf(k) === i && !k.includes('.')).join(', ')} off while Flow runs`);
+}
+
+/* A shell outside Flow that waits for this process to end and, if it ended still holding the trackpad (the kept file
+   still names it: no quit put it back, and no later Flow took it over), puts back what macOS had and drops the file. */
+function watchdog() {
+  const file = keptFile();
+  const put = kept.map((s) => `${shell(DEFAULTS)} ${putArgs(s).map(shell).join(' ')} 2>/dev/null`).join('; ');
+  const script = `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done; grep -q '"pid":${process.pid},' ${shell(file)} 2>/dev/null || exit 0; ${put}; ${shell(ACTIVATE)} -u >/dev/null 2>&1; rm -f ${shell(file)}`;
+  try {
+    spawn('/bin/sh', ['-c', script], { detached: true, stdio: 'ignore' }).unref();
+  } catch (e) {
+    console.error(`[flow] trackpad: no watchdog, so a crash leaves macOS's gestures off until the next quit: ${e.message}`);
+  }
+}
+
+/* Puts back what macOS had before takeTrackpad. */
+function giveBack() {
+  if (!kept) return;
+  setAll(kept);
+  kept = null;
+  try {
+    fs.rmSync(keptFile(), { force: true });
+  } catch (e) {
+    console.error(`[flow] trackpad: could not drop the kept settings: ${e.message}`);
+  }
+  console.log('[flow] trackpad: macOS\'s gestures are back as they were');
+}
+
+module.exports = { start, watch, want, live, stop, takeTrackpad, giveBack };
+
+
+
+
