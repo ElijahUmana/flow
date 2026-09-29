@@ -866,3 +866,220 @@
   function zoneFolder(ws, zid) {
     const F = window.FlowFiles;
     if (!ws.host) { F.pickFolder(ws, zid); return; }
+    const label = freshLabel(`zone|${zid}`);
+    if (label) renameInline(label, F.folderOf(ws, zid), (v) => { if (v !== null) F.setFolder(ws, zid, v); render(); }, 'row');
+  }
+  function renameZoneRow(ws, zid) {
+    const label = freshLabel(`zone|${zid}`);
+    if (label) renameZone(ws, zid, label);
+  }
+  /* The owner's name for a page; an empty name gives the page its own title back. */
+  function renamePageRow(ws, act) {
+    const pg = pageOf(ws, act);
+    if (!pg || !NOTES() || !NOTES().renamePage || !NOTES().key(pg.url)) return;
+    const label = freshLabel(act);
+    if (!label) return;
+    const shown = label.textContent;
+    renameInline(label, shown, (v) => {
+      if (v !== null && v !== shown) NOTES().renamePage(pg.url, v, pg.title);
+      render();
+    }, 'row');
+  }
+  function renameNoteRow(ws, id) {
+    const n = noteById(ws, id);
+    if (!n || !NOTES() || !NOTES().renameNote) return;
+    const label = freshLabel(`note|${id}`);
+    if (!label) return;
+    const shown = label.textContent;
+    renameInline(label, shown, (v) => {
+      if (v !== null && v !== shown) NOTES().renameNote(ws, id, v);
+      render();
+    }, 'row');
+  }
+  /* A page or a note dropped on "+ new section" gets a new section with it inside, named in place. */
+  function intoSection(ws, what, target, zone = '') {
+    const [k, id, ti] = what.split('|');
+    if (k === 'note') {
+      if (target === '+') { renameSectionRow(ws, NOTES().newSection(ws, withZone({ holds: 'note', item: id }, zone)).id); return; }
+      NOTES().move(ws, id, target || null);
+      return;
+    }
+    const sec = target === '+' ? NOTES().newSection(ws, withZone({ holds: 'page' }, zone)).id : target;
+    if (k === 'saved') moveSaved(ws, id, sec);
+    else {
+      const p = openPages(ws).find((x) => x.w.id === id && x.i === +(ti || 0));
+      if (p) savePage(ws, p.url, p.title, sec);
+    }
+    if (target === '+') renameSectionRow(ws, sec);
+  }
+  /* ---------- right-click menus ---------- */
+  function zoneItems(ws, what, from) {
+    if (SOLO) return [];
+    return [
+      ...(ws.zones || []).filter((zn) => zn !== from).map((zn) => ({ label: `move to ${zn.name}`, hint: '', run: () => moveTo(ws, what, zn.id) })),
+      ...(from ? [{ label: 'move to the main workspace', hint: '', run: () => moveTo(ws, what, null) }] : []),
+    ];
+  }
+  function sectionItems(ws, what, holds, current, verb, zone = '') {
+    if (!NOTES()) return [];
+    return [
+      ...NOTES().sections(ws, holds).filter((f) => f.id !== current && secSpace(ws, f) === zone).map((f) => ({ label: `${verb} ${f.title}`, hint: '', run: () => intoSection(ws, what, f.id) })),
+      { label: `${verb} a new section`, hint: '', run: () => intoSection(ws, what, '+', zone) },
+    ];
+  }
+  const zoneIdOf = (ws, w) => { const zn = w ? spaceOf(ws, w) : null; return zn ? zn.id : ''; };
+  function rowItems(ws, k, id, rest) {
+    if (k === 'files') return window.FlowFiles.menu(ws, `files|${id}`);
+    if (k === 'zone' && !id) return SOLO || !A.addZone ? [] : [{ label: 'new sub-workspace', hint: '', run: () => perform('newzone|', A.WS.indexOf(ws)) }];
+    if (k === 'zone') return SOLO || !A.removeZone ? [] : [
+      /* one inside it, where the workspace's spaces nest (app.js spaces) */
+      ...(A.spaces && A.addZone ? [{ label: 'new sub-workspace', hint: '', run: () => perform(`newzone|${id}`, A.WS.indexOf(ws)) }] : []),
+      { label: 'rename', hint: '', run: () => renameZoneRow(ws, id) },
+      ...(window.FlowFiles && window.FlowFiles.pickFolder ? [{ label: 'folder', hint: window.FlowFiles.folderOf(ws, id), run: () => zoneFolder(ws, id) }] : []),
+      { label: 'remove', hint: '', run: () => A.removeZone(ws, id) },
+    ];
+    if (k === 'folder' || k === 'sec') {
+      const f = noteById(ws, id);
+      if (!f || !NOTES()) return [];
+      const empty = !ws.notes.some((n) => n.parent === id) && !(ws.saved || []).some((s) => s.section === id);
+      const sz = secSpace(ws, f);
+      return [
+        { label: 'rename', hint: '', run: () => renameSectionRow(ws, id) },
+        ...(NOTES().moveSection ? zoneItems(ws, `${k}|${id}`, sz ? zoneById(ws, sz) : null) : []),
+        ...(empty ? [{ label: 'remove', hint: '', run: () => NOTES().removeSection(ws, id) }] : []),
+      ];
+    }
+    if (k === 'note') {
+      const n = noteById(ws, id);
+      if (!n) return [];
+      const w = ws.windows.find((x) => x.noteId === id);
+      if (n.kind === 'page') return NOTES() ? [{ label: 'delete', hint: '', run: () => deleteNote(ws, id) }] : [];
+      return [
+        ...sectionItems(ws, `note|${id}`, 'note', n.parent, 'move to', n.parent ? secSpace(ws, noteById(ws, n.parent)) : zoneIdOf(ws, w)),
+        ...(n.parent ? [{ label: 'move out of its section', hint: '', run: () => intoSection(ws, `note|${id}`, '') }] : []),
+        ...zoneItems(ws, `note|${id}`, w ? spaceOf(ws, w) : null),
+        w ? { label: 'close', hint: '', run: () => closeWin(ws, w) } : NOTES() ? { label: 'delete', hint: '', run: () => deleteNote(ws, id) } : null,
+      ].filter(Boolean);
+    }
+    if (k === 'saved') {
+      const s = (ws.saved || []).find((x) => x.id === id);
+      if (!s) return [];
+      const at = openOf(s, openPages(ws));
+      return [
+        ...sectionItems(ws, `saved|${id}`, 'page', s.section, 'move to', secSpace(ws, noteById(ws, s.section))),
+        ...zoneItems(ws, `saved|${id}`, at ? at.zone : null),
+        ...(at ? [{ label: 'close', hint: '', run: () => closeTab(ws, at.w, at.i) }] : []),
+        { label: 'remove from saved', hint: '', run: () => removeSaved(ws, id) },
+      ];
+    }
+    if (k === 'tab') {
+      const w = findWin(ws, id);
+      const p = w && openPages(ws).find((x) => x.w === w && x.i === +(rest || 0));
+      if (!p) return [];
+      return [
+        ...(normUrl(p.url) ? sectionItems(ws, `page|${w.id}|${p.i}`, 'page', null, 'save to', zoneIdOf(ws, w)) : []),
+        ...zoneItems(ws, `win|${w.id}`, spaceOf(ws, w)),
+        { label: 'close', hint: '', run: () => closeTab(ws, w, p.i) },
+      ];
+    }
+    const w = k === 'win' ? findWin(ws, id) : k === 'reopen' ? ws.closed.find((x) => x.id === id) : null;
+    if (!w || !isTerm(w)) return [];
+    return [...agentItems(ws, w), ...zoneItems(ws, k === 'win' ? `win|${w.id}` : `closed|${w.id}`, spaceOf(ws, w))];
+  }
+  /* A window's menu is its row's: one menu per tool, on the window and in the sidebar. */
+  function windowItems(ws, w) {
+    if (isTerm(w)) return rowItems(ws, 'win', w.id);
+    if (w.type === 'note') return rowItems(ws, 'note', w.noteId);
+    if (w.type === 'page') {
+      /* the row the sidebar shows for its shown tab: the saved row when that page is saved */
+      const i = w.tab || 0;
+      const p = openPages(ws).find((x) => x.w === w && x.i === i);
+      const s = p && findSaved(ws, p.url);
+      return s ? rowItems(ws, 'saved', s.id) : rowItems(ws, 'tab', w.id, String(i));
+    }
+    return [];
+  }
+  /* A sidebar row's menu; an older session from ⌘K has its own. */
+  function rowCtx(e) {
+    const srow = e.target.closest('.srow');
+    if (srow) {
+      const s = foundById(srow.dataset.sess);
+      if (!s) return;
+      const on = runningOf(s.running);
+      const at = flowWinOf(on);
+      showMenu(e, s.resumable === false ? [{ label: 'copy session id', hint: `${s.id.slice(0, 8)}…`, run: () => copyText(s.id) }] : [
+        at ? { label: 'go to it', hint: at.ws.name, run: () => openFound(s.id) } : on ? null : { label: 'open here', hint: A.WS[A.cur] ? A.WS[A.cur].name : '', run: () => openFound(s.id) },
+        { label: 'fork here', hint: '', run: () => forkSession({ sessionId: s.id, cwd: tilde(s.cwd), title: s.title || 'that session' }) },
+        { label: 'copy resume command', hint: `${s.id.slice(0, 8)}…`, run: () => copyResume({ cwd: tilde(s.cwd), sessionId: s.id }) },
+      ].filter(Boolean));
+      return;
+    }
+    const row = e.target.closest('.tr[data-act]');
+    if (!row) return;
+    const [k, id, rest] = row.dataset.act.split('|');
+    const ws = A.WS[+row.dataset.ws];
+    if (ws) showMenu(e, rowItems(ws, k, id, rest));
+  }
+
+  /* ---------- the sidebar's own input: clicks, ×, renames, drags, the hover card ---------- */
+  function wire() {
+    touched.observe(sblist, { subtree: true, childList: true, attributes: true, characterData: true });
+    q.addEventListener('input', () => { sessAll = false; picked = ''; findSessions(q.value.trim().toLowerCase()); render(); });
+    q.addEventListener('keydown', (e) => {
+      if (e.isComposing || e.metaKey || e.ctrlKey || e.altKey || !q.value.trim() || !['ArrowDown', 'ArrowUp', 'Enter'].includes(e.key)) return;
+      e.preventDefault();
+      if (e.key === 'Enter') { pickResult(markPick()); return; }
+      const list = [...sblist.querySelectorAll('.tr[data-act], .srow')];
+      const at = list.findIndex((x) => x.classList.contains('sel'));
+      const to = list[Math.min(list.length - 1, Math.max(0, at + (e.key === 'ArrowDown' ? 1 : -1)))];
+      if (!to) return;
+      picked = rowKey(to);
+      markPick();
+      touched.takeRecords();
+      to.scrollIntoView({ block: 'nearest' });
+    });
+    /* The click comes in the same task as the release, so nothing can redraw in between; a redraw held back during
+       the press happens after the click. */
+    const release = () => {
+      if (!pressed) return;
+      pressed = false;
+      if (held) { held = false; setTimeout(render, 0); }
+    };
+    sblist.addEventListener('pointerdown', () => { pressed = true; }, true);
+    document.addEventListener('pointerup', release, true);
+    document.addEventListener('pointercancel', release, true);
+    /* a release outside the window never arrives: the next move with no button down, or leaving the window, ends it */
+    document.addEventListener('pointermove', (e) => { if (pressed && !e.buttons) release(); }, true);
+    window.addEventListener('blur', release);
+    /* The row the first click of a double-click was on: when the list changed under the pointer before the second click
+       (a ⌘K result opened, and the search cleared), the second click lands on another row and does nothing. */
+    let firstAt = '';
+    const rowAt = (e) => { const tr = e.target.closest('.tr'); return !tr ? '' : tr.dataset.act || (tr.dataset.sess ? `sess|${tr.dataset.sess}` : ''); };
+    /* A double-click's second press never moves the keys: they stay where its first click put them, until the rename
+       the double-click starts takes them (a word can still be picked inside a name being typed). */
+    sblist.addEventListener('mousedown', (e) => { if (e.detail > 1 && !(A.renaming && A.renaming.el.contains(e.target))) e.preventDefault(); });
+    sblist.addEventListener('click', (e) => {
+      if (A.renaming && A.renaming.el.contains(e.target)) return;
+      const tr = e.target.closest('.tr');
+      const at = rowAt(e);
+      /* and its second click never acts again: the first one went there, and the double-click renames */
+      if (e.detail > 1) return;
+      firstAt = at;
+      const ws = tr && A.WS[+tr.dataset.ws];
+      const x = e.target.closest('[data-closews], [data-end], [data-detach], [data-close], [data-del], [data-unsave], [data-zpop], [data-delpage]');
+      if (x && ws) {
+        e.stopPropagation();
+        const d = x.dataset;
+        if (d.closews && A.closeWorkspace) A.closeWorkspace(ws);
+        else if (d.end) endAgent(ws, d.end);
+        else if (d.detach) { const w = findWin(ws, d.detach); if (w) closeWin(ws, w); }
+        else if (d.close) {
+          const [wid, ti] = d.close.split('|');
+          const w = findWin(ws, wid);
+          if (w) closeTab(ws, w, +ti);
+        } else if (d.del) deleteNote(ws, d.del);
+        else if (d.delpage) deletePage(d.delpage);
+        else if (d.unsave) removeSaved(ws, d.unsave);
+        else popOut(ws.id, d.zpop);
+        return;
+      }
