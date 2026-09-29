@@ -304,3 +304,156 @@
   }
   /* A pane's handle dragged out of its team window and dropped outside it. */
   function startPaneDrag(teamId, pane, e) {
+    const L = locate(teamId);
+    if (!L || !pane || document.body.classList.contains('busy') || isBlocked(L.ws)) return;
+    const { ws, w: team } = L;
+    const list = PANES.get(teamId) || [];
+    const lead = list.length ? leadPane(list) : null;
+    if ((lead && lead.paneId === pane.paneId) || (!lead && pane.index === 0)) { toast('the lead stays with its team.'); return; }
+    if (e && e.preventDefault) e.preventDefault();
+    bringFront(ws, team);
+    const ghost = document.createElement('div');
+    ghost.className = 'ghost';
+    ghost.textContent = `${paneName(pane)}: drop it outside the team`;
+    document.body.appendChild(ghost);
+    const target = e.target, pointerId = e.pointerId;
+    let lx = e.clientX, ly = e.clientY, finished = false;
+    const place = (ev) => {
+      if (ev.pointerId !== pointerId) return;
+      lx = ev.clientX;
+      ly = ev.clientY;
+      ghost.style.left = ev.clientX + 12 + 'px';
+      ghost.style.top = ev.clientY + 10 + 'px';
+      edgePan(ws, ev.clientX, ev.clientY, () => { ghost.style.left = lx + 12 + 'px'; ghost.style.top = ly + 10 + 'px'; });
+    };
+    place(e);
+    setDragging(true);
+    if (e.isTrusted && target && target.setPointerCapture) target.setPointerCapture(pointerId);
+    const finish = (commit, ev) => {
+      if (finished) return;
+      finished = true;
+      edgePan(ws, null);
+      window.removeEventListener('pointermove', place, true);
+      window.removeEventListener('pointerup', up, true);
+      window.removeEventListener('pointercancel', cancel, true);
+      window.removeEventListener('blur', blur);
+      if (target && target.removeEventListener) target.removeEventListener('lostpointercapture', cancel);
+      if (target && target.hasPointerCapture && target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
+      ghost.remove();
+      setDragging(false);
+      if (!commit || !ev || isBlocked(ws)) return;
+      const tel = elOf(team);
+      if (tel && !rectHas(tel.getBoundingClientRect(), ev.clientX, ev.clientY)) trackMutation(ws, breakOut(ws, team, pane, ev.clientX, ev.clientY, null));
+    };
+    const up = (ev) => { if (ev.pointerId === pointerId) finish(true, ev); };
+    const cancel = (ev) => { if (ev.pointerId === pointerId) finish(false); };
+    const blur = () => finish(false);
+    window.addEventListener('pointermove', place, true);
+    window.addEventListener('pointerup', up, true);
+    window.addEventListener('pointercancel', cancel, true);
+    window.addEventListener('blur', blur);
+    if (target && target.addEventListener) target.addEventListener('lostpointercapture', cancel);
+  }
+
+  const memberRecordId = (used, teamId, pane) => {
+    const suffix = String(pane.sessionId || pane.paneId).replace(/[^A-Za-z0-9_-]/g, '').slice(-18) || 'member';
+    let id = `${teamId}-member-${suffix}`, n = 2;
+    while (used.has(id)) id = `${teamId}-member-${suffix}-${n++}`;
+    used.add(id);
+    return id;
+  };
+
+  /* A team still holding teammate panes is one atomic shutdown: capture every pane conversation before the question, so
+     undo can resume the lead in the team window and each teammate as its own unlinked closed record. Any local team with
+     an incomplete snapshot blocks closure; an attached VM team becomes a disabled VM choice. Re-read before kill. */
+  async function closeSnapshot(ws) {
+    const choices = [], restore = [], blocked = [];
+    const terms = [...ws.windows, ...ws.closed].filter((w) => w.type === 'term' || w.type === 'team');
+    const usedIds = new Set([...ws.windows, ...ws.closed].map((w) => w.id));
+    for (const w of terms) {
+      const remote = !!w.host;
+      const choice = remote ? { id: w.id, type: w.type, title: termTitle(w), host: w.host, attach: w.attach || '', cmd: w.cmd || '',
+        cwd: w.cwd || '', sessionId: w.sessionId || '', mate: w.mate ? JSON.parse(JSON.stringify(w.mate)) : null, canShutdown: true } : null;
+      if (w.type === 'team' || (remote && w.attach)) {
+        let inventory = null, inventoryError = null;
+        try {
+          inventory = await window.flow.term.teamSessions(w.id, remoteOpts(w));
+        } catch (err) {
+          inventoryError = err;
+        }
+        const legacy = Array.isArray(inventory);
+        const panes = legacy ? inventory : inventory && Array.isArray(inventory.panes) ? inventory.panes : [];
+        const exists = legacy ? panes.length > 0 : !!(inventory && inventory.exists === true);
+        if (!inventoryError && (!inventory || (!legacy && inventory.exists !== true && inventory.exists !== false))) inventoryError = new Error('invalid team inventory');
+        if (!inventoryError && exists && !panes.length) inventoryError = new Error('the running team returned an empty pane inventory');
+        if (inventoryError) {
+          const reason = `could not verify every pane: ${(inventoryError && inventoryError.message) || inventoryError}`;
+          if (choice) { choice.canShutdown = false; choice.reason = reason; choice.panes = []; }
+          else blocked.push({ id: w.id, title: termTitle(w), reason });
+        } else if (exists) {
+          const lead = w.type === 'team' ? (panes.length ? leadPane(panes) : null)
+            : panes.find((p) => p.windowActive && p.active) || panes.find((p) => p.active) || (panes.length ? leadPane(panes) : null);
+          const complete = !!lead && panes.every((p) => p && p.paneId && p.sessionId && p.cwd)
+            && new Set(panes.map((p) => p.paneId)).size === panes.length
+            && new Set(panes.map((p) => p.sessionId)).size === panes.length;
+          if (choice) {
+            choice.canShutdown = complete;
+            choice.panes = panes;
+            if (!complete) choice.reason = 'not every pane has a distinct conversation to resume';
+          } else if (!complete) blocked.push({ id: w.id, title: termTitle(w), reason: 'not every pane has a distinct conversation to resume' });
+          if (complete) {
+            restore.push({
+              teamId: w.id,
+              signature: panes.map((p) => ({ paneId: p.paneId, panePid: p.panePid, sessionTmuxId: p.sessionTmuxId,
+                windowId: p.windowId, windowIndex: p.windowIndex, windowActive: !!p.windowActive, windowLayout: p.windowLayout || '',
+                windowName: p.windowName || '', windowWidth: p.windowWidth, windowHeight: p.windowHeight, index: p.index, active: !!p.active, left: p.left, top: p.top, width: p.width, height: p.height, cwd: p.cwd,
+                command: p.command || '', title: p.title || '', sessionId: p.sessionId, mate: p.mate ? JSON.parse(JSON.stringify(p.mate)) : null })),
+              leadSessionId: lead.sessionId,
+              members: panes.filter((p) => p !== lead).map((p) => ({
+                id: memberRecordId(usedIds, w.id, p), paneId: p.paneId, zone: w.zone || null,
+                title: (p.mate && p.mate.name) || paneName(p), cwd: p.cwd, sessionId: p.sessionId,
+                mate: p.mate ? { name: p.mate.name, team: p.mate.team, color: p.mate.color || '', lead: w.id, paneId: p.paneId, unlinked: true } : null,
+              })),
+            });
+          }
+        }
+      }
+      if (choice) choices.push(choice);
+    }
+    return { choices, restore, blocked };
+  }
+
+  async function beginClose(ws) {
+    if (!ws || locking.has(ws.id) || closing.has(ws.id)) return false;
+    locking.add(ws.id);
+    try {
+      for (;;) {
+        const pending = [...(mutations.get(ws.id) || [])];
+        if (!pending.length) break;
+        await Promise.allSettled(pending);
+      }
+      closing.add(ws.id);
+      return true;
+    } finally {
+      locking.delete(ws.id);
+    }
+  }
+  function endClose(ws) {
+    if (ws) { locking.delete(ws.id); closing.delete(ws.id); }
+  }
+
+  function mount(app) {
+    A = app;
+    ({ locate, save, toast, addWindow, removeWindow, apply, sizeCanvas, focusWin, bringFront, besideSpot, toSpace, bottom } = app);
+    ({ geo, elOf, termTitle, splitTitle, renderTitle, onTermTitle, scheduleSidebar, renderSidebar, remoteOpts, newId } = app);
+    ({ tilde, setDragging, edgePan, keepSpaceOrigin, rectHas, inSpace, WIN } = app);
+    ({ viewport } = app.els);
+    setInterval(poll, POLL_MS);
+  }
+
+  window.FlowTeams = { mount, onOpened, onExit, teamAt, dropOnTeam, startPaneDrag, members, paneName, label, pollPanes, runsOn, runsOnMenu, closeSnapshot, beginClose, endClose };
+})();
+
+
+
+
