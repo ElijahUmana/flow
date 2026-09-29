@@ -649,3 +649,220 @@
   /* Open a found session from what the search said of it, at once: one running in a Flow window goes to that window; one
      running anywhere else stays where it is (fork it instead), once main's own list agrees; otherwise it resumes in a new
      window here. A conversation that started somewhere since the search is pty's to guard (holdersOf): it starts no
+     second claude, and the window says where it runs and opens it once it is free (term.js waits and tries again). */
+  /* The Flow window, open or closed, that holds a conversation, as flowWinOf gives it; null when none does. */
+  function flowWinWith(id) {
+    for (const ws of A.WS) {
+      const w = ws.windows.find((x) => x.sessionId === id);
+      if (w) return { ws, w };
+      const c = ws.closed.find((x) => x.sessionId === id);
+      if (c) return { ws, closed: c };
+    }
+    return null;
+  }
+  /* A second click on the same session while the first is still asking whether it runs does nothing more. */
+  const opening = new Set();
+  async function openFound(id) {
+    if (opening.has(id)) return null;
+    opening.add(id);
+    try {
+      return await openFoundOnce(id);
+    } finally {
+      opening.delete(id);
+    }
+  }
+  async function openFoundOnce(id) {
+    const s = foundById(id);
+    if (!s) return null;
+    let on = runningOf(s.running);
+    /* a Flow window that already holds it, even one whose claude has not started yet, is where it opens */
+    let at = flowWinOf(on) || flowWinWith(id);
+    /* the search's mark can be a claude that has exited since, or one whose pane Flow has just closed that is still
+       exiting: main's own list leaves those out, so it is asked before the session is said to run elsewhere */
+    if (!at && on) {
+      on = runningOf(await runningNow(s));
+      at = flowWinOf(on) || flowWinWith(id);
+    }
+    if (at) {
+      q.value = '';
+      findSessions('');
+      perform(at.w ? `win|${at.w.id}` : `reopen|${at.closed.id}`, A.WS.indexOf(at.ws));
+      return at.w || null;
+    }
+    if (on) { toast(`${s.title || 'that session'} is already running in ${runsAt(on)}, so it is not opened again`, 6000); return null; }
+    if (s.resumable === false) { toast(`${s.title || 'that session'} cannot be resumed: its transcript is gone`, 5000); return null; }
+    const ws = A.WS[A.cur];
+    const note = NOTES() ? NOTES().take(s.id) : '';
+    const w = addWindow(ws, { id: newId('w'), type: 'term', title: '', label: s.title || '', where: 'this Mac', note, noted: !!note, cmd: 'claude', cwd: tilde(s.cwd) || ws.folder, sessionId: s.id, resume: true, ...freeSpot(ws, 34, 42) });
+    q.value = '';
+    findSessions('');
+    sessAll = false;
+    render();
+    focusWin(ws, w);
+    return w;
+  }
+  async function runningNow(s) {
+    try {
+      return (await flow.sessions.running()).find((x) => x.id === s.id) || null;
+    } catch (err) {
+      console.error(`could not check whether ${s.id} is still running`, err);
+      return s.running;
+    }
+  }
+  /* A closed agent comes back at once, or goes to the Flow window that holds its conversation now. */
+  function reopenAgent(ws, wid) {
+    const w = ws.closed.find((x) => x.id === wid);
+    if (!w) return;
+    const sid = w.cmd === 'claude' && w.sessionId ? w.sessionId.toLowerCase() : '';
+    const held = sid ? A.WS.map((x) => ({ ws: x, w: x.windows.find((y) => y.id !== wid && String(y.sessionId || '').toLowerCase() === sid) })).find((x) => x.w) : null;
+    if (held) { perform(`win|${held.w.id}`, A.WS.indexOf(held.ws)); return; }
+    reopen(ws, wid);
+  }
+
+  /* ---------- drawing ---------- */
+  let dragItem = null, pressed = false, held = false, windowDrag = () => false, windowDrop = () => false, windowCancel = () => {}, nativeDragEnd = () => {};
+  /* The list as last drawn, until anything else changes it (a rename in place, a highlight): the same list again is
+     left as it is, since replacing it ends the typing run (what one ⌘Z undoes) of whatever editor has the keys. The
+     list's own attributes (the pointer's group, a drag's classes) do not count. */
+  let drawn = null;
+  const byOthers = (recs) => recs.some((r) => r.target !== sblist || r.type !== 'attributes');
+  const touched = new MutationObserver((recs) => { if (byOthers(recs)) drawn = null; });
+  /* Never while something in the sidebar is being renamed in place: a redraw would take the name being typed away.
+     Not between a press and its release either: the row under the pointer would be replaced and the click lost; it
+     draws right after the click instead. */
+  function render() {
+    if (pressed) { held = true; return; }
+    if (!A || !A.WS[A.cur] || A.dragging || dragItem || (A.renaming && sblist.contains(A.renaming.el))) return;
+    const qv = q.value.trim().toLowerCase();
+    const html = qv ? searchHTML(qv) : treeHTML(A.WS[A.cur]);
+    if (html === drawn && !byOthers(touched.takeRecords())) return;
+    sblist.innerHTML = html;
+    if (qv) markPick();
+    touched.takeRecords();
+    drawn = html;
+  }
+  /* ⌘K from the keyboard: one result is lit (the first, until ↓ or ↑ picks another), and Enter opens it as a click
+     would. */
+  let picked = '';
+  const rowKey = (x) => x.dataset.act || `sess|${x.dataset.sess}`;
+  function markPick() {
+    const list = [...sblist.querySelectorAll('.tr[data-act], .srow')];
+    const at = Math.max(0, list.findIndex((x) => rowKey(x) === picked));
+    list.forEach((x, i) => x.classList.toggle('sel', i === at));
+    return list[at] || null;
+  }
+  /* A result picked in ⌘K, by a click or by Enter: the search is over, and the list is back. */
+  function pickResult(tr) {
+    if (!tr) return;
+    if (tr.classList.contains('srow')) { openFound(tr.dataset.sess); return; }
+    perform(tr.dataset.act, +tr.dataset.ws);
+    if (q.value.trim()) { q.value = ''; findSessions(''); render(); }
+  }
+
+  /* ---------- going to things, and organizing them ---------- */
+  function perform(act, wi) {
+    if (!SOLO && wi !== A.cur) go(wi);
+    const ws = A.WS[wi];
+    const [k, a, b] = act.split('|');
+    if (k === 'win' || k === 'mate') { focusWin(ws, findWin(ws, a)); return; }
+    if (k === 'tab') { const w = findWin(ws, a); if (w) showTab(ws, w, +b); return; }
+    if (k === 'reopen') { reopenAgent(ws, a); return; }
+    if (k === 'zone') { showSpace(ws, a); return; }
+    if (k === 'folder' || k === 'sec') { toggleKey(`${ws.id}:f:${a}`); return; }
+    if (k === 'saved') { openSaved(ws, a); return; }
+    if (k === 'rec') { const r = recordOf(act.slice(4)); if (r) { q.value = ''; findSessions(''); openUrl(ws, r.url); } return; }
+    if (k === 'files') { window.FlowFiles.perform(ws, act); return; }
+    if (k === 'newsec') { renameSectionRow(ws, NOTES().newSection(ws, withZone({ holds: a }, b && zoneById(ws, b) ? b : '')).id); return; }
+    if (k === 'newzone') { const zn = A.addZone(ws, a && zoneById(ws, a) ? a : ''); if (zn) renameZoneRow(ws, zn.id); return; }
+    if (k === 'note') openNote(ws, a);
+  }
+  /* Moves an agent, note or page, open or closed, to a sub-workspace of its workspace (zoneId; null for the main
+     space) or to another workspace (to). Organizing is moving a tool to the goal it serves, one way for every tool. */
+  function moveTo(ws, what, zoneId, to) {
+    const [k, id] = what.split('|');
+    const other = to && to !== ws ? to : null;
+    /* a section moves to another space of its workspace with everything in it */
+    if (k === 'sec' || k === 'folder') {
+      if (!other && NOTES() && NOTES().moveSection) NOTES().moveSection(ws, id, zoneId || '');
+      return;
+    }
+    if (k === 'closed') {
+      const w = ws.closed.find((x) => x.id === id);
+      if (!w) return;
+      delete w.zone;
+      if (other) { ws.closed.splice(ws.closed.indexOf(w), 1); other.closed.push(w); } else if (zoneId) w.zone = zoneId;
+      render();
+      save();
+      return;
+    }
+    if (k === 'saved') {
+      const s = (ws.saved || []).find((x) => x.id === id);
+      if (!s) return;
+      const at = openOf(s, openPages(ws));
+      if (other) {
+        const sec = lastSection(other);
+        if (!sec) { toast('could not move the page: notes.js, which keeps the sections, did not load', 6000); return; }
+        ws.saved.splice(ws.saved.indexOf(s), 1);
+        s.section = sec;
+        savedOf(other).push(s);
+        if (at) moveWindow(ws, at.w, other);
+        else { render(); save(); }
+        savedChanged();
+        return;
+      }
+      /* filed in a section of the space it goes to; its window goes with it when open */
+      const zone = zoneId && zoneById(ws, zoneId) ? zoneId : '';
+      if (secSpace(ws, noteById(ws, s.section)) !== zone) {
+        const sec = lastSection(ws, zone);
+        if (sec) { s.section = sec; s.at = Date.now(); }
+      }
+      if (at) moveToSpace(ws, at.w, zone || null);
+      else { render(); save(); }
+      savedChanged();
+      return;
+    }
+    if (k === 'note') {
+      const n = noteById(ws, id);
+      const w = ws.windows.find((x) => x.noteId === id);
+      if (!n) return;
+      if (other && !w) {
+        ws.notes.splice(ws.notes.indexOf(n), 1);
+        delete n.parent;
+        other.notes.unshift(n);
+        render();
+        save();
+        return;
+      }
+      const v = w || openNote(ws, id);
+      if (v) { if (other) moveWindow(ws, v, other); else moveToSpace(ws, v, zoneId); }
+      return;
+    }
+    const w = findWin(ws, id);
+    if (!w) return;
+    if (other) moveWindow(ws, w, other);
+    else moveToSpace(ws, w, zoneId);
+  }
+  function deleteNote(ws, id) {
+    const d = NOTES().deleteNote(ws, id);
+    if (d) toast(`deleted ${d.title}`, 6000, { label: 'undo', run: d.undo });
+  }
+  /* The label of a row, ready to rename: a rename still open is ended first, since ending it redraws the list. */
+  function freshLabel(...acts) {
+    if (A.renaming) A.renaming.finish(true);
+    render();
+    return sblist.querySelector(acts.map((a) => `.tr[data-act="${CSS.escape(a)}"] .l`).join(', '));
+  }
+  function renameSectionRow(ws, id) {
+    const f = noteById(ws, id);
+    const label = freshLabel(`folder|${id}`, `sec|${id}`);
+    if (!f || !label) return;
+    renameInline(label, f.title, (v) => {
+      if (v && v !== f.title) { NOTES().renameSection(ws, id, v); savedChanged(); }
+      render();
+    }, 'row');
+  }
+  /* A sub-workspace's own folder (files.js keeps the rules): the Mac's picker, or on the VM typed in place in its
+     heading, starting from the folder in use. */
+  function zoneFolder(ws, zid) {
+    const F = window.FlowFiles;
+    if (!ws.host) { F.pickFolder(ws, zid); return; }
