@@ -1083,3 +1083,217 @@
         else popOut(ws.id, d.zpop);
         return;
       }
+      if (e.target.closest('[data-more]')) { sessAll = true; findSessions(q.value.trim().toLowerCase()); return; }
+      const mk = e.target.closest('[data-make]');
+      if (mk) {
+        const gk = mk.closest('.grp').dataset.grp;
+        A.ui.closed = A.ui.closed.filter((y) => y !== gk);
+        perform(mk.dataset.make, +mk.closest('.grp').dataset.ws);
+        return;
+      }
+      const g = e.target.closest('.grp');
+      if (g) { const k = g.dataset.grp, ui = A.ui; ui.closed = ui.closed.includes(k) ? ui.closed.filter((y) => y !== k) : [...ui.closed, k]; render(); save(); return; }
+      const s = e.target.closest('.srow');
+      if (s) { pickResult(s); return; }
+      const tg = e.target.closest('[data-tog]');
+      if (tg) { toggleKey(tg.dataset.tog, tg.dataset.down === '1'); return; }
+      if (tr) pickResult(tr);
+    });
+    sblist.addEventListener('contextmenu', rowCtx);
+    sblist.addEventListener('dblclick', (e) => {
+      const row = e.target.closest('.tr[data-act]');
+      if (!row || q.value.trim() || (A.renaming && A.renaming.el.contains(e.target)) || row.dataset.act !== firstAt) return;
+      const [k, id] = row.dataset.act.split('|');
+      const ws = A.WS[+row.dataset.ws];
+      if (!ws) return;
+      if (k === 'zone') { renameZoneRow(ws, id); return; }
+      if (k === 'sec' || k === 'folder') {
+        if (!NOTES()) return;
+        toggleKey(`${ws.id}:f:${id}`);
+        renameSectionRow(ws, id);
+        return;
+      }
+      if (k === 'note') { renameNoteRow(ws, id); return; }
+      if (k === 'tab' || k === 'saved') { renamePageRow(ws, row.dataset.act); return; }
+      if (k !== 'win' && k !== 'reopen') return;
+      const w = findWin(ws, id) || ws.closed.find((x) => x.id === id);
+      if (!w || !isTerm(w)) return;
+      const label = freshLabel(`win|${id}`, `reopen|${id}`);
+      if (label) renameAgent(ws, w, label);
+    });
+    sblist.addEventListener('mouseover', (e) => {
+      /* the group heading of what the pointer is over: its "+" shows */
+      const hov = e.target.closest('.tr, .grp');
+      let gEl = hov && hov.classList.contains('grp') ? hov : null;
+      for (let x = hov && !gEl && !hov.classList.contains('sph') ? hov.previousElementSibling : null; x && !gEl; x = x.previousElementSibling) {
+        if (x.classList.contains('sph')) break;
+        if (x.classList.contains('grp')) gEl = x;
+      }
+      sblist.querySelectorAll('.grp.over').forEach((x) => { if (x !== gEl) x.classList.remove('over'); });
+      if (gEl && !gEl.classList.contains('over')) gEl.classList.add('over');
+      const row = e.target.closest('.tr[data-act^="saved|"], .tr[data-act^="tab|"], .tr[data-act^="rec|"]');
+      if (row === cardRow) return;
+      cardRow = row;
+      hideCard();
+      if (row && !dragItem) cardTimer = setTimeout(() => showCard(row), 450);
+    });
+    sblist.addEventListener('mouseleave', () => { sblist.querySelectorAll('.grp.over').forEach((x) => x.classList.remove('over')); cardRow = null; hideCard(); });
+    ['pointerdown', 'wheel', 'dragstart'].forEach((t) => sblist.addEventListener(t, () => { cardRow = null; hideCard(); }, true));
+
+    /* Notes go onto note sections, pages (open or saved) onto page sections, anything onto a sub-workspace or a pill. */
+    const fits = (what, drop) => {
+      const k = what.split('|')[0], d = drop.split('|')[0];
+      return d === 'zone' ? !SOLO : !NOTES() ? false : d === 'note' ? k === 'note' : d === 'page' ? k === 'page' || k === 'saved' : false;
+    };
+    /* a dragged text selection starts its drag on a text node */
+    const elOf = (e) => (e.target.nodeType === 1 ? e.target : e.target.parentElement);
+    const target = (e) => {
+      const t = elOf(e) && elOf(e).closest('[data-drop]');
+      if (!t || !dragItem || +t.dataset.ws !== dragItem.ws || !fits(dragItem.what, t.dataset.drop)) return null;
+      /* the notes outside a section only take a note that is in one */
+      if (t.dataset.drop === 'note|') { const n = noteById(A.WS[dragItem.ws], dragItem.what.split('|')[1]); if (!n || !n.parent) return null; }
+      return t;
+    };
+    const clearDrop = () => {
+      sblist.classList.remove('drag-note', 'drag-page', 'drag-any');
+      document.querySelectorAll('#sblist .drop, #spaces .drop').forEach((x) => x.classList.remove('drop', 'area'));
+    };
+    /* A window dragged by its title bar (app.js calls these on each move and at the release): a page window's shown page
+       or a note window's note lights up the section or heading that takes it, as its row would, and is filed there when
+       let go; the window itself goes back where it was. Sub-workspace rows and pills stay app.js's. */
+    let winDrag = null;
+    windowDrag = (ws, w, el) => {
+      if (!winDrag) {
+        const p = w.type === 'page' ? openPages(ws).find((x) => x.w === w && x.i === (w.tab || 0)) : null;
+        const what = w.type === 'note' && w.noteId ? `note|${w.noteId}` : p && !blank(p) && !fileTab(p) ? `page|${w.id}|${p.i}` : '';
+        winDrag = { ws: A.WS.indexOf(ws), what, t: null };
+      }
+      const over = el && el.closest && sblist.contains(el) ? el.closest('[data-drop]') : null;
+      let t = over && winDrag.what && NOTES() && +over.dataset.ws === winDrag.ws && !over.dataset.drop.startsWith('zone|') && fits(winDrag.what, over.dataset.drop) ? over : null;
+      if (t && t.dataset.drop === 'note|') { const n = noteById(ws, winDrag.what.split('|')[1]); if (!n || !n.parent) t = null; }
+      if (winDrag.what && NOTES() && el && sblist.contains(el)) sblist.classList.add(winDrag.what.startsWith('note|') ? 'drag-note' : 'drag-page');
+      const area = !!t && t.dataset.drop === 'note|';
+      const lit = !t ? [] : area ? [...sblist.querySelectorAll(`.tr[data-drop="note|"][data-ws="${t.dataset.ws}"]`)] : [t];
+      sblist.querySelectorAll('.drop').forEach((y) => { if (!lit.includes(y)) y.classList.remove('drop', 'area'); });
+      lit.forEach((y) => y.classList.add('drop', ...(area ? ['area'] : [])));
+      winDrag.t = t;
+      return !!t;
+    };
+    windowCancel = () => {
+      winDrag = null;
+      clearDrop();
+    };
+    windowDrop = (ws) => {
+      const d = winDrag;
+      winDrag = null;
+      clearDrop();
+      if (!d || !d.t) return false;
+      const drop = d.t.dataset.drop, at = drop.slice(drop.indexOf('|') + 1);
+      if (d.t.classList.contains('grp')) A.ui.closed = A.ui.closed.filter((y) => y !== d.t.dataset.grp);
+      intoSection(ws, d.what, at, d.t.dataset.sp || '');
+      return true;
+    };
+    sblist.addEventListener('dragstart', (e) => {
+      const from = elOf(e);
+      const d = from && from.closest('[data-drag]');
+      if (d && d.dataset.drag.startsWith('files|')) { window.FlowFiles.dragStart(e, d.dataset.drag); return; }
+      if (d) {
+        dragItem = { ws: +d.dataset.ws, what: d.dataset.drag };
+        e.dataTransfer.setData('text/plain', `sidebar:${d.dataset.drag}`);
+        e.dataTransfer.effectAllowed = 'move';
+        /* "+ new section" shows in the group the dragged row can be filed in, "+ new sub-workspace" for any row; after
+           the drag has its image */
+        const k = d.dataset.drag.split('|')[0];
+        const cls = ['drag-any', ...(!NOTES() ? [] : k === 'note' ? ['drag-note'] : k === 'page' || k === 'saved' ? ['drag-page'] : [])];
+        setTimeout(() => { if (dragItem) sblist.classList.add(...cls); }, 0);
+        return;
+      }
+      const s = from && from.closest('.srow');
+      if (!s) return;
+      A.setDragSession(s.dataset.sess);
+      e.dataTransfer.setData('text/plain', 'session:' + s.dataset.sess);
+      e.dataTransfer.effectAllowed = 'copy';
+    });
+    nativeDragEnd = () => {
+      A.setDragSession(null);
+      if (window.FlowFiles) window.FlowFiles.dragEnd();
+      viewport.classList.remove('drop');
+      if (!dragItem) return;
+      dragItem = null;
+      clearDrop();
+      render();
+    };
+    sblist.addEventListener('dragend', nativeDragEnd);
+    sblist.addEventListener('dragover', (e) => {
+      const t = target(e);
+      /* the notes outside a section light up together, as the one place a note leaves its section */
+      const area = !!t && t.dataset.drop === 'note|';
+      const lit = !t ? [] : area ? [...sblist.querySelectorAll(`.tr[data-drop="note|"][data-ws="${t.dataset.ws}"]`)] : [t];
+      sblist.querySelectorAll('.drop').forEach((y) => { if (!lit.includes(y)) y.classList.remove('drop', 'area'); });
+      if (!t) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      lit.forEach((y) => y.classList.add('drop', ...(area ? ['area'] : [])));
+    });
+    sblist.addEventListener('drop', (e) => {
+      const t = target(e);
+      if (!t) return;
+      e.preventDefault();
+      const ws = A.WS[dragItem.ws], what = dragItem.what;
+      const drop = t.dataset.drop, kind = drop.slice(0, drop.indexOf('|')), at = drop.slice(drop.indexOf('|') + 1);
+      dragItem = null;
+      clearDrop();
+      /* a heading's drop makes a new one there: its group opens so the new one can be named */
+      if (t.classList.contains('grp')) A.ui.closed = A.ui.closed.filter((y) => y !== t.dataset.grp);
+      if (kind === 'zone' && at === '+') {
+        const zn = A.addZone(ws);
+        if (zn) { moveTo(ws, what, zn.id); renameZoneRow(ws, zn.id); }
+      } else if (kind === 'zone') moveTo(ws, what, at || null);
+      else intoSection(ws, what, at, t.dataset.sp || '');
+    });
+    /* A pill takes any row: another workspace's pill moves it there, this workspace's pill to its main space. */
+    const pillAt = (e) => (dragItem && !SOLO && !/^(sec|folder)\|/.test(dragItem.what) ? e.target.closest('#spaces .sp[data-i]') : null);
+    spacesEl.addEventListener('dragover', (e) => {
+      const p = pillAt(e);
+      spacesEl.querySelectorAll('.sp.drop').forEach((y) => { if (y !== p) y.classList.remove('drop'); });
+      if (!p) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      p.classList.add('drop');
+    });
+    spacesEl.addEventListener('dragleave', (e) => { if (!spacesEl.contains(e.relatedTarget)) spacesEl.querySelectorAll('.sp.drop').forEach((y) => y.classList.remove('drop')); });
+    spacesEl.addEventListener('drop', (e) => {
+      const p = pillAt(e);
+      if (!p) return;
+      e.preventDefault();
+      const ws = A.WS[dragItem.ws], what = dragItem.what;
+      dragItem = null;
+      clearDrop();
+      moveTo(ws, what, null, A.WS[+p.dataset.i]);
+    });
+  }
+
+  function mount(app) {
+    A = app;
+    ({ esc, hostOf, prettyTitle, tilde, newId, ago, termTitle, isTerm, noteById, zoneById, findWin, locate, zoneOf, curSpace, inSpace } = app);
+    ({ save, go, toast, focusWin, openNote, openPageWin, closeWin, addWindow, reopen, endAgent, popOut, showSpace, moveToSpace } = app);
+    ({ moveWindow, frontWin, freeSpot, renameInline, renameAgent, renameZone, showMenu, agentItems, forkSession, copyResume } = app);
+    ({ copyText, openSessionIds, WIN, SOLO, SOLO_ZONE } = app);
+    ({ sb, sblist, q, spacesEl, viewport } = app.els);
+    if (!NOTES()) console.error('notes.js did not load, so the sidebar has no sections (load notes.js before sidebar.js)');
+    wire();
+  }
+
+  window.FlowSidebar = {
+    mount, render, migrate, savedHooks, savedSection, openUrl, windowItems,
+    isSaved: (ws, url) => !!findSaved(ws, url),
+    nativeDragEnd: () => nativeDragEnd(),
+    windowDrag: (ws, w, el) => windowDrag(ws, w, el),
+    windowCancel: () => windowCancel(),
+    windowDrop: (ws, w) => windowDrop(ws, w),
+  };
+})();
+
+
+
+
