@@ -416,3 +416,212 @@ function watch(senderId, dirs, changed) {
       H = { host: h, wants: new Map(), known: new Map(), proc: null, starting: null, gen: 0, timer: null, retry: null,
         failures: 0, error: null };
       hosts.set(h, H);
+    }
+    H.wants.set(senderId, { keys: set, changed });
+    schedule(H);
+  }
+}
+
+// A window closed or stopped showing files.
+function stop(senderId) {
+  for (const H of hosts.values()) if (H.wants.delete(senderId)) schedule(H);
+}
+
+function tell(H, key) {
+  const p = key.slice(2);
+  for (const w of [...H.wants.values()]) {
+    if (!w.keys.has(key)) continue;
+    try {
+      if (key.startsWith(FILE)) w.changed(H.host, p, 'file');
+      else w.changed(H.host, p);
+    } catch (e) {
+      console.error(`[flow] vmfiles: telling a window that ${p} changed failed: ${e.message}`);
+    }
+  }
+}
+
+function wanted(H) {
+  const all = new Set();
+  for (const w of H.wants.values()) for (const k of w.keys) all.add(k);
+  return [...all].sort();
+}
+
+function schedule(H) {
+  if (H.timer) return;
+  H.timer = setTimeout(() => {
+    H.timer = null;
+    sync(H);
+  }, cfg.debounceMs);
+}
+
+function sync(H) {
+  const want = wanted(H);
+  for (const d of [...H.known.keys()]) if (!want.includes(d)) H.known.delete(d);
+  if (!want.length) {
+    stopLoop(H);
+    clearTimeout(H.retry);
+    H.retry = null;
+    if (hosts.get(H.host) === H) hosts.delete(H.host);
+    return;
+  }
+  const sig = want.join('\0');
+  if ((H.proc && H.proc.sig === sig) || H.starting === sig) return;
+  if (H.retry) {
+    // Backing off: the retry starts with what is wanted then; a folder added meanwhile says why it is empty.
+    for (const k of want) {
+      if (H.known.has(k) || !k.startsWith(DIR)) continue;
+      H.known.set(k, { hash: '', result: null, down: H.error });
+      tell(H, k);
+    }
+    return;
+  }
+  stopLoop(H);
+  start(H, want);
+}
+
+function stopLoop(H) {
+  H.gen++;
+  H.starting = null;
+  const P = H.proc;
+  if (!P) return;
+  H.proc = null;
+  clearTimeout(P.dog);
+  P.child.kill();
+}
+
+async function start(H, keys) {
+  const gen = ++H.gen;
+  const sig = keys.join('\0');
+  H.starting = sig;
+  const argv = ['sh', '-c', WATCH_SH, 'sh', String(cfg.tick), String(cfg.life)];
+  for (const key of keys) {
+    let k = H.known.get(key);
+    const s = key.startsWith(DIR) ? seen.get(keyOf(H.host, key.slice(2))) : null;
+    if (!k && s) H.known.set(key, (k = { hash: s.hash, result: s.result, down: null }));
+    argv.push(key.startsWith(FILE) ? 'f' : 'd', key.slice(2), (k && k.hash) || '');
+  }
+  let child;
+  try {
+    child = await spawn(H.host, argv, false);
+  } catch (e) {
+    if (gen === H.gen && hosts.get(H.host) === H) {
+      H.starting = null;
+      failed(H, keys, e.message, true);
+    }
+    return;
+  }
+  if (gen !== H.gen || hosts.get(H.host) !== H) {
+    child.kill();
+    return;
+  }
+  H.starting = null;
+  const P = { child, keys, sig, buf: Buffer.alloc(0), err: '', live: false, why: null, deaf: false, dog: null };
+  H.proc = P;
+  arm(H, P);
+  child.stdout.on('data', (b) => {
+    if (H.proc !== P) return;
+    arm(H, P);
+    feed(H, P, b);
+  });
+  child.stderr.on('data', (b) => { if (P.err.length < 4000) P.err += b; });
+  child.on('error', (e) => { P.why = P.why || e.message; });
+  child.on('close', (code) => ended(H, P, code));
+}
+
+// No byte for watchdogMs (three ticks and some): the connection is gone even if ssh has not noticed.
+function arm(H, P) {
+  clearTimeout(P.dog);
+  P.dog = setTimeout(() => {
+    if (H.proc !== P) return;
+    P.deaf = true;
+    P.child.kill();
+  }, cfg.watchdogMs);
+}
+
+function feed(H, P, chunk) {
+  P.buf = P.buf.length ? Buffer.concat([P.buf, chunk]) : chunk;
+  let used;
+  try {
+    used = frames(P.buf, (i, hash, result) => {
+      const key = P.keys[i];
+      if (key === undefined || key.startsWith(FILE) !== !result) throw new Error(`unexpected entry ${i} from the VM`);
+      if (result) listed(H, key, hash, asked(key.slice(2), result));
+      else touched(H, key, hash);
+    }, () => beat(H, P));
+  } catch (e) {
+    P.why = e.message;
+    P.buf = Buffer.alloc(0);
+    P.child.kill();
+    return;
+  }
+  P.buf = used ? P.buf.subarray(used) : P.buf;
+}
+
+function listed(H, key, hash, result) {
+  const k = H.known.get(key) || {};
+  k.hash = hash;
+  k.result = result;
+  k.down = null;
+  H.known.set(key, k);
+  tell(H, key);
+}
+
+// A file's first size and time are where watching starts, unless they differ from the copy its page shows (the file
+// changed between that fetch and this first look); after that, every change is told. A change makes every copy fetched
+// before it stale, so the page's reload fetches again even within FRESH_MS.
+function touched(H, key, hash) {
+  const k = H.known.get(key);
+  H.known.set(key, { hash });
+  const at = keyOf(H.host, path.posix.normalize(key.slice(2)));
+  const c = copies.get(at);
+  if (k && k.hash ? false : !c || `${c.size}:${c.mtime}` === hash) return;
+  changedAt.set(at, Date.now());
+  pending.delete(at);
+  away.delete(at);
+  tell(H, key);
+}
+
+// The first heartbeat of a loop: folders that said the VM was away and have not changed since show their listing again
+// (the loop sends only what changed), and a file whose page could not load while the VM was away is told, so it loads.
+function beat(H, P) {
+  if (P.live) return;
+  P.live = true;
+  H.failures = 0;
+  H.error = null;
+  for (const key of P.keys) {
+    if (key.startsWith(FILE)) {
+      if (away.delete(keyOf(H.host, path.posix.normalize(key.slice(2))))) tell(H, key);
+      continue;
+    }
+    const k = H.known.get(key);
+    if (k && k.down) {
+      k.down = null;
+      tell(H, key);
+    }
+  }
+}
+
+function ended(H, P, code) {
+  clearTimeout(P.dog);
+  if (H.proc !== P) return;
+  H.proc = null;
+  if (code === 0 && P.live && !P.why) {
+    const want = wanted(H);   // the loop reached its lifetime
+    if (want.length) start(H, want);
+    return;
+  }
+  const why = P.why || (P.deaf ? 'no answer from the VM' : lastLine(P.err) || `the VM file watch ended (exit ${code})`);
+  failed(H, P.keys, why, code === 255 || P.deaf);
+}
+
+function failed(H, keys, why, unreachable) {
+  if (!H.failures) console.error(`[flow] vmfiles ${H.host}: ${why}`);
+  H.failures++;
+  H.error = unreachable ? UNREACHABLE : why;
+  for (const key of keys) {
+    if (!key.startsWith(DIR)) continue;   // a file's page keeps showing its last copy
+    const k = H.known.get(key) || { hash: '', result: null };
+    k.down = H.error;
+    H.known.set(key, k);
+    tell(H, key);
+  }
