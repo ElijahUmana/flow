@@ -834,3 +834,208 @@ async function open(host, file, folders) {
   const h = checkHost(host);
   const f = checkPath(file);
   if (homes.has(h) && f.startsWith('/') && !shown(h, f, folders)) return { error: OUTSIDE };
+  const r = await fetchCopy(h, f);
+  if (!r.ok) return { error: r.error };
+  if (!shown(h, r.path, folders)) return { error: OUTSIDE };
+  if ((await files().kindOf(r.file, r.size)) !== 'other') return { url: urlOf(h, r.path) };
+  fs.chmodSync(r.file, 0o400);
+  const err = await (cfg.openPath ? cfg.openPath(r.file) : require('electron').shell.openPath(r.file));
+  return err ? { error: err } : { app: true };
+}
+
+/* files-main.js's rule for a VM file, as shown() is on the Mac: inside one of folders (the workspace folders on that
+   host, as typed: '~', '~/x', 'x' from the home folder, '/x' as is) with no part starting with a dot. The VM's home
+   comes with every fetch: open() and serve() check before fetching once it is known, and after the fetch before that
+   (a tab restored before anything was fetched this run). */
+function shown(host, abs, folders) {
+  const home = homes.get(host);
+  if (!home || typeof abs !== 'string' || !abs.startsWith('/') || !Array.isArray(folders)) return false;
+  const p = path.posix.normalize(abs);
+  return folders.some((typed) => {
+    if (typeof typed !== 'string' || !typed) return false;
+    const root = typed === '~' ? home : typed.startsWith('~/') ? path.posix.join(home, typed.slice(2))
+      : typed.startsWith('/') ? typed : path.posix.join(home, typed);
+    const rel = path.posix.relative(path.posix.normalize(root), p);
+    return !path.posix.isAbsolute(rel) && !rel.split('/').some((x) => x.startsWith('.'));
+  });
+}
+
+/* What a VM path is, from the listings held of its folder (a watch loop's current one first, then the newest one-time
+   listing, then an older one): 'dir' or 'file', or null when none is held or the name is not in it. No round trip, so
+   files-main.js keeps a link to a folder as text in a VM .md, as it does on the Mac. */
+function kindAt(host, abs) {
+  if (typeof abs !== 'string' || !abs.startsWith('/')) return null;
+  const p = path.posix.resolve(abs);
+  const dir = path.posix.dirname(p);
+  const name = path.posix.basename(p);
+  const H = hosts.get(host);
+  const live = [];
+  const older = [];
+  if (H) for (const [key, k] of H.known) (H.proc && H.proc.keys.includes(key) ? live : older).push(k.result);
+  const once = [];
+  for (const [key, s] of seen) if (key.startsWith(`${host}\0`)) once.unshift(s.result);
+  for (const r of [...live, ...once, ...older]) {
+    if (!r || !r.ok || path.posix.resolve(r.path) !== dir) continue;
+    const e = r.entries.find((x) => x.name === name);
+    if (e) return e.kind;
+  }
+  return null;
+}
+
+const answer = (status, text) => new Response(text, { status, headers: { 'content-type': 'text/plain; charset=utf-8', 'content-security-policy': "default-src 'none'" } });
+
+// A flow-file://vm/<host>/<path> request whose signature files-main.js checked: the file as it is on the VM now, if
+// shown() allows it in folders. files-main.js names a report's folder in an x-flow-scope header (its own request, made
+// from the signature), which respond() gets as origin.scope.
+async function serve(req, folders) {
+  const u = new URL(req.url);
+  let segs;
+  try {
+    segs = u.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  } catch (e) {
+    if (e instanceof URIError) return answer(400, 'not a file address');
+    throw e;
+  }
+  const host = segs.shift();
+  if (u.host !== 'vm' || !host || !HOST_RE.test(host) || host.startsWith('-') || !segs.length) return answer(404, 'not there');
+  const abs = '/' + segs.join('/');
+  if (homes.has(host) && !shown(host, abs, folders)) return answer(403, OUTSIDE);
+  const r = await fetchCopy(host, abs);
+  if (!r.ok) return answer(r.error === UNREACHABLE ? 502 : 404, r.error);
+  if (!shown(host, r.path, folders)) return answer(403, OUTSIDE);
+  return files().respond(r.file, await fs.promises.stat(r.file), { host, path: r.path, scope: req.headers.get('x-flow-scope') || null });
+}
+
+// ---------- carrying files between the Mac and the VM ----------
+
+// A VM file copied into a folder on this Mac (the downloads folder unless macDir is given), never over another file:
+// { ok, file, error }.
+async function copy(host, p, macDir) {
+  const h = checkHost(host);
+  const f = checkPath(p);
+  if (macDir == null && !cfg.downloads) throw new Error('vmfiles.copy: no folder given and no downloads folder set in init');
+  const dir = localPath(macDir == null ? cfg.downloads : macDir);
+  if (macDir == null) fs.mkdirSync(dir, { recursive: true });   // made as page downloads make it; a folder given must exist
+  let st;
+  try {
+    st = fs.statSync(dir);
+  } catch (e) {
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return fail('no such folder on this Mac');
+    throw e;
+  }
+  if (!st.isDirectory()) return fail('not a folder');
+  let out = null;
+  const r = await fetch(h, f, 0, 0, {
+    head(x) {
+      if (!x.word) out = openFree(dir, path.posix.basename(x.path) || 'file');
+    },
+    data(b) {
+      fs.writeSync(out.fd, b);
+    },
+  });
+  if (out) fs.closeSync(out.fd);
+  const error = r.problem || (r.head.word ? wordError(r.head.word) : null);
+  if (error) {
+    if (out) unlinkQuiet(out.file);
+    return fail(error);
+  }
+  return { ok: true, file: out.file, error: null };
+}
+
+/* A file on this Mac copied into a folder on the VM, never over another file: { ok, path, error }. opts.make is for a
+   Flow folder such as the one for images pasted into a VM terminal: it is created private to its user, and files in it
+   older than MADE_KEEP_DAYS are removed first so it does not grow with every paste. */
+async function put(macFile, host, dir, opts) {
+  const h = checkHost(host);
+  const d = checkPath(dir);
+  const file = localPath(macFile);
+  let st;
+  try {
+    st = fs.statSync(file);
+  } catch (e) {
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return fail('no such file on this Mac');
+    throw e;
+  }
+  if (!st.isFile()) return fail('not a file');
+  const name = path.basename(file);
+  const ext = path.extname(name);
+  const base = path.basename(name, ext) || 'file';
+  const release = await slot(h);
+  try {
+    let child;
+    try {
+      const make = !!(opts && opts.make);
+      child = await spawn(h, ['sh', '-c', PUT_SH, 'sh', d, base, ext, String(st.size), make ? 'make' : '', make ? String(MADE_KEEP_DAYS) : ''], true);
+    } catch (e) {
+      console.error(`[flow] vmfiles ${h}: ${e.message}`);
+      return fail(UNREACHABLE);
+    }
+    children.add(child);
+    return await new Promise((resolve) => {
+      const outs = [];
+      let err = '';
+      let readError = null;
+      const src = fs.createReadStream(file);
+      src.on('error', (e) => {
+        readError = e.message;
+        child.stdin.destroy();
+      });
+      child.stdin.on('error', (e) => {
+        if (e.code !== 'EPIPE') err += e.message;
+      });
+      src.pipe(child.stdin);
+      child.stdout.on('data', (b) => outs.push(b));
+      child.stderr.on('data', (b) => { if (err.length < 4000) err += b; });
+      child.on('error', (e) => { err += e.message; });
+      child.on('close', (code) => {
+        children.delete(child);
+        src.destroy();
+        const out = Buffer.concat(outs).toString('utf8');
+        if (readError) resolve(fail('could not read the file: ' + readError));
+        else if (code === 255) resolve(fail(UNREACHABLE));
+        else if (code !== 0) resolve(fail(lastLine(err) || `the VM ended the transfer (exit ${code})`));
+        else if (out.startsWith('P\t') && out.endsWith('\0')) resolve({ ok: true, path: out.slice(2, -1), error: null });
+        else if (out === 'short\n') resolve(fail('the copy to the VM did not finish'));
+        else if (/^[a-z]+\n$/.test(out)) resolve(fail(wordError(out.trim())));
+        else resolve(fail('unexpected answer from the VM: ' + out.slice(0, 200)));
+      });
+    });
+  } finally {
+    release();
+  }
+}
+
+/* The Mac's network is back, or Flow's window came to the front again: each host whose watch is waiting out its backoff
+   (its VM was away) tries again now, its backoff started over, and the ssh helper's too (sshRetry). Hosts that are not
+   waiting are left alone, so nothing runs that would not have run anyway. Returns the hosts tried. */
+function retryNow() {
+  const tried = [];
+  for (const H of hosts.values()) {
+    if (!H.retry) continue;
+    clearTimeout(H.retry);
+    H.retry = null;
+    H.failures = 0;
+    if (cfg.sshRetry) cfg.sshRetry(H.host);
+    const want = wanted(H);
+    if (want.length) start(H, want);
+    tried.push(H.host);
+  }
+  return tried;
+}
+
+function shutdown() {
+  for (const H of hosts.values()) {
+    clearTimeout(H.timer);
+    clearTimeout(H.retry);
+    stopLoop(H);
+  }
+  hosts.clear();
+  for (const c of children) c.kill();
+  children.clear();
+}
+
+module.exports = { init, list, watch, stop, open, serve, shown, kindAt, copy, put, retryNow, shutdown };
+
+
+
+
