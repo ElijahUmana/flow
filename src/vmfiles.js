@@ -207,3 +207,212 @@ async function spawn(host, argv, stdin) {
 async function slot(host) {
   let q = queues.get(host);
   if (!q) queues.set(host, (q = { busy: 0, waiting: [] }));
+  if (q.busy >= SESSIONS) await new Promise((resolve) => q.waiting.push(resolve));
+  q.busy++;
+  return () => {
+    q.busy--;
+    const next = q.waiting.shift();
+    if (next) next();
+    else if (!q.busy) queues.delete(host);
+  };
+}
+
+function cacheRoot() {
+  fs.mkdirSync(cfg.cacheDir, { recursive: true, mode: 0o700 });
+  const st = fs.statSync(cfg.cacheDir);
+  if (st.uid !== process.getuid() || (st.mode & 0o077) !== 0) {
+    throw new Error(`refusing to keep VM files in ${cfg.cacheDir}: it must be private to this user`);
+  }
+  return cfg.cacheDir;
+}
+
+// The copy keeps the file's own name, so a page shows it and knows its type; its folder is per run and (host, path).
+function copyPathFor(host, abs) {
+  let name = path.posix.basename(abs);
+  if (!name || name === '.' || name === '..') name = 'file';
+  const dir = path.join(cacheRoot(), String(process.pid), crypto.createHash('sha1').update(keyOf(host, abs)).digest('hex').slice(0, 20));
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return path.join(dir, name);
+}
+
+function sizeOf(file) {
+  try {
+    return fs.statSync(file).size;
+  } catch (e) {
+    if (e.code === 'ENOENT') return -1;
+    throw e;
+  }
+}
+
+function readRange(file, from, length) {
+  const buf = Buffer.alloc(length);
+  const fd = fs.openSync(file, 'r');
+  try {
+    return buf.subarray(0, fs.readSync(fd, buf, 0, length, from));
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function unlinkQuiet(file) {
+  try {
+    fs.unlinkSync(file);
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error(`[flow] vmfiles could not remove ${file}: ${e.message}`);
+  }
+}
+
+// A new file in dir named like name, "name (1).ext" on a clash, as page downloads are; returns { fd, file }.
+function openFree(dir, name) {
+  const ext = path.extname(name);
+  const base = path.basename(name, ext) || 'file';
+  for (let n = 0; ; n++) {
+    const file = path.join(dir, n ? `${base} (${n})${ext}` : base + ext);
+    try {
+      return { fd: fs.openSync(file, 'wx'), file };
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+    }
+  }
+}
+
+// A VM file's address, signed by files-main.js: flow-file://vm/<signature>/<host>/<path>. files-main checks the signature
+// and hands serve() below the address without it. The path is normalized first because the URL parser drops . and ..
+// segments, which would no longer match the signature.
+function urlOf(host, abs) {
+  return files().vmUrlOf(host, path.posix.normalize(abs));
+}
+
+// ---------- listing ----------
+
+// Reads WATCH_SH's frames from buf; returns how many bytes it used. onFrame(i, hash, result) for D and E, and with no
+// result for F; onBeat().
+function frames(buf, onFrame, onBeat) {
+  let at = 0;
+  for (;;) {
+    const nl = buf.indexOf(10, at);
+    if (nl < 0) return at;
+    const line = buf.toString('utf8', at, nl);
+    if (line === '.') {
+      at = nl + 1;
+      onBeat();
+      continue;
+    }
+    const f = line.split('\t');
+    if (f[0] === 'F' && f.length === 3 && /^\d+$/.test(f[1]) && /^(\d+:[\d.]+|missing)$/.test(f[2])) {
+      at = nl + 1;
+      onFrame(Number(f[1]), f[2], null);
+      continue;
+    }
+    if (f[0] === 'E' && f.length === 3 && /^\d+$/.test(f[1]) && WORDS[f[2]]) {
+      at = nl + 1;
+      onFrame(Number(f[1]), f[2], { ok: false, error: WORDS[f[2]] });
+      continue;
+    }
+    if (f[0] === 'D' && f.length === 4 && /^\d+$/.test(f[1]) && /^\d+$/.test(f[3])) {
+      const end = nl + 1 + Number(f[3]);
+      if (buf.length < end) return at;
+      const listing = parseListing(buf.subarray(nl + 1, end));
+      at = end;
+      onFrame(Number(f[1]), f[2], listing);
+      continue;
+    }
+    throw new Error('unexpected output from the VM: ' + line.slice(0, 200));
+  }
+}
+
+function parseListing(body) {
+  const parts = body.toString('utf8').split('\0');
+  if (parts.length < 3 || parts[parts.length - 1] !== '' || !/^#\d+$/.test(parts[parts.length - 2])) {
+    throw new Error('unexpected listing from the VM');
+  }
+  const entries = [];
+  for (let i = 1; i < parts.length - 2; i++) {
+    const rec = parts[i];
+    const tab = rec.indexOf('\t');
+    if (tab < 0) throw new Error('unexpected listing entry from the VM: ' + JSON.stringify(rec.slice(0, 200)));
+    entries.push({ name: rec.slice(tab + 1), kind: rec.slice(0, tab) === 'd' ? 'dir' : 'file' });
+  }
+  entries.sort(files().compare);
+  return { ok: true, path: parts[0], entries: entries.slice(0, MAX_ENTRIES), total: Number(parts[parts.length - 2].slice(1)) };
+}
+
+const asked = (dir, r) => Object.assign({ dir }, r);
+
+function remember(host, dir, hash, result) {
+  const k = keyOf(host, dir);
+  seen.delete(k);
+  seen.set(k, { hash, result });
+  if (seen.size > SEEN_MAX) seen.delete(seen.keys().next().value);
+}
+
+// One pass of WATCH_SH for a folder nobody watches yet.
+async function listOnce(host, dir) {
+  const release = await slot(host);
+  try {
+    let child;
+    try {
+      child = await spawn(host, ['sh', '-c', WATCH_SH, 'sh', '1', '0', 'd', dir, ''], false);
+    } catch (e) {
+      console.error(`[flow] vmfiles ${host}: ${e.message}`);
+      return asked(dir, fail(UNREACHABLE));
+    }
+    children.add(child);
+    const out = [];
+    let err = '';
+    const code = await new Promise((resolve) => {
+      child.stdout.on('data', (b) => out.push(b));
+      child.stderr.on('data', (b) => { if (err.length < 4000) err += b; });
+      child.on('error', (e) => { err += e.message; });
+      child.on('close', resolve);
+    });
+    children.delete(child);
+    if (code === 255) return asked(dir, fail(UNREACHABLE));
+    let got = null;
+    try {
+      frames(Buffer.concat(out), (i, hash, result) => { got = { hash, result }; }, () => {});
+    } catch (e) {
+      return asked(dir, fail(e.message));
+    }
+    if (code !== 0 || !got) return asked(dir, fail(lastLine(err) || `the VM did not list it (exit ${code})`));
+    remember(host, dir, got.hash, asked(dir, got.result));
+    return asked(dir, got.result);
+  } finally {
+    release();
+  }
+}
+
+// One folder level, as files-main.js lists one on the Mac: { ok, dir, path, entries: [{ name, kind }], total } or
+// { ok: false, dir, error }. A folder being watched answers from what its loop last sent.
+async function list(host, dir) {
+  const h = checkHost(host);
+  const d = checkPath(dir);
+  const H = hosts.get(h);
+  const k = H && H.known.get(DIR + d);
+  if (k && (H.proc ? H.proc.keys.includes(DIR + d) : !!H.retry)) {
+    if (k.down) return asked(d, fail(k.down));
+    if (k.result) return k.result;
+  }
+  return listOnce(h, d);
+}
+
+// ---------- watching what windows show ----------
+
+/* dirs: [{ host, dir }] and [{ host, file }], every VM folder the window shows and every VM file it shows as a page
+   ([] when none). changed(host, dir) when a folder's names change, so the window lists it again; changed(host, file,
+   'file') when a file's size or time changes, it goes or it comes back, so its page can show it again. */
+function watch(senderId, dirs, changed) {
+  const want = new Map();
+  for (const x of Array.isArray(dirs) ? dirs : []) {
+    if (!x || !x.host) continue;
+    const h = checkHost(x.host);
+    if (!want.has(h)) want.set(h, new Set());
+    want.get(h).add(typeof x.file === 'string' ? FILE + checkPath(x.file) : DIR + checkPath(x.dir));
+  }
+  for (const H of hosts.values()) if (!want.has(H.host) && H.wants.delete(senderId)) schedule(H);
+  for (const [h, set] of want) {
+    let H = hosts.get(h);
+    if (!H) {
+      H = { host: h, wants: new Map(), known: new Map(), proc: null, starting: null, gen: 0, timer: null, retry: null,
+        failures: 0, error: null };
+      hosts.set(h, H);
