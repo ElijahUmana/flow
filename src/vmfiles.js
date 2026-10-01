@@ -625,3 +625,212 @@ function failed(H, keys, why, unreachable) {
     H.known.set(key, k);
     tell(H, key);
   }
+  clearTimeout(H.retry);
+  H.retry = setTimeout(() => {
+    H.retry = null;
+    const want = wanted(H);
+    if (want.length && hosts.get(H.host) === H) start(H, want);
+  }, Math.min(cfg.retryMaxMs, cfg.retryMs * 2 ** (H.failures - 1)));
+}
+
+// ---------- reading a file from the VM ----------
+
+// Runs FETCH_SH and hands its reply to h: h.head({ word } | { size, mtime, path }, stop) once, then h.data(buf, stop)
+// for the file's bytes. stop() ends the transfer early. Resolves when the process is gone.
+async function fetch(host, p, from, cap, h) {
+  const release = await slot(host);
+  try {
+    let child;
+    try {
+      child = await spawn(host, ['sh', '-c', FETCH_SH, 'sh', p, String(from), String(cap)], false);
+    } catch (e) {
+      console.error(`[flow] vmfiles ${host}: ${e.message}`);
+      return { problem: UNREACHABLE };
+    }
+    children.add(child);
+    return await new Promise((resolve) => {
+      let head = null;
+      let buf = Buffer.alloc(0);
+      let err = '';
+      let problem = null;
+      let stopped = false;
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        child.kill();
+      };
+      const hand = (fn) => {
+        try {
+          fn();
+        } catch (e) {
+          problem = problem || e.message;
+          stop();
+        }
+      };
+      child.stdout.on('data', (b) => {
+        if (stopped) return;
+        if (head) {
+          hand(() => h.data(b, stop));
+          return;
+        }
+        buf = buf.length ? Buffer.concat([buf, b]) : b;
+        if (buf.length > 16384 && buf.indexOf(10) < 0 && buf.indexOf(0, buf.indexOf(0) + 1) < 0) {
+          problem = 'unexpected output from the VM';
+          stop();
+          return;
+        }
+        if (buf.length >= 2 && buf[0] === 0x46 && buf[1] === 0x20) {
+          const z = buf.indexOf(0);
+          const z2 = z < 0 ? -1 : buf.indexOf(0, z + 1);
+          if (z2 < 0) return;
+          const text = buf.toString('utf8', 2, z);
+          const tab = text.indexOf('\t');
+          const [size, mtime] = text.slice(0, tab).split(' ');
+          head = { size: Number(size), mtime, path: buf.toString('utf8', z + 1, z2) };
+          homes.set(host, text.slice(tab + 1));
+          const rest = buf.subarray(z2 + 1);
+          buf = null;
+          hand(() => {
+            h.head(head, stop);
+            if (rest.length && !stopped) h.data(rest, stop);
+          });
+          return;
+        }
+        const nl = buf.indexOf(10);
+        if (nl < 0) return;
+        head = { word: buf.toString('utf8', 0, nl) };
+        buf = null;
+        hand(() => h.head(head, stop));
+      });
+      child.stderr.on('data', (b) => { if (err.length < 4000) err += b; });
+      child.on('error', (e) => { problem = problem || e.message; });
+      child.on('close', (code) => {
+        children.delete(child);
+        if (!problem && !stopped) {
+          if (code === 255) problem = UNREACHABLE;
+          else if (code !== 0) problem = lastLine(err) || `the VM ended the transfer (exit ${code})`;
+          else if (!head) problem = 'no answer from the VM';
+        }
+        resolve({ problem, head, stopped });
+      });
+    });
+  } finally {
+    release();
+  }
+}
+
+// The whole file into a new copy, swapped in when complete, so a page never reads half of it.
+async function fetchWhole(host, p) {
+  let target = null;
+  let part = null;
+  let fd = null;
+  let got = 0;
+  const r = await fetch(host, p, 0, cfg.maxOpen, {
+    head(x) {
+      if (x.word) return;
+      target = copyPathFor(host, x.path);
+      part = `${target}.${crypto.randomBytes(4).toString('hex')}.part`;
+      fd = fs.openSync(part, 'wx', 0o600);
+    },
+    data(b) {
+      fs.writeSync(fd, b);
+      got += b.length;
+    },
+  });
+  if (fd !== null) fs.closeSync(fd);
+  const error = r.problem || (r.head.word ? wordError(r.head.word) : null);
+  if (error) {
+    if (part) unlinkQuiet(part);
+    return fail(error);
+  }
+  fs.renameSync(part, target);
+  return { ok: true, file: target, path: r.head.path, size: got, mtime: r.head.mtime };
+}
+
+// When the file only grew since the copy was made: fetch from OVERLAP bytes before the copy's end, check those bytes
+// match the copy, and append the rest. Returns null when the whole file has to come instead.
+async function fetchTail(host, p, have) {
+  const from = Math.max(0, have.size - OVERLAP);
+  const want = have.size - from;
+  let mode = null;   // 'same' | 'grew' | 'whole'
+  let seenBytes = Buffer.alloc(0);
+  let fd = null;
+  let got = 0;
+  const r = await fetch(host, p, from, cfg.maxOpen, {
+    head(x, stopNow) {
+      if (x.word) return;
+      if (x.size === have.size && x.mtime === have.mtime) mode = 'same';
+      else if (x.size > have.size) mode = 'grew';
+      else mode = 'whole';
+      if (mode !== 'grew') stopNow();
+    },
+    data(b, stopNow) {
+      if (seenBytes.length < want) {
+        const need = want - seenBytes.length;
+        seenBytes = Buffer.concat([seenBytes, b.subarray(0, need)]);
+        b = b.subarray(need);
+        if (seenBytes.length < want) return;
+        if (!seenBytes.equals(readRange(have.file, from, want))) {
+          mode = 'whole';
+          stopNow();
+          return;
+        }
+        fs.chmodSync(have.file, 0o600);
+        fd = fs.openSync(have.file, 'r+');
+        fs.ftruncateSync(fd, have.size);
+      }
+      if (b.length) {
+        fs.writeSync(fd, b, 0, b.length, have.size + got);
+        got += b.length;
+      }
+    },
+  });
+  if (fd !== null) fs.closeSync(fd);
+  if (r.problem) return fd === null ? fail(r.problem) : null;
+  if (r.head.word) return fail(wordError(r.head.word));
+  if (mode === 'whole' || (mode === 'grew' && seenBytes.length < want)) return null;
+  return { ok: true, file: have.file, path: r.head.path, size: have.size + got, mtime: r.head.mtime };
+}
+
+// The temp copy of a VM file, fetched or brought up to date: { ok, file, path, size, error }. Calls for the same path
+// share one fetch.
+function fetchCopy(host, p) {
+  const h = checkHost(host);
+  const given = checkPath(p);
+  const key = keyOf(h, given);
+  if (!pending.has(key)) {
+    const job = (async () => {
+      const started = Date.now();
+      const abs = aliases.get(key) || (given.startsWith('/') ? path.posix.normalize(given) : null);
+      const had = abs ? copies.get(keyOf(h, abs)) : null;
+      const intact = had && sizeOf(had.file) === had.size;
+      if (intact && started - had.at < cfg.freshMs && had.at > (changedAt.get(keyOf(h, abs)) || 0)) {
+        return { ok: true, file: had.file, path: abs, size: had.size, error: null };
+      }
+      let r = intact ? await fetchTail(h, given, had) : null;
+      if (!r) r = await fetchWhole(h, given);
+      if (!r.ok) {
+        if (r.error === UNREACHABLE && abs) away.add(keyOf(h, abs));
+        return r;
+      }
+      const where = path.posix.normalize(r.path);
+      away.delete(keyOf(h, where));
+      aliases.set(key, where);
+      copies.set(keyOf(h, where), { file: r.file, size: r.size, mtime: r.mtime, at: started });
+      return { ok: true, file: r.file, path: where, size: r.size, error: null };
+    })();
+    pending.set(key, job);
+    // A change seen meanwhile drops this job from pending, so the next caller fetches anew; only its own entry goes.
+    const done = () => { if (pending.get(key) === job) pending.delete(key); };
+    job.then(done, done);
+  }
+  return pending.get(key);
+}
+
+/* As files-main.js opens a file on the Mac: { url } when Flow shows it as a page (served by serve()), { app: true } when
+   the Mac's app opened it, or { error }. Only a file shown() allows in folders opens. The Mac's app gets a read-only
+   copy, so it shows the file as locked instead of saving edits into a copy the VM never sees. */
+async function open(host, file, folders) {
+  const h = checkHost(host);
+  const f = checkPath(file);
+  if (homes.has(h) && f.startsWith('/') && !shown(h, f, folders)) return { error: OUTSIDE };
