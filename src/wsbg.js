@@ -105,3 +105,110 @@ function show(e, o) {
     state.subT = 0;
     if ((state.sub && state.sub.row === b) || (!fills.has(b) && !state.sub)) return;
     state.subT = setTimeout(() => { state.subT = 0; if (fills.has(b)) openSub(b); else state.closeSub(); }, state.sub ? SWITCH_MS : OPEN_MS);
+  });
+
+  if (o.onBg) {
+    subRow('background', '', (el) => {
+      const box = o.el ? o.el.getBoundingClientRect() : null;
+      const w = box && box.width ? box.width : innerWidth, h = box && box.height ? box.height : innerHeight;
+      const s = 52 / w, on = colors(o.bg);
+      const grid = node('div', 'bs');
+      presets.forEach((p) => {
+        const b = node('button', colors(p.css) === on ? 'on' : '');
+        b.title = p.name;
+        b.style.height = Math.round(h * s) + 'px';
+        const art = node('i');
+        art.style.cssText = `width:${w}px;height:${h}px;transform:scale(${s})`;
+        art.style.background = p.css;
+        b.appendChild(art);
+        b.addEventListener('pointerenter', () => { if (o.el) o.el.style.background = p.css; });
+        b.addEventListener('click', () => {
+          state.picked = true;
+          if (o.el) o.el.style.background = p.css;
+          act(o.onBg, p.css)();
+        });
+        grid.appendChild(b);
+      });
+      grid.addEventListener('pointerleave', () => { if (o.el) o.el.style.background = o.bg; });
+      el.appendChild(grid);
+    });
+  }
+  if (o.onFolderText) {
+    row('folder', o.folder || '', (ev) => {
+      const was = o.folder || '';
+      const r = node('div', 'row', 'folder');
+      const input = node('input', 'ed');
+      input.value = was;
+      input.spellcheck = false;
+      r.appendChild(input);
+      ev.currentTarget.replaceWith(r);
+      input.focus();
+      input.select();
+      input.addEventListener('keydown', (k) => { if (k.key === 'Enter') { k.preventDefault(); close(); } });
+      state.commit = () => { const v = input.value.trim(); if (v !== was) o.onFolderText(v); };
+    });
+  } else if (o.onFolder) {
+    row('folder', o.folder || '', act(o.onFolder));
+  }
+  if (o.onRunsOn) {
+    const places = { mac: 'this Mac', vm: 'the VM' };
+    subRow('new agents start on', places[o.runsOn], (el) => {
+      for (const [where, label] of Object.entries(places)) {
+        const b = node('button', o.runsOn === where ? 'row on' : 'row', label);
+        b.addEventListener('click', o.runsOn === where ? close : act(o.onRunsOn, where));
+        el.appendChild(b);
+      }
+    });
+  }
+  const settings = rows.length;
+  if (o.onRename) row('rename', '', act(o.onRename));
+  if (o.onDelete) row('delete', '', act(o.onDelete));
+  menu.append(...rows);
+  if (settings && rows.length > settings) menu.insertBefore(node('hr'), rows[settings]);
+
+  state.outside = (ev) => { if (!menu.contains(ev.target) && !(state.sub && state.sub.el.contains(ev.target))) close(); };
+  state.key = (ev) => {
+    if (ev.key !== 'Escape') return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    state.cancelled = true;
+    close();
+  };
+  document.body.appendChild(menu);
+  const m = menu.getBoundingClientRect();
+  menu.style.left = Math.max(6, Math.min(e.clientX, innerWidth - m.width - 6)) + 'px';
+  menu.style.top = Math.max(6, Math.min(e.clientY, innerHeight - m.height - 6)) + 'px';
+  document.addEventListener('pointerdown', state.outside, true);
+  document.addEventListener('keydown', state.key, true);
+  window.addEventListener('blur', close);
+  open = state;
+}
+
+/* The folder a new workspace picks up: a folder in the home folder named like it, case, spaces, dashes and dots aside
+   ('ef start' finds ~/ef-start), as '~/<name>'; null when there is none. It reads the home folder through flow.files,
+   which lists workspace folders only, so call it once the new workspace (folder '~') is saved. */
+async function folderFor(name) {
+  const flow = window.flow;
+  const key = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!key(name)) return null;
+  if (!flow || !flow.files || !flow.homeDir) { console.error('flow.files is missing, so a new workspace cannot pick up its folder'); return null; }
+  let r;
+  try {
+    r = await flow.files.list(null, flow.homeDir);
+  } catch (err) {
+    console.error("could not read the home folder for a new workspace's folder", err);
+    return null;
+  }
+  if (!r || !r.ok) { console.error(`could not read the home folder for a new workspace's folder: ${(r && r.error) || 'no answer'}`); return null; }
+  const dirs = r.entries.filter((d) => d.kind === 'dir');
+  const lower = String(name).toLowerCase();
+  const hit = dirs.find((d) => d.name === name) || dirs.find((d) => d.name.toLowerCase() === lower) || dirs.find((d) => key(d.name) === key(name));
+  return hit ? `~/${hit.name}` : null;
+}
+
+window.FlowWsMenu = { presets: presets.map((p) => ({ ...p })), open: show, close, folderFor };
+})();
+
+
+
+
