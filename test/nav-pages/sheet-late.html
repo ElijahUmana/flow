@@ -1,0 +1,12 @@
+<!doctype html><meta charset="utf-8"><title>nav test: a grid whose bar comes 2 s after load</title>
+<style>body{margin:0;font:16px sans-serif;background:#fff}#grid{height:300px;background:#efe;padding:20px;box-sizing:border-box}#bar{overflow-x:scroll;height:16px}#bar div{width:5000px;height:1px}</style>
+<div id="grid">grid: nothing here scrolls; a sideways wheel moves the bar below 50 ms later, as a Sheet does</div>
+<div id="slot"></div>
+<script>
+let bar = null; setTimeout(() => { bar = document.createElement("div"); bar.id = "bar"; bar.appendChild(document.createElement("div")); document.getElementById("slot").appendChild(bar); }, 2000);
+document.getElementById('grid').addEventListener('wheel', (e) => { const dx = e.deltaX; setTimeout(() => { if (bar) bar.scrollLeft += dx; }, 50); }, { passive: true });
+</script>
+
+
+
+
