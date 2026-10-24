@@ -1,0 +1,22 @@
+--- a/src/app.js
++++ b/src/app.js
+@@ -995,6 +995,7 @@
+   const sx = e.clientX, sy = e.clientY, ow = w.w, oh = w.h;
+   if (ws.mode !== 'float') { captureFloat(ws); ws.mode = 'float'; layout(ws); renderModes(); }
+   setDragging(true);
++  if (window.FlowTerm && window.FlowTerm.hold) window.FlowTerm.hold(true);
+   busy.add(w.id);
+   r.el.classList.add('drag');
+   if (e.isTrusted) handle.setPointerCapture(e.pointerId);
+@@ -1002,6 +1003,7 @@
+   const move = (ev) => resizeTo(ws, w, ow + ((ev.clientX - sx) / zf / VW) * 100, oh + ((ev.clientY - sy) / zf / VH) * 100);
+   const up = () => {
+     setDragging(false);
++    if (window.FlowTerm && window.FlowTerm.hold) window.FlowTerm.hold(false);
+     busy.delete(w.id);
+     r.el.classList.remove('drag');
+     handle.removeEventListener('pointermove', move);
+
+
+
+
