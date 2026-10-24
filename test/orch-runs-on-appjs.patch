@@ -1,0 +1,33 @@
+--- a/src/app.js
++++ b/src/app.js
+@@ -344,7 +344,7 @@
+   const id = w.id;
+   const cmd = w.cmd === 'shell' ? 'shell' : 'claude';
+   return {
+-    id, cmd, cwd: expand(w.cwd || ws.folder), host: w.host || undefined, attach: w.attach || undefined,
++    id, cmd, cwd: w.host ? w.cwd || '~' : expand(w.cwd || ws.folder), host: w.host || undefined, attach: w.attach || undefined,
+     sessionId: w.sessionId || undefined, resume: cmd === 'claude' && !!w.sessionId, forkFrom: w.forkFrom || undefined,
+     team: w.type === 'team',
+     onTitle: (t) => onTermTitle(id, t),
+@@ -1217,7 +1217,7 @@
+   }
+   if (kind === 'agent' || kind === 'team' || kind === 'shell') {
+     const team = kind === 'team', shell = kind === 'shell';
+-    const w = addWindow(ws, { id: newId('w'), type: team ? 'team' : 'term', title: '', where: 'this Mac', note: '', cmd: shell ? 'shell' : 'claude', cwd: ws.folder, ...(shell ? {} : { sessionId: uuid() }), ...place(team ? 46 : 36, team ? 50 : 44) });
++    const w = addWindow(ws, { id: newId('w'), type: team ? 'team' : 'term', title: '', ...window.FlowTeams.runsOn(ws), note: '', cmd: shell ? 'shell' : 'claude', ...(shell ? {} : { sessionId: uuid() }), ...place(team ? 46 : 36, team ? 50 : 44) });
+     focusWin(ws, w);
+     const r = WIN.get(w.id);
+     if (r.term) r.term.focus();
+@@ -1551,7 +1551,7 @@
+     window.FlowWsMenu.open(e, {
+       el: s ? s.sec : null, bg: ws.bg,
+       onBg: (css) => { ws.bg = css; if (s) s.sec.style.background = css; save(); },
+-      folder: ws.folder, onFolder: () => pickFolder(ws),
++      ...window.FlowTeams.runsOnMenu(ws, () => pickFolder(ws)),
+       onRename: () => renamePill(i),
+       onDelete: () => nav.removeWorkspace(ws),
+     });
+
+
+
+
