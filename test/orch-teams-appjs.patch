@@ -1,0 +1,218 @@
+--- a/src/app.js
++++ b/src/app.js
+@@ -130,7 +130,6 @@
+ /* Runtime handles live here, keyed by id, never in the saved state. */
+ const WIN = new Map(); // window id -> { el, tb, host, term, page, cur, osc, glyph, vis }
+ const SEC = new Map(); // workspace id -> { sec, canvas, rubber }
+-const PANES = new Map(); // team window id -> last flow.term.panes(id)
+ const busy = new Set(); // ids of windows being dragged or resized right now
+ 
+ function snapshot() {
+@@ -227,7 +226,7 @@
+   if (isTerm(w)) {
+     const r = WIN.get(w.id);
+     const g = (r && r.glyph) || (w.cmd === 'shell' || w.attach ? '' : '✳');
+-    return `${lights()}<div class="title">${g ? `<span class="tg">${esc(g)}</span>` : ''}<span class="tt">${esc(termTitle(w))}</span><span class="where">${esc(w.where || '')}</span></div><button class="act" data-act="note" title="${w.type === 'team' ? 'this team\'s note' : 'this agent\'s note'}">✎</button>`;
++    return `${lights()}<div class="title">${g ? `<span class="tg">${esc(g)}</span>` : ''}<span class="tt">${esc(termTitle(w))}</span><span class="where">${esc((window.FlowTeams && window.FlowTeams.label(w)) || w.where || '')}</span></div><button class="act" data-act="note" title="${w.type === 'team' ? 'this team\'s note' : 'this agent\'s note'}">✎</button>`;
+   }
+   if (w.type === 'page') return `${lights()}<div class="title">${esc(winTitle(ws, w))}</div><button class="act" data-act="note" title="this page's note">✎</button>`;
+   return `${lights()}<div class="title">${esc(winTitle(ws, w))}</div><span class="act"></span>`;
+@@ -334,7 +333,9 @@
+     onOpened: (res) => onTermOpened(id, res),
+     onLink: (url) => { const L = locate(id); if (L) openPageWin(L.ws, url, L.w); },
+     onFocus: () => { const L = locate(id); if (L) bringFront(L.ws, L.w); },
+-    onMateDragStart: (pane, e) => startPaneDrag(id, pane, e),
++    panesFrom: 'app',
++    onExit: () => { if (window.FlowTeams) window.FlowTeams.onExit(id); },
++    onMateDragStart: (pane, e) => { if (window.FlowTeams) window.FlowTeams.startPaneDrag(id, pane, e); },
+   };
+ }
+ function onTermTitle(id, t) {
+@@ -360,7 +361,7 @@
+   if (!L || !res) return;
+   if (!res.ok) { toast(`${termTitle(L.w)} could not start: ${res.error || 'no reason given'}`, 5000); return; }
+   if (res.cwdMissing) toast(`${tilde(L.w.cwd || L.ws.folder)} is not there, so ${termTitle(L.w)} started in your home folder`, 5000);
+-  if (L.w.type === 'team') pollPanes(id);
++  if (window.FlowTeams) window.FlowTeams.onOpened(id, res);
+ }
+ function pageOpts(id, n) {
+   return {
+@@ -829,112 +830,6 @@
+   }
+ }
+ 
+-/* ---------- teams: teammates are real tmux panes that can leave and join ---------- */
+-const paneErr = new Set();
+-function paneName(p) {
+-  return splitTitle(p.title || '').text || p.command || `pane ${p.index}`;
+-}
+-function members(w) {
+-  const panes = PANES.get(w.id) || [];
+-  return panes.length < 2 ? [] : panes;
+-}
+-function pollPanes(id) {
+-  const L = locate(id);
+-  return flow.term.panes(id, L ? remoteOpts(L.w) : undefined).then((list) => {
+-    const next = Array.isArray(list) ? list : [];
+-    const sig = (l) => JSON.stringify(l.map((p) => [p.paneId, p.index, p.title, p.command]));
+-    const prev = PANES.get(id) || [];
+-    PANES.set(id, next);
+-    paneErr.delete(id);
+-    if (sig(prev) !== sig(next)) scheduleSidebar();
+-  }, (err) => {
+-    if (!paneErr.has(id)) { paneErr.add(id); console.warn(`could not list the panes of ${id}`, err); }
+-  });
+-}
+-function pollAllPanes() {
+-  if (document.hidden) return;
+-  WS.forEach((ws) => ws.windows.forEach((w) => { const r = WIN.get(w.id); if (w.type === 'team' && r && r.term) pollPanes(w.id); }));
+-}
+-const teamAt = (ws, x, y, except) => ws.windows.find((o) => o.type === 'team' && o !== except && elOf(o) && rectHas(elOf(o).getBoundingClientRect(), x, y));
+-async function attachToTeam(ws, w, team, ox, oy) {
+-  let res;
+-  try {
+-    res = await flow.term.joinPane(w.id, team.id);
+-  } catch (err) {
+-    res = { ok: false, error: err && err.message };
+-  }
+-  if (!res || !res.ok) {
+-    w.x = ox;
+-    w.y = oy;
+-    apply(w, w);
+-    sizeCanvas(ws);
+-    toast(`${termTitle(w)} could not join ${termTitle(team)}: ${(res && res.error) || 'no reason given'}`, 5000);
+-    save();
+-    return;
+-  }
+-  removeWindow(ws, w);
+-  bringFront(ws, team);
+-  flash(elOf(team));
+-  toast(`${termTitle(w)} joined ${termTitle(team)}`);
+-  pollPanes(team.id);
+-  renderSidebar();
+-  save();
+-}
+-function startPaneDrag(teamId, pane, e) {
+-  const L = locate(teamId);
+-  if (!L || !pane) return;
+-  const { ws, w: team } = L;
+-  const panes = PANES.get(teamId) || [];
+-  const lead = panes.length ? panes.reduce((a, b) => (b.index < a.index ? b : a)) : null;
+-  if ((lead && lead.paneId === pane.paneId) || (!lead && pane.index === 0)) { toast('the lead stays with its team. drag a teammate out instead.'); return; }
+-  if (e && e.preventDefault) e.preventDefault();
+-  bringFront(ws, team);
+-  const name = paneName(pane);
+-  const ghost = document.createElement('div');
+-  ghost.className = 'ghost';
+-  ghost.textContent = `${name}: drop it outside the team`;
+-  document.body.appendChild(ghost);
+-  const place = (ev) => { ghost.style.left = ev.clientX + 12 + 'px'; ghost.style.top = ev.clientY + 10 + 'px'; };
+-  place(e);
+-  setDragging(true);
+-  if (e.isTrusted && e.target && e.target.setPointerCapture) e.target.setPointerCapture(e.pointerId);
+-  const end = () => {
+-    ghost.remove();
+-    setDragging(false);
+-    window.removeEventListener('pointermove', place, true);
+-    window.removeEventListener('pointerup', up, true);
+-    window.removeEventListener('pointercancel', end, true);
+-  };
+-  const up = (ev) => {
+-    end();
+-    const tel = elOf(team);
+-    if (tel && !rectHas(tel.getBoundingClientRect(), ev.clientX, ev.clientY)) breakOut(ws, team, pane, ev.clientX, ev.clientY);
+-  };
+-  window.addEventListener('pointermove', place, true);
+-  window.addEventListener('pointerup', up, true);
+-  window.addEventListener('pointercancel', end, true);
+-}
+-async function breakOut(ws, team, pane, cx, cy) {
+-  const nid = newId('w');
+-  const name = paneName(pane);
+-  let res;
+-  try {
+-    res = await flow.term.breakPane(team.id, pane.paneId, nid);
+-  } catch (err) {
+-    res = { ok: false, error: err && err.message };
+-  }
+-  if (!res || !res.ok) { toast(`could not take ${name} out: ${(res && res.error) || 'no reason given'}`, 5000); return null; }
+-  const r = viewport.getBoundingClientRect();
+-  const w = addWindow(ws, {
+-    id: nid, type: 'term', title: name, where: team.host ? team.where : 'this Mac', host: team.host || undefined, note: '', cmd: 'claude', cwd: team.host ? pane.cwd : tilde(pane.cwd) || ws.folder, w: 30, h: 38,
+-    x: ((cx - r.left + ws.pan) / VW) * 100 - 10, y: clamp(((cy - r.top) / VH) * 100 - 4, 5.4, 58),
+-  });
+-  toast(`${name} is its own window now. drop it on a team to add it back.`);
+-  pollPanes(team.id);
+-  renderSidebar();
+-  return w;
+-}
+-
+ /* ---------- window actions ---------- */
+ function addWindow(ws, w, at) {
+   const sp = curSpace(ws);
+@@ -1160,7 +1055,7 @@
+     w.x = ox + ((ev.clientX - sx) / VW) * 100;
+     w.y = clamp(oy + ((ev.clientY - sy) / VH) * 100, 4.5, 92);
+     apply(w, w);
+-    const t = w.type === 'term' ? teamAt(ws, ev.clientX, ev.clientY, w) : null;
++    const t = w.type === 'term' && window.FlowTeams ? window.FlowTeams.teamAt(ws, ev.clientX, ev.clientY, w) : null;
+     if (t !== teamTarget) { if (teamTarget && elOf(teamTarget)) elOf(teamTarget).classList.remove('dropon'); teamTarget = t; if (t) elOf(t).classList.add('dropon'); }
+     const under = document.elementFromPoint(ev.clientX, ev.clientY);
+     const tabEl = under && !SOLO ? under.closest('.sp[data-i]') : null;
+@@ -1180,7 +1075,7 @@
+     tb.removeEventListener('pointercancel', up);
+     if (tabTarget) { tabTarget.classList.remove('dropon'); w.x = ox; w.y = oy; moveWindow(ws, w, WS[+tabTarget.dataset.i]); return; }
+     if (spaceTarget) { const t = spaceTarget; t.classList.remove('dropon'); w.x = ox; w.y = oy; moveToSpace(ws, w, t.classList.contains('sp') ? null : t.dataset.act.slice(5)); return; }
+-    if (teamTarget) { const t = teamTarget; if (elOf(t)) elOf(t).classList.remove('dropon'); attachToTeam(ws, w, t, ox, oy); return; }
++    if (teamTarget) { const t = teamTarget; if (elOf(t)) elOf(t).classList.remove('dropon'); window.FlowTeams.dropOnTeam(ws, w, t); return; }
+     sizeCanvas(ws);
+     renderSidebar();
+     save();
+@@ -1285,7 +1180,7 @@
+   }
+   ws.windows.filter((w) => w.type === 'team').forEach((w) => {
+     add('agents', 0, '◫', termTitle(w), [w.where, whereIs(ws, w)].filter(Boolean).join(' · '), `win|${w.id}`, { text: text(w) });
+-    members(w).forEach((p) => add('agents', 1, '›_', paneName(p), '', `mate|${w.id}|${p.paneId}`, { path: `${termTitle(w)} › ${paneName(p)}`, text: `${p.title || ''} ${p.command || ''} ${p.cwd || ''}` }));
++    if (window.FlowTeams) window.FlowTeams.members(w).forEach((p) => add('agents', 1, '›_', window.FlowTeams.paneName(p), '', `mate|${w.id}|${p.paneId}`, { path: `${termTitle(w)} › ${window.FlowTeams.paneName(p)}`, text: `${p.title || ''} ${p.command || ''} ${p.cwd || ''}` }));
+   });
+   ws.windows.filter((w) => w.type === 'term').forEach((w) => add('agents', 0, '›_', termTitle(w), [w.where, whereIs(ws, w), w.note ? '✎' : ''].filter(Boolean).join(' · '), `win|${w.id}`, { text: text(w) }));
+   ws.closed.forEach((w) => add('agents', 0, w.type === 'team' ? '◫' : '›_', termTitle(w), 'closed', `reopen|${w.id}`, { dim: true, text: `${w.note || ''} ${w.osc || ''}`, end: w.id }));
+@@ -1828,6 +1723,16 @@
+   renderSidebar();
+   edges();
+   if (window.FlowDock) window.FlowDock.attach($('dock'));
++  if (window.FlowTeams) {
++    window.FlowTeams.mount({
++      get WS() { return WS; }, get cur() { return cur; }, get VW() { return VW; }, get VH() { return VH; },
++      locate, save, toast, addWindow, removeWindow, apply, sizeCanvas, focusWin, bringFront, besideSpot, dockTopPct,
++      geo, elOf, termTitle, splitTitle, renderTitle, onTermTitle, scheduleSidebar, renderSidebar, remoteOpts, newId,
++      tilde, setDragging, rectHas, inSpace, WIN, els: { viewport },
++    });
++  } else {
++    console.error('teams.js did not load, so teammates stay as panes of their team');
++  }
+ 
+   spacesEl.addEventListener('click', (e) => {
+     if (renaming && renaming.el.contains(e.target)) return;
+@@ -1966,7 +1871,6 @@
+     requestAnimationFrame(() => requestAnimationFrame(() => track.classList.remove('noanim')));
+   }).observe(viewport);
+ 
+-  setInterval(pollAllPanes, 3000);
+   if (!restored) save();
+   if (!ui.hinted && !SOLO) {
+     ui.hinted = true;
+--- a/src/index.html
++++ b/src/index.html
+@@ -47,6 +47,7 @@
+ <script src="page.js"></script>
+ <script src="dock.js"></script>
+ <script src="wsbg.js"></script>
++<script src="teams.js"></script>
+ <script src="app.js"></script>
+ </body>
+ </html>
+
+
+
+
