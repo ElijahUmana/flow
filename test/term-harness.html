@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http:; font-src 'self' data:; connect-src 'self'">
+<title>Flow: terminal harness</title>
+<link rel="stylesheet" href="../src/vendor/xterm/xterm.css">
+<link rel="stylesheet" href="../src/term.css">
+<style>
+:root{--line:#26262a;--text:#e9e9ec;--dim:#8d8d93;--faint:#5d5d63;--win:#0f0f11;--bar1:#242428;--bar2:#1c1c1f;--sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif}
+html,body{margin:0;height:100%;overflow:hidden;background:#0b0b0d;color:var(--text);font-family:var(--sans);-webkit-font-smoothing:antialiased}
+*{box-sizing:border-box}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+.desk{position:fixed;inset:0;background:radial-gradient(1100px 650px at 18% 8%, #2b2444 0%, transparent 62%), radial-gradient(900px 600px at 92% 95%, #3b2236 0%, transparent 60%), #141319}
+.win{position:absolute;display:flex;flex-direction:column;border-radius:10px;background:var(--win);border:1px solid #2a2a2e;box-shadow:0 20px 55px rgba(0,0,0,.5);overflow:hidden}
+.tb{height:30px;flex:none;display:flex;align-items:center;padding:0 10px;background:linear-gradient(var(--bar1),var(--bar2));border-bottom:1px solid #29292d;user-select:none;-webkit-user-select:none;gap:10px}
+.lights{display:flex;gap:7px;flex:none}
+.lights i{width:11px;height:11px;border-radius:50%;background:#3b3b40}
+.lights i:nth-child(1){background:#ff5f57}.lights i:nth-child(2){background:#febc2e}.lights i:nth-child(3){background:#28c840}
+.tb .title{flex:1;text-align:center;font-size:12px;color:#bfbfc4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tb .where{color:var(--faint);margin-left:8px}
+.tb .act{flex:none;width:47px;text-align:right;font-size:12.5px;color:var(--faint)}
+.body{flex:1;display:flex;min-height:0}
+.termhost{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;position:relative}
+#w-claude{left:14px;top:44px;width:760px;height:560px}
+#w-shell{left:790px;top:44px;width:696px;height:300px}
+#w-team{left:790px;top:360px;width:696px;height:520px}
+#parking{position:absolute;left:14px;top:620px;width:760px;height:260px;border:1px dashed rgba(255,255,255,.14);border-radius:14px;color:#5d5d63;font-size:12px;padding:8px 12px}
+</style>
+<div class="desk" id="desk">
+  <div id="parking">reparent target</div>
+  <div class="win term" id="w-claude"><div class="tb"><div class="lights"><i></i><i></i><i></i></div><div class="title"><span class="ttl">claude</span><span class="where">this Mac</span></div><span class="act">✎</span></div><div class="body"><div class="termhost"></div></div></div>
+  <div class="win term" id="w-shell"><div class="tb"><div class="lights"><i></i><i></i><i></i></div><div class="title"><span class="ttl">shell</span><span class="where">this Mac</span></div><span class="act">✎</span></div><div class="body"><div class="termhost"></div></div></div>
+  <div class="win team" id="w-team"><div class="tb"><div class="lights"><i></i><i></i><i></i></div><div class="title"><span class="ttl">team</span><span class="where">this Mac</span></div><span class="act">✎</span></div><div class="termhost"></div></div>
+</div>
+<script src="../src/vendor/xterm/xterm.js"></script>
+<script src="../src/vendor/xterm/addon-fit.js"></script>
+<script src="../src/vendor/xterm/addon-search.js"></script>
+<script src="../src/vendor/xterm/addon-web-links.js"></script>
+<script src="../src/term.js"></script>
+<script src="term-harness.js"></script>
+
+
+
+
