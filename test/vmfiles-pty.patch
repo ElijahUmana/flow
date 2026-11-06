@@ -1,0 +1,88 @@
+--- a/src/pty.js	2026-11-01 21:33:39.216949565 +0000
++++ b/src/pty.js	2026-11-01 21:33:39.246699665 +0000
+@@ -6,7 +6,7 @@
+ const fs = require('fs');
+ const os = require('os');
+ const path = require('path');
+-const { execFile } = require('child_process');
++const { execFile, spawn } = require('child_process');
+ const nodePty = require('node-pty');
+ 
+ const HOME = os.homedir();
+@@ -240,27 +240,50 @@
+   return path.join(dir, 'cm-%C');
+ }
+ 
++const sshArgs = (host, argv) => ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ControlMaster=auto',
++  '-o', 'ControlPath=' + controlPath(), '-o', 'ControlPersist=120', '--', host, argv.map(shq).join(' ')];
++
+ // After a failed connection, calls to that host fail with the same error until a backoff has passed (5 s, doubling up
+ // to 60 s), so an unreachable host does not get a new ssh for every pane poll. The first failure of a streak is logged.
+-async function sshExec(host, argv) {
+-  await cfg.ready;
++function backingOff(host) {
+   const down = hostDown.get(host);
+   if (down && Date.now() < down.until) throw new Error(down.error);
+-  const remoteCmd = argv.map(shq).join(' ');
+-  const r = await exec(SSH, ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ControlMaster=auto',
+-    '-o', 'ControlPath=' + controlPath(), '-o', 'ControlPersist=120', '--', host, remoteCmd], 25000);
+-  if (r.code === 255) {
+-    const prev = hostDown.get(host);
+-    const failures = prev ? prev.failures + 1 : 1;
+-    const error = `ssh ${host}: ${r.stderr || 'connection failed'}`;
+-    hostDown.set(host, { failures, until: Date.now() + Math.min(60000, 5000 * 2 ** (failures - 1)), error });
+-    if (!prev) console.error(`[flow] ${error}`);
+-    throw new Error(error);
+-  }
++}
++
++function hostFailed(host, stderr) {
++  const prev = hostDown.get(host);
++  const failures = prev ? prev.failures + 1 : 1;
++  const error = `ssh ${host}: ${stderr || 'connection failed'}`;
++  hostDown.set(host, { failures, until: Date.now() + Math.min(60000, 5000 * 2 ** (failures - 1)), error });
++  if (!prev) console.error(`[flow] ${error}`);
++  return error;
++}
++
++async function sshExec(host, argv) {
++  await cfg.ready;
++  backingOff(host);
++  const r = await exec(SSH, sshArgs(host, argv), 25000);
++  if (r.code === 255) throw new Error(hostFailed(host, r.stderr));
+   hostDown.delete(host);
+   return r;
+ }
+ 
++// sshExec for a long or binary transfer (vmfiles.js): the ssh process itself, stdout and stderr as Buffers, stdin a pipe
++// when opts.stdin. The same connection, options and backoff; a process ended early with kill() leaves the backoff as is.
++async function sshSpawn(host, argv, opts) {
++  await cfg.ready;
++  const h = checkHost(host);
++  backingOff(h);
++  const child = spawn(...spawnable(SSH, sshArgs(h, argv)), { env: cfg.env, stdio: [opts && opts.stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
++  let stderr = '';
++  child.stderr.on('data', (b) => { if (stderr.length < 4000) stderr += b; });
++  child.on('close', (code) => {
++    if (code === 255) hostFailed(h, stderr.trim());
++    else if (code !== null) hostDown.delete(h);
++  });
++  return child;
++}
++
+ // own: Flow's own tmux server on that host (the same socket name as here), not the host's default server.
+ const runRemote = (host, args, own) => sshExec(host, own ? ['tmux', '-L', cfg.socket, ...args] : ['tmux', ...args]);
+ 
+@@ -857,7 +880,7 @@
+ 
+ module.exports = {
+   init, open, write, resize, detach, detachAll, shutdown,
+-  kill, exists, list, panes, breakPane, joinPane, teammate,
++  kill, exists, list, panes, breakPane, joinPane, teammate, sshExec, sshSpawn,
+   ready: () => cfg.ready,
+   pending: () => running.size > 0,
+   info: () => ({ socket: cfg.socket, tmux: cfg.tmux, claude: cfg.env ? resolveClaude() : null, conf: CONF }),
+
+
+
+
